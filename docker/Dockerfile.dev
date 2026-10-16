@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# ch_table_engines' dev images (ch_table_engines.md §2.1, §1.2 rule 8): a
+# server with a C toolchain on it, in which the extension is built by PGXS
+# into a copy of the tree and every leg runs.  Nothing is built or installed
+# on the host; the tree is bind-mounted read-only (test/run.sh).
+#
+#   BASE_IMAGE=pg_accel/vexec-dev:vanilla        vanilla REL_19_STABLE at
+#                                                 the commit the image was
+#                                                 built from, with PostgreSQL's
+#                                                 regression suite (/cb/pgregress)
+#   BASE_IMAGE=pg_accel/vexec-dev:port-<commit>   the port's server (CH6)
+#
+# What the base lacks, added here:
+#   liblz4-dev, libzstd-dev   the codecs' headers: the base has their runtime
+#                             libraries only
+#   libipc-run-perl           IPC::Run, which PostgreSQL's TAP modules need
+#   /cb/pgperl                PostgreSQL's TAP modules (src/test/perl) at the
+#                             server's own commit, read out of PostgreSQL's
+#                             checkout (the "pgsrc" build context), as the
+#                             base takes its regression suite: the server is
+#                             built without TAP support, so PGXS installs none
+
+ARG BASE_IMAGE=pg_accel/vexec-dev:vanilla
+
+FROM ${BASE_IMAGE}
+USER root
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        liblz4-dev libzstd-dev libipc-run-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=bind,from=pgsrc,target=/pgsrc,ro \
+    mkdir -p /cb/pgperl \
+ && git -C /pgsrc archive "$(cat /usr/local/pgsql/.pg_ref_commit)" src/test/perl \
+        | tar -x -C /cb/pgperl --strip-components=3 \
+ && test -f /cb/pgperl/PostgreSQL/Test/Cluster.pm \
+ && cp /usr/local/pgsql/.pg_ref_commit /cb/pgperl/.pg_ref_commit \
+ && chown -R postgres:postgres /cb/pgperl
+
+# PostgreSQL's own regression suite at the server's commit, and the libraries
+# it loads (regress, and contrib/spi's refint and autoinc), for the pgregress leg
+RUN --mount=type=bind,from=pgsrc,target=/pgsrc,ro \
+    mkdir -p /cb/pgregress \
+ && git -C /pgsrc archive "$(cat /usr/local/pgsql/.pg_ref_commit)" src/test/regress contrib/spi \
+        | tar -x -C /cb/pgregress \
+ && inc="$(/usr/local/pgsql/bin/pg_config --includedir-server)" \
+ && for f in src/test/regress/regress.c contrib/spi/refint.c contrib/spi/autoinc.c; do \
+        gcc -O2 -fPIC -shared -I"$inc" -o "/cb/pgregress/src/test/regress/$(basename "$f" .c).so" "/cb/pgregress/$f" || exit 1; \
+    done \
+ && chown -R postgres:postgres /cb/pgregress
+
+ENV PATH=/usr/local/pgsql/bin:$PATH \
+    TMPDIR=/tmp
+USER postgres
+WORKDIR /home/postgres

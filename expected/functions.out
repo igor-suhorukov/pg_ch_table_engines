@@ -1,0 +1,36 @@
+-- The extension's functions (ch_table_engines.md §2.4).
+SET client_min_messages = warning;
+CREATE TABLE fn (a int) USING mergetree WITH (order_by = 'a');
+INSERT INTO fn SELECT generate_series(1, 10);
+INSERT INTO fn SELECT generate_series(11, 20);
+SELECT name, rows, bytes > 0 AS has_bytes, min_rowid <= max_rowid AS ids, level FROM ch.parts('fn');
+   name    | rows | has_bytes | ids | level 
+-----------+------+-----------+-----+-------
+ all_1_1_0 |   10 | t         | t   |     0
+ all_2_2_0 |   10 | t         | t   |     0
+(2 rows)
+
+SELECT ch.table_size('fn') = (SELECT sum(bytes) FROM ch.parts('fn')) AS size;
+ size 
+------
+ t
+(1 row)
+
+-- pg_relation_size() measures the main fork: the pages store's data, nothing of the files store's
+SELECT (pg_relation_size('fn') > 0) = (current_setting('ch.default_storage') = 'pages') AS main_fork,
+	   ch.table_size('fn') > 0 AS parts;
+ main_fork | parts 
+-----------+-------
+ t         | t
+(1 row)
+
+-- the library's threads: its four idle executors' and the backend's, after every call
+SELECT threads FROM ch.engine_info();
+ threads 
+---------
+       5
+(1 row)
+
+SELECT ch.parts('pg_class');
+ERROR:  "pg_class" is not a table of the ClickHouse engines
+DROP TABLE fn;

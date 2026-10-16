@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1.7
+# Builder of libchte_engine.so: the core of ClickHouse v26.8.8.8-lts compiled from its sources
+# into one shared library (ch_table_engines.md §2.2).  Debian trixie like pg_accel/vexec-dev,
+# so the library asks for no newer glibc than the server image has.  ClickHouse wants Clang >= 21
+# and LLD (cmake/tools.cmake:25-79 at the tag); trixie ships 19, trixie-backports has 21.
+FROM debian:trixie
+ARG LLVM_VERSION=21
+RUN echo "deb http://deb.debian.org/debian trixie-backports main" > /etc/apt/sources.list.d/backports.list \
+    && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates cmake ninja-build ccache nasm yasm python3 git perl file binutils \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie-backports \
+        clang-${LLVM_VERSION} lld-${LLVM_VERSION} llvm-${LLVM_VERSION} \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 builder \
+    && git config --system --add safe.directory '*'
+ENV CC=clang-${LLVM_VERSION} CXX=clang++-${LLVM_VERSION} TMPDIR=/tmp
+USER builder
+WORKDIR /home/builder

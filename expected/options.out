@@ -1,0 +1,222 @@
+-- Options of the engines' tables (ch_table_engines.md §2.4).
+SET client_min_messages = warning;
+-- defaults: storage pages (ch.default_storage), no key
+CREATE TABLE o1 (a int, b text) USING mergetree;
+SELECT reloptions FROM pg_class WHERE relname = 'o1';
+   reloptions    
+-----------------
+ {storage=pages}
+(1 row)
+
+SELECT ch.definition('o1');
+                                                                                                                                                                    definition                                                                                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(LZ4), c2 Nullable(String) CODEC(LZ4), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0
+(1 row)
+
+-- the pages store
+CREATE TABLE op (a int) USING mergetree WITH (storage = 'pages');
+SELECT reloptions FROM pg_class WHERE relname = 'op';
+   reloptions    
+-----------------
+ {storage=pages}
+(1 row)
+
+DROP TABLE op;
+-- the engines' options, and heap's beside them
+CREATE TABLE o2 (a int, b text, c date) USING mergetree
+	WITH (order_by = 'a, c', primary_key = 'a', index_granularity = 1024,
+		  compression = 'zstd(3)', settings = 'min_bytes_for_wide_part = 0', parallel_workers = 2);
+SELECT reloptions FROM pg_class WHERE relname = 'o2';
+                                                                     reloptions                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ {parallel_workers=2,"order_by=a, c",primary_key=a,index_granularity=1024,compression=zstd(3),"settings=min_bytes_for_wide_part = 0",storage=pages}
+(1 row)
+
+SELECT ch.definition('o2');
+                                                                                                                                                                                                                 definition                                                                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(ZSTD(3)), c2 Nullable(String) CODEC(ZSTD(3)), c3 Nullable(Int32) CODEC(ZSTD(3)), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = MergeTree ORDER BY (c1, c3) PRIMARY KEY (c1) SETTINGS index_granularity = 1024, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0, min_bytes_for_wide_part = 0
+(1 row)
+
+SELECT relname, (SELECT option_value FROM pg_options_to_table(reloptions) WHERE option_name = 'parallel_workers')
+  FROM pg_class WHERE relname = 'o2';
+ relname | option_value 
+---------+--------------
+ o2      | 2
+(1 row)
+
+-- refused
+CREATE TABLE bad (a int) USING mergetree WITH (order_by = 'nosuch');
+ERROR:  column "nosuch" named in option "order_by" does not exist
+CREATE TABLE bad (a int) USING mergetree WITH (storage = 'tape');
+ERROR:  invalid value for option "storage": "tape"
+HINT:  Valid values are "pages" and "files".
+CREATE TABLE bad (a int) USING mergetree WITH (storage = 'pages', order_by = 'nosuch');
+ERROR:  column "nosuch" named in option "order_by" does not exist
+CREATE TABLE bad (a int) USING mergetree WITH (index_granularity = 0);
+ERROR:  index_granularity must be between 1 and 1048576
+CREATE TABLE bad (a int) USING mergetree WITH (compression = 'gzip');
+ERROR:  invalid value for option "compression": "gzip"
+HINT:  Valid values are "lz4", "lz4hc", "lz4hc(N)", "zstd", "zstd(N)" and "none".
+CREATE TABLE bad (a int) USING mergetree WITH (ver = 'a');
+ERROR:  option "ver" does not apply to MergeTree
+CREATE TABLE bad (a int) USING mergetree WITH (settings = 'storage_policy = ''x''');
+ERROR:  setting "storage_policy" cannot be given to a table of the ClickHouse engines
+CREATE TABLE bad (a int) USING mergetree WITH (nosuch = 1);
+ERROR:  unrecognized parameter "nosuch"
+CREATE TABLE bad (a int) USING heap WITH (order_by = 'a');
+ERROR:  unrecognized parameter "order_by"
+SELECT count(*) FROM pg_class WHERE relname = 'bad';
+ count 
+-------
+     0
+(1 row)
+
+-- an engine's own options
+CREATE TABLE r1 (k int, ver int, x text) USING replacingmergetree WITH (order_by = 'k', ver = 'ver');
+ERROR:  column "ver" named by an option of ReplacingMergeTree must be NOT NULL
+CREATE TABLE r1 (k int, ver int NOT NULL, x text) USING replacingmergetree WITH (order_by = 'k', ver = 'ver');
+SELECT ch.definition('r1');
+                                                                                                                                                                                   definition                                                                                                                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(LZ4), c2 Int32 CODEC(LZ4), c3 Nullable(String) CODEC(LZ4), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = ReplacingMergeTree(c2) ORDER BY (c1) SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0
+(1 row)
+
+CREATE TABLE c1 (k int, s int8) USING collapsingmergetree WITH (order_by = 'k');
+ERROR:  CollapsingMergeTree needs option "sign"
+CREATE TABLE c1 (k int, s int8 NOT NULL) USING collapsingmergetree WITH (order_by = 'k', sign = 's');
+ALTER TABLE c1 ALTER COLUMN s DROP NOT NULL;
+ERROR:  column "s" is named by an option of CollapsingMergeTree and stays NOT NULL
+SELECT ch.definition('c1');
+                                                                                                                                                                   definition                                                                                                                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(LZ4), c2 Int8 CODEC(LZ4), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = CollapsingMergeTree(c2) ORDER BY (c1) SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0
+(1 row)
+
+-- ALTER TABLE SET and RESET: heap's options and the engines' alike
+ALTER TABLE o1 SET (parallel_workers = 3, compression = 'lz4hc');
+SELECT reloptions FROM pg_class WHERE relname = 'o1';
+                      reloptions                      
+------------------------------------------------------
+ {storage=pages,parallel_workers=3,compression=lz4hc}
+(1 row)
+
+ALTER TABLE o1 RESET (parallel_workers);
+SELECT reloptions FROM pg_class WHERE relname = 'o1';
+            reloptions             
+-----------------------------------
+ {storage=pages,compression=lz4hc}
+(1 row)
+
+ALTER TABLE o1 SET (order_by = 'a');
+SELECT reloptions FROM pg_class WHERE relname = 'o1';
+                  reloptions                  
+----------------------------------------------
+ {storage=pages,compression=lz4hc,order_by=a}
+(1 row)
+
+SELECT ch.definition('o1');
+                                                                                                                                                                       definition                                                                                                                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(LZ4HC(9)), c2 Nullable(String) CODEC(LZ4HC(9)), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = MergeTree ORDER BY (c1) SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0
+(1 row)
+
+ALTER TABLE o1 SET (nosuch = 1);
+ERROR:  unrecognized parameter "nosuch"
+ALTER TABLE o1 SET (fillfactor = 5);
+ERROR:  value 5 out of bounds for option "fillfactor"
+DETAIL:  Valid values are between "10" and "100".
+-- a table's keys stay while it has data
+INSERT INTO o1 VALUES (1, 'x');
+ALTER TABLE o1 SET (order_by = 'b');
+ERROR:  cannot change the storage, keys or engine options of "o1" while it has data
+HINT:  TRUNCATE the table first, or make a new table with CREATE TABLE AS.
+ALTER TABLE o1 SET (compression = 'none');
+SELECT reloptions FROM pg_class WHERE relname = 'o1';
+                 reloptions                  
+---------------------------------------------
+ {storage=pages,order_by=a,compression=none}
+(1 row)
+
+TRUNCATE o1;
+ALTER TABLE o1 SET (order_by = 'b');
+SELECT reloptions FROM pg_class WHERE relname = 'o1';
+                 reloptions                  
+---------------------------------------------
+ {storage=pages,compression=none,order_by=b}
+(1 row)
+
+-- CREATE TABLE AS and SELECT INTO
+CREATE TABLE ctas USING mergetree WITH (order_by = 'g') AS SELECT g, g * 2 AS h FROM generate_series(1, 10) g;
+SELECT reloptions FROM pg_class WHERE relname = 'ctas';
+         reloptions         
+----------------------------
+ {order_by=g,storage=pages}
+(1 row)
+
+SELECT count(*), sum(h) FROM ctas;
+ count | sum 
+-------+-----
+    10 | 110
+(1 row)
+
+SET default_table_access_method = mergetree;
+SELECT g INTO si FROM generate_series(1, 5) g;
+SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE relname = 'si';
+  amname   
+-----------
+ mergetree
+(1 row)
+
+SELECT reloptions FROM pg_class WHERE relname = 'si';
+   reloptions    
+-----------------
+ {storage=pages}
+(1 row)
+
+CREATE TABLE dflt (a int) WITH (order_by = 'a');
+SELECT reloptions FROM pg_class WHERE relname = 'dflt';
+         reloptions         
+----------------------------
+ {order_by=a,storage=pages}
+(1 row)
+
+RESET default_table_access_method;
+-- SET ACCESS METHOD, both ways
+CREATE TABLE h1 (a int, b text) WITH (fillfactor = 70);
+INSERT INTO h1 SELECT g, g::text FROM generate_series(1, 100) g;
+ALTER TABLE h1 SET ACCESS METHOD mergetree;
+SELECT amname, reloptions FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE relname = 'h1';
+  amname   |          reloptions           
+-----------+-------------------------------
+ mergetree | {fillfactor=70,storage=pages}
+(1 row)
+
+SELECT count(*), sum(a) FROM h1;
+ count | sum  
+-------+------
+   100 | 5050
+(1 row)
+
+ALTER TABLE h1 SET ACCESS METHOD heap;
+SELECT amname, reloptions FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE relname = 'h1';
+ amname |   reloptions    
+--------+-----------------
+ heap   | {fillfactor=70}
+(1 row)
+
+SELECT count(*), sum(a) FROM h1;
+ count | sum  
+-------+------
+   100 | 5050
+(1 row)
+
+ALTER TABLE h1 SET (fillfactor = 80);
+SELECT reloptions FROM pg_class WHERE relname = 'h1';
+   reloptions    
+-----------------
+ {fillfactor=80}
+(1 row)
+
+DROP TABLE o1, o2, r1, c1, ctas, si, dflt, h1;

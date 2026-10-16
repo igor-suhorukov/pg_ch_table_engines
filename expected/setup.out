@@ -1,0 +1,21 @@
+-- The extension, and what the other tests share.
+CREATE EXTENSION ch_table_engines;
+SELECT amname, amtype FROM pg_am WHERE amhandler::text LIKE 'ch.%' ORDER BY amname;
+            amname            | amtype 
+------------------------------+--------
+ aggregatingmergetree         | t
+ coalescingmergetree          | t
+ collapsingmergetree          | t
+ mergetree                    | t
+ replacingmergetree           | t
+ summingmergetree             | t
+ versionedcollapsingmergetree | t
+(7 rows)
+
+-- the engine library loads on first use, with its four idle executor threads
+SELECT version, threads FROM ch.engine_info();
+         version          | threads 
+--------------------------+---------
+ ClickHouse v26.8.8.8-lts |       5
+(1 row)
+

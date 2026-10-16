@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ch_table_engines' Compose project (ch_table_engines.md §2.1, §6): the dev
+# images, and the containers every leg runs in.  test/run.sh drives it; the
+# host builds images and starts containers, and nothing else (§1.2, rule 8).
+#
+#   chte-dev-vanilla   vanilla REL_19_STABLE: pg_accel/vexec-dev:vanilla and
+#                      what Dockerfile.dev adds
+#   vanilla            a leg's container on it: the tree read-only at /src,
+#                      its run's directory at /work, the engine library at
+#                      /engine, no network
+#   chte-engine-builder  Dockerfile.engine: Debian trixie with Clang 21 from
+#                      trixie-backports, for ClickHouse's sources
+#   engine             test/engine.sh on it: ClickHouse v26.8.8.8-lts read-only
+#                      at /ch, the build tree and ccache at /build (§2.2)
+#
+# PG_SRC is the build's checkout of PostgreSQL (pg_accel's
+# test/vexec/checkouts.sh keeps it, ~/.cache/pg_accel/postgres), from which
+# the image takes PostgreSQL's TAP modules at its server's own commit.
+
+name: pg_chte
+
+x-run: &run
+  user: postgres
+  network_mode: none
+  shm_size: 2gb
+  mem_limit: ${CHTE_MEM:-40g}
+  memswap_limit: ${CHTE_MEM:-40g}
+  cpus: ${CHTE_CPUS:-0}
+  tmpfs:
+    - /tmp:exec
+  volumes:
+    - ..:/src:ro
+    - ${CHTE_WORK:-/nonexistent}:/work
+    - ${CHTE_DATA:-/nonexistent}:/data:ro
+    - ${CHTE_ENGINE_BUILD:-${HOME}/.cache/pg_accel/chte/engine}/lib:/engine:ro
+  environment:
+    CHTE_SRC: /src
+    CHTE_WORK: /work
+    MAKE_JOBS: ${MAKE_JOBS:-8}
+    CHTE_TESTS: ${CHTE_TESTS:-}
+    CHTE_SETTINGS: ${CHTE_SETTINGS:-}
+    CHTE_ENGINE: /engine/libchte_engine.so
+
+services:
+  chte-dev-vanilla:
+    image: pg_chte/dev:${CHTE_VANILLA_FLAVOR:-vanilla}
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      additional_contexts:
+        pgsrc: ${PG_SRC:-${HOME}/.cache/pg_accel/postgres}
+      args:
+        BASE_IMAGE: pg_accel/vexec-dev:${CHTE_VANILLA_FLAVOR:-vanilla}
+    profiles: ["build"]
+
+  vanilla:
+    <<: *run
+    image: pg_chte/dev:${CHTE_VANILLA_FLAVOR:-vanilla}
+    profiles: ["run"]
+
+  chte-engine-builder:
+    image: pg_chte/engine-builder:clang21
+    build:
+      context: .
+      dockerfile: Dockerfile.engine
+    profiles: ["build"]
+
+  engine:
+    image: pg_chte/engine-builder:clang21
+    profiles: ["run"]
+    user: "1000:1000"
+    network_mode: none
+    mem_limit: ${CHTE_ENGINE_MEM:-44g}
+    memswap_limit: ${CHTE_ENGINE_MEM:-44g}
+    tmpfs:
+      - /tmp:exec
+    volumes:
+      - ..:/src:ro
+      - ${CHTE_CH_SRC:-${HOME}/.cache/pg_accel/chte/clickhouse-src}:/ch:ro
+      - ${CHTE_ENGINE_BUILD:-${HOME}/.cache/pg_accel/chte/engine}:/build
+    environment:
+      CHTE_ENGINE_JOBS: ${CHTE_ENGINE_JOBS:-16}
+      CHTE_ENGINE_TARGETS: ${CHTE_ENGINE_TARGETS:-chte_engine}
+      CHTE_ENGINE_RECONFIGURE: ${CHTE_ENGINE_RECONFIGURE:-0}
+      CHTE_ENGINE_KEEP_GOING: ${CHTE_ENGINE_KEEP_GOING:-1}
+      CHTE_ENGINE_BUILD_TYPE: ${CHTE_ENGINE_BUILD_TYPE:-RelWithDebInfo}

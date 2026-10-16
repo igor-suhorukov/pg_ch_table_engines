@@ -1,0 +1,7 @@
+/* Only the C API of include/chte_engine.h is visible; everything ClickHouse, libc++,
+ * libunwind and the bundled contribs define stays local to the library, so nothing in it
+ * can interpose on or be interposed by symbols of the server or other extensions. */
+{
+    global: chte_*;
+    local: *;
+};

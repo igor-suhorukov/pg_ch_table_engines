@@ -1,0 +1,7 @@
+# ch_table_engines: ClickHouse's MergeTree family as PostgreSQL 19 table
+# access methods (ch_table_engines.md).  Not ClickHouse's: the README says so.
+comment = 'ClickHouse''s MergeTree table engines as table access methods'
+default_version = '0.1'
+module_pathname = '$libdir/ch_table_engines'
+relocatable = false
+superuser = true

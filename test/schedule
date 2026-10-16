@@ -1,0 +1,15 @@
+# The extension's regression suite (ch_table_engines.md §6, "suite"):
+# "test:" against a server that preloads the library, "nopreload:" against one
+# that loads it lazily, "files:" against one whose ch.default_storage is files.
+test: setup
+test: options
+test: types
+test: insert
+test: visibility
+test: ddl
+test: scans
+test: functions
+test: store
+nopreload: nopreload
+# again with the files store as the default (§2.9): the tests whose answers do not name a store
+files: setup types insert visibility ddl scans functions

@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The identifiers the Cloudberry port's core series adds to PostgreSQL 19's
+# headers: origin/REL_19_STABLE_CLOUDBERRY at 871f0c5102e against
+# origin/REL_19_STABLE at 0f433a6b357, by checks/core_identifiers.py, which
+# counts the series' struct members and header guard beside the plan's 61
+# (ch_table_engines.md §1.2, rule 1).  No source of src/ names one.
+AnalyzeSampleRowsFunc
+CloseMatViewIncrementalMaintenanceExternal
+GetTableAmExtension
+LastNewOidWasPreassigned
+MemoryContextBlockFree
+MemoryContextBlockFreeHooked
+MemoryContextBlockMalloc
+MemoryContextBlockMallocHooked
+MemoryContextBlockRealloc
+MemoryContextBlockReallocHooked
+OpenMatViewIncrementalMaintenanceExternal
+RegisterTableAmExtension
+SMGR_FILE_CREATE
+SMGR_FILE_EXTEND
+SMGR_FILE_TRUNCATE
+SMGR_FILE_UNLINK
+SmgrFileEvent
+TABLEAMEXT_H
+TableAmBlockSequence
+TableAmExtRoutine
+TableAmExtensionCount
+XactAbortAgainAfterEnd
+XactAdoptTransactionState
+analyze_sample_rows_hook
+analyze_sample_rows_hook_type
+columnref_fallback_hook
+columnref_fallback_hook_type
+combocid_create_hook
+combocid_create_hook_type
+combocid_miss_hook
+combocid_miss_hook_type
+deparse_function_as_column_hook
+deparse_function_as_column_hook_type
+deparse_range_function_hook
+deparse_range_function_hook_type
+extractTableAmRelOptions
+index_unique_check
+memory_block_alloc_hook
+memory_block_alloc_hook_type
+new_oid_hook
+new_oid_hook_type
+parserQueryLockMode
+physical_slot_restart_lsn_hook
+physical_slot_restart_lsn_hook_type
+queryLockMode
+query_lockmode_hook
+query_lockmode_hook_type
+raw_parser_hook
+raw_parser_hook_type
+relation_add_columns
+relation_get_block_sequences
+scan_extractcolumns
+smgr_file_event_hook
+smgr_file_event_hook_type
+standard_raw_parser
+star_expansion_filter_hook
+star_expansion_filter_hook_type
+startblknum
+table_am_reloptions
+table_scan_extractcolumns
+table_scans_by_column
+tablespace_location_drop_hook
+tablespace_location_drop_hook_type
+tablespace_location_hook
+tablespace_location_hook_type
+xact_commit_recorded_hook
+xact_commit_recorded_hook_type

@@ -1,0 +1,190 @@
+-- DDL over a table of an engine (ch_table_engines.md §2.13).
+SET client_min_messages = warning;
+CREATE TABLE dd (a int, b text) USING mergetree WITH (order_by = 'a');
+INSERT INTO dd SELECT g, 'v' || g FROM generate_series(1, 1000) g;
+-- TRUNCATE, rolled back and committed
+BEGIN;
+TRUNCATE dd;
+SELECT count(*) FROM dd;
+ count 
+-------
+     0
+(1 row)
+
+ROLLBACK;
+SELECT count(*), sum(a) FROM dd;
+ count |  sum   
+-------+--------
+  1000 | 500500
+(1 row)
+
+TRUNCATE dd;
+SELECT count(*) FROM dd;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM ch.parts('dd');
+ count 
+-------
+     0
+(1 row)
+
+INSERT INTO dd SELECT g, 'v' || g FROM generate_series(1, 1000) g;
+-- ADD COLUMN: older parts read the column's missing value
+ALTER TABLE dd ADD COLUMN c int DEFAULT 7;
+ALTER TABLE dd ADD COLUMN d text;
+INSERT INTO dd VALUES (2000, 'new', 8, 'dee');
+SELECT c, d, count(*) FROM dd GROUP BY c, d ORDER BY c;
+ c |  d  | count 
+---+-----+-------
+ 7 |     |  1000
+ 8 | dee |     1
+(2 rows)
+
+-- a volatile default rewrites the table
+ALTER TABLE dd ADD COLUMN e float8 DEFAULT random();
+SELECT count(*), count(e), bool_and(e >= 0 AND e < 1) FROM dd;
+ count | count | bool_and 
+-------+-------+----------
+  1001 |  1001 | t
+(1 row)
+
+-- DROP COLUMN
+ALTER TABLE dd DROP COLUMN b;
+SELECT count(*), sum(a), sum(c) FROM dd;
+ count |  sum   | sum  
+-------+--------+------
+  1001 | 502500 | 7008
+(1 row)
+
+INSERT INTO dd (a, c, d) VALUES (3000, 9, 'after drop');
+SELECT a, c, d FROM dd WHERE a >= 2000 ORDER BY a;
+  a   | c |     d      
+------+---+------------
+ 2000 | 8 | dee
+ 3000 | 9 | after drop
+(2 rows)
+
+SELECT ch.definition('dd');
+                                                                                                                                                                                                  definition                                                                                                                                                                                                   
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(LZ4), c3 Nullable(Int32) CODEC(LZ4), c4 Nullable(String) CODEC(LZ4), c5 Nullable(Float64) CODEC(LZ4), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = MergeTree ORDER BY (c1) SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0
+(1 row)
+
+-- a type change rewrites
+ALTER TABLE dd ALTER COLUMN a TYPE int8;
+SELECT pg_typeof(a), count(*), sum(a) FROM dd GROUP BY 1;
+ pg_typeof | count |  sum   
+-----------+-------+--------
+ bigint    |  1002 | 505500
+(1 row)
+
+-- VACUUM FULL rewrites into new storage
+SELECT relfilenode AS before FROM pg_class WHERE relname = 'dd' \gset
+VACUUM FULL dd;
+SELECT relfilenode <> :before AS new_storage FROM pg_class WHERE relname = 'dd';
+ new_storage 
+-------------
+ t
+(1 row)
+
+SELECT count(*), sum(a), sum(c) FROM dd;
+ count |  sum   | sum  
+-------+--------+------
+  1002 | 505500 | 7017
+(1 row)
+
+VACUUM dd;
+-- SET NOT NULL scans; the parts keep their columns as they are
+ALTER TABLE dd ALTER COLUMN a SET NOT NULL;
+INSERT INTO dd (a, e) VALUES (NULL, 0.5);
+ERROR:  null value in column "a" of relation "dd" violates not-null constraint
+DETAIL:  Failing row contains (null, 7, null, 0.5).
+ALTER TABLE dd ALTER COLUMN a DROP NOT NULL;
+-- SET TABLESPACE copies the parts
+CREATE TABLESPACE chts LOCATION '';
+ALTER TABLE dd SET TABLESPACE chts;
+SELECT count(*), sum(a), sum(c) FROM dd;
+ count |  sum   | sum  
+-------+--------+------
+  1002 | 505500 | 7017
+(1 row)
+
+INSERT INTO dd (a, c) VALUES (4000, 1);
+SELECT count(*) FROM dd;
+ count 
+-------
+  1003
+(1 row)
+
+ALTER TABLE dd SET TABLESPACE pg_default;
+SELECT count(*), sum(a) FROM dd;
+ count |  sum   
+-------+--------
+  1003 | 509500
+(1 row)
+
+-- UNLOGGED and TEMPORARY tables, and SET LOGGED
+CREATE UNLOGGED TABLE du (a int) USING mergetree;
+INSERT INTO du SELECT generate_series(1, 100);
+SELECT count(*) FROM du;
+ count 
+-------
+   100
+(1 row)
+
+SELECT count(*) FROM ch.tables_unlogged t JOIN pg_class c ON c.relfilenode = t.relfilenumber WHERE c.relname = 'du';
+ count 
+-------
+     1
+(1 row)
+
+ALTER TABLE du SET LOGGED;
+SELECT relpersistence, (SELECT count(*) FROM du) FROM pg_class WHERE relname = 'du';
+ relpersistence | count 
+----------------+-------
+ p              |   100
+(1 row)
+
+CREATE TEMP TABLE dt (a int) USING mergetree;
+INSERT INTO dt SELECT generate_series(1, 50);
+SELECT count(*) FROM dt;
+ count 
+-------
+    50
+(1 row)
+
+SELECT backend >= 0 AS has_backend FROM ch.tables_unlogged t JOIN pg_class c ON c.relfilenode = t.relfilenumber WHERE c.relname = 'dt';
+ has_backend 
+-------------
+ t
+(1 row)
+
+-- DROP, rolled back and committed
+BEGIN;
+DROP TABLE du;
+ROLLBACK;
+SELECT count(*) FROM du;
+ count 
+-------
+   100
+(1 row)
+
+DROP TABLE du, dt;
+-- the catalogs keep nothing of dropped tables
+DROP TABLE dd;
+DROP TABLESPACE chts;
+SELECT count(*) FROM ch.tables t WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.relfilenode = t.relfilenumber);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM ch.parts p WHERE NOT EXISTS (SELECT 1 FROM ch.tables t WHERE t.relfilenumber = p.relfilenumber);
+ count 
+-------
+     0
+(1 row)
+

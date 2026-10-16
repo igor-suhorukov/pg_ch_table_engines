@@ -1,0 +1,137 @@
+/*-------------------------------------------------------------------------
+ *
+ * functions.c
+ *	  The extension's SQL functions (ch_table_engines.md §2.4, "Functions").
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/htup_details.h"
+#include "access/relation.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "catalog/pg_class.h"
+#include "utils/acl.h"
+#include "utils/builtins.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
+
+#include "chte.h"
+
+static Relation
+open_engine_relation(Oid relid, ChEngineKind *kind)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+
+	if (!ch_is_engine_rel(rel, kind))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a table of the ClickHouse engines", RelationGetRelationName(rel))));
+	return rel;
+}
+
+PG_FUNCTION_INFO_V1(ch_parts);
+Datum
+ch_parts(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	rel;
+	ChStorageId id;
+	List	   *parts;
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rel = open_engine_relation(PG_GETARG_OID(0), NULL);
+	ch_buffer_flush_for_scan(rel, GetActiveSnapshot());
+	ch_storage_id(rel, &rel->rd_locator, &id);
+	parts = ch_parts_visible(&id, GetActiveSnapshot());
+	foreach(lc, parts)
+	{
+		ChPart	   *p = lfirst(lc);
+		Datum		values[6];
+		bool		nulls[6] = {false};
+
+		values[0] = CStringGetTextDatum(p->name);
+		values[1] = Int64GetDatum(p->rows);
+		values[2] = Int64GetDatum(p->bytes);
+		values[3] = Int64GetDatum(p->min_rowid);
+		values[4] = Int64GetDatum(p->max_rowid);
+		values[5] = Int32GetDatum(p->level);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	relation_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(ch_definition);
+Datum
+ch_definition(PG_FUNCTION_ARGS)
+{
+	ChEngineKind kind;
+	Relation	rel = open_engine_relation(PG_GETARG_OID(0), &kind);
+	ChOptions	opts;
+	char	   *def;
+
+	ch_relation_options(rel, &opts);
+	def = ch_table_definition(rel, &opts, kind);
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(def));
+}
+
+PG_FUNCTION_INFO_V1(ch_table_size);
+Datum
+ch_table_size(PG_FUNCTION_ARGS)
+{
+	Relation	rel = open_engine_relation(PG_GETARG_OID(0), NULL);
+	ChStorageId id;
+	List	   *parts;
+	ListCell   *lc;
+	int64		bytes = 0;
+
+	ch_storage_id(rel, &rel->rd_locator, &id);
+	parts = ch_parts_visible(&id, GetActiveSnapshot());
+	foreach(lc, parts)
+		bytes += ((ChPart *) lfirst(lc))->bytes;
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(bytes);
+}
+
+PG_FUNCTION_INFO_V1(ch_engine_info);
+Datum
+ch_engine_info(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false};
+	const ChEngine *eng = ch_engine();
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = CStringGetTextDatum("ClickHouse v26.8.8.8-lts");
+	values[1] = Int32GetDatum(eng->thread_count());
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(ch_remove_orphans);
+Datum
+ch_remove_orphans(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), ShareLock);
+	ChStorageId id;
+	int			removed;
+
+	if (!ch_is_engine_rel(rel, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a table of the ClickHouse engines", RelationGetRelationName(rel))));
+	if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, RelationGetRelationName(rel));
+	ch_storage_id(rel, &rel->rd_locator, &id);
+	removed = ch_store_sweep(rel, &id);
+	relation_close(rel, NoLock);
+	PG_RETURN_INT32(removed);
+}

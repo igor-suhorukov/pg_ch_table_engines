@@ -1,0 +1,32 @@
+# The submodules of ClickHouse v26.8.8.8-lts the engine library needs (ch_table_engines.md §2.2):
+# what dbms, the functions and the aggregate functions link unconditionally, the C++ runtime
+# (llvm-project), sysroot (checked at configure) and libfiu.
+# Start minimal; add a line when configure or link names a missing ch_contrib:: target.
+contrib/sysroot
+contrib/llvm-project
+contrib/abseil-cpp
+contrib/boost
+contrib/cctz
+contrib/double-conversion
+contrib/fast_float
+contrib/fmtlib
+contrib/lz4
+contrib/magic_enum
+contrib/miniselect
+contrib/re2
+contrib/sparsehash-c11
+contrib/StringZilla
+contrib/xxHash
+contrib/xz
+contrib/zlib-ng
+contrib/zmij
+contrib/zstd
+contrib/zxc
+contrib/croaring
+contrib/libdivide
+contrib/c-ares
+contrib/replxx
+contrib/clickstack
+contrib/wyhash
+contrib/morton-nd
+contrib/libfiu
