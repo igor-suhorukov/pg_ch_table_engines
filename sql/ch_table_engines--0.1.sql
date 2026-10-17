@@ -4,6 +4,8 @@
 
 CREATE SCHEMA ch;
 
+-- The catalogs are heap's, whatever default_table_access_method says.
+
 -- A table's storage: one row per relfilenumber the extension made, with its row
 -- id and block counters (§2.6, "Row ids").  The counters move in place and
 -- never back, as a sequence's do.
@@ -17,7 +19,7 @@ CREATE TABLE ch.tables (
 	next_rowid		bigint NOT NULL,
 	next_block		bigint NOT NULL,
 	library			text NOT NULL
-);
+) USING heap;
 CREATE UNIQUE INDEX tables_storage ON ch.tables (tablespace, relfilenumber, backend);
 
 -- A part's row: its visibility is the part's (§2.6, MVCC rules 1-4).
@@ -31,14 +33,15 @@ CREATE TABLE ch.parts (
 	min_rowid		bigint NOT NULL,
 	max_rowid		bigint NOT NULL,
 	level			integer NOT NULL,
+	marks			integer NOT NULL,	-- its granules
 	manifest		bytea				-- the pages store's: each file's pages; NULL in the files store
-);
+) USING heap;
 CREATE UNIQUE INDEX parts_storage_name ON ch.parts (tablespace, relfilenumber, backend, name);
 
 -- The same for UNLOGGED and temporary tables, which a crash resets with them.
-CREATE UNLOGGED TABLE ch.tables_unlogged (LIKE ch.tables);
+CREATE UNLOGGED TABLE ch.tables_unlogged (LIKE ch.tables) USING heap;
 CREATE UNIQUE INDEX tables_unlogged_storage ON ch.tables_unlogged (tablespace, relfilenumber, backend);
-CREATE UNLOGGED TABLE ch.parts_unlogged (LIKE ch.parts);
+CREATE UNLOGGED TABLE ch.parts_unlogged (LIKE ch.parts) USING heap;
 CREATE UNIQUE INDEX parts_unlogged_storage_name ON ch.parts_unlogged (tablespace, relfilenumber, backend, name);
 
 REVOKE ALL ON ch.tables, ch.parts, ch.tables_unlogged, ch.parts_unlogged FROM PUBLIC;

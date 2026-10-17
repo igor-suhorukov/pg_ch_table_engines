@@ -27,7 +27,8 @@ typedef struct ChEngine
 	int			(*write_part) (chte_writer *, size_t, chte_part_info *, chte_error *);
 	int			(*write_commit) (chte_writer *, chte_error *);
 	void		(*write_close) (chte_writer *);
-	int			(*read_begin) (chte_table *, const char *, const char *, chte_reader **, chte_error *);
+	int			(*read_begin) (chte_table *, const char *, const char *, const chte_mark_range *, size_t,
+							   chte_reader **, chte_error *);
 	int			(*read_next) (chte_reader *, uint32_t *, chte_error *);
 	int			(*read_vector) (chte_reader *, uint32_t, chte_vector *, chte_error *);
 	void		(*read_end) (chte_reader *);
@@ -36,6 +37,15 @@ typedef struct ChEngine
 	int			(*drop_part) (chte_table *, const char *, chte_error *);
 	int			(*pages_attach) (chte_table *, const char *, const chte_page_file *, size_t, chte_error *);
 	void		(*pages_detach) (chte_table *, const char *);
+	int			(*filter_create) (chte_table *, const chte_filter_node *, size_t, chte_filter **, chte_error *);
+	void		(*filter_free) (chte_filter *);
+	int			(*part_select) (chte_table *, const char *, chte_filter *, uint32_t, uint32_t,
+								chte_mark_range *, size_t, size_t *, uint64_t *, chte_error *);
+	int			(*part_column_bytes) (chte_table *, const char *, const char *, uint64_t *, uint64_t *,
+									  chte_error *);
+	int			(*part_stats) (chte_table *, const char *, const char *, chte_column_stats *, chte_error *);
+	chte_batch *(*read_retain) (chte_reader *);
+	void		(*batch_release) (chte_batch *);
 } ChEngine;
 
 /* GUCs */
@@ -46,11 +56,18 @@ extern char *ch_engine_settings;
 /* The library, loaded and initialized on the first call. */
 extern const ChEngine *ch_engine(void);
 
-/* Readers and writers, owned by the resource owner they are opened under */
+/* The library's objects, owned by the resource owner they are made under */
 #include "utils/resowner.h"
+typedef enum ChHandleKind
+{
+	CH_HANDLE_READER,
+	CH_HANDLE_WRITER,
+	CH_HANDLE_FILTER,
+	CH_HANDLE_BATCH
+} ChHandleKind;
 extern ResourceOwner ch_handle_reserve(void);
-extern void ch_handle_opened(ResourceOwner owner, bool reader, void *ptr);
-extern void ch_handle_closing(ResourceOwner owner, bool reader, void *ptr);
+extern void ch_handle_opened(ResourceOwner owner, ChHandleKind kind, void *ptr);
+extern void ch_handle_closing(ResourceOwner owner, ChHandleKind kind, void *ptr);
 
 /* Whether this process has loaded it. */
 extern bool ch_engine_loaded(void);

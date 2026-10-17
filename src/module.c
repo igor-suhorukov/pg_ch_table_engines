@@ -116,6 +116,14 @@ _PG_init(void)
 							   "",
 							   PGC_SUSET, 0,
 							   NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_chscan",
+							 "Whether the planner offers ChScan: a scan that reads only the columns it needs, "
+							 "and only the granules its quals keep.",
+							 NULL,
+							 &ch_enable_chscan,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 	MarkGUCPrefixReserved("ch");
 
 	ch_options_init();
@@ -126,6 +134,12 @@ _PG_init(void)
 	RegisterXactCallback(ch_xact_callback, NULL);
 	RegisterSubXactCallback(ch_subxact_callback, NULL);
 
+	ch_chscan_init();
+
 	if (ch_preloaded)
+	{
 		ch_store_register_rmgr();
+		/* without vexec, unused entries of its registries */
+		ch_vexec_register();
+	}
 }

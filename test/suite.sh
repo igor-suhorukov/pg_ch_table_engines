@@ -8,6 +8,8 @@
 #
 #   CHTE_TESTS   the tests, all of the schedule's by default
 #   CHTE_WORK    the run's directory: results/, the servers' logs
+#   CHTE_PRELOAD the preloaded servers' shared_preload_libraries:
+#                ch_table_engines; pg_accel's chte leg adds vexec
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
@@ -42,7 +44,7 @@ run_suite() {
 
 tests=${CHTE_TESTS:-$(sed -n 's/^test: //p' "$BUILD/test/schedule" | tr '\n' ' ')}
 echo "== suite, preloaded: $tests"
-run_suite preloaded ch_table_engines $tests || status=1
+run_suite preloaded "${CHTE_PRELOAD:-ch_table_engines}" $tests || status=1
 nopreload=$(sed -n 's/^nopreload: //p' "$BUILD/test/schedule" | tr '\n' ' ')
 if [ -z "${CHTE_TESTS:-}" ] && [ -n "$nopreload" ]; then
 	echo "== suite, not preloaded: $nopreload"
@@ -51,6 +53,6 @@ fi
 files=$(sed -n 's/^files: //p' "$BUILD/test/schedule" | tr '\n' ' ')
 if [ -z "${CHTE_TESTS:-}" ] && [ -n "$files" ]; then
 	echo "== suite, the files store by default: $files"
-	CHTE_EXTRA_SETTING="ch.default_storage = 'files'" run_suite files ch_table_engines $files || status=1
+	CHTE_EXTRA_SETTING="ch.default_storage = 'files'" run_suite files "${CHTE_PRELOAD:-ch_table_engines}" $files || status=1
 fi
 exit $status

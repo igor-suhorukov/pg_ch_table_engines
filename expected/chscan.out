@@ -1,0 +1,624 @@
+-- ChScan (ch_table_engines.md §2.8): the columns a scan needs, and the
+-- granules its quals keep by ClickHouse's analysis of the key and of the
+-- parts' statistics; every answer the same as the plain scan's.
+SET client_min_messages = warning;
+SET ch.insert_buffer_rows = 20000;
+CREATE TABLE cs (a int, b text, c numeric(10, 2), d date, e bool, f int8, g float8)
+  USING mergetree WITH (order_by = 'a', settings = 'index_granularity = 1024');
+-- five parts of 20,000 rows, a's ranges apart: 1-20000, 20001-40000, ...
+INSERT INTO cs SELECT i, 'k' || (i % 100), i / 4.0, date '2020-01-01' + i / 100, i % 3 = 0,
+    CASE WHEN i % 10 = 0 THEN NULL ELSE i * 1000 END, i / 8.0
+  FROM generate_series(1, 100000) i;
+RESET ch.insert_buffer_rows;
+SELECT count(*) AS parts, sum(rows) AS rows FROM ch.parts('cs');
+ parts |  rows  
+-------+--------
+     5 | 100000
+(1 row)
+
+-- every query answered by ChScan and by the plain scan, the same
+CREATE FUNCTION same_answer(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  with_chscan text;
+  without text;
+BEGIN
+  SET LOCAL ch.enable_chscan = on;
+  EXECUTE 'SELECT md5(coalesce(string_agg(r::text, '','' ORDER BY r::text), '''')) FROM (' || q || ') r'
+    INTO with_chscan;
+  SET LOCAL ch.enable_chscan = off;
+  EXECUTE 'SELECT md5(coalesce(string_agg(r::text, '','' ORDER BY r::text), '''')) FROM (' || q || ') r'
+    INTO without;
+  RETURN CASE WHEN with_chscan = without THEN 'same' ELSE 'DIFFERENT' END;
+END $$;
+-- what ChScan read, from EXPLAIN ANALYZE, whatever the workers launched
+CREATE FUNCTION granules(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  plan jsonb;
+  node jsonb;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) ' || q INTO plan;
+  node := jsonb_path_query_first(plan, 'strict $.**? (@."Custom Plan Provider" == "ChScan")');
+  RETURN format('%s read of %s, parts pruned: %s', node->>'Granules Read', node->>'Granules', node->>'Parts Pruned');
+END $$;
+-- the key: a range of granules of one part; the other parts ruled out by their statistics
+EXPLAIN (COSTS OFF) SELECT count(*), sum(c) FROM cs WHERE a BETWEEN 1000 AND 2000;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Custom Scan (ChScan) on cs
+         Filter: ((a >= 1000) AND (a <= 2000))
+         Columns: a, c
+         Pruning: ((a >= 1000) AND (a <= 2000))
+(5 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(*), sum(c) FROM cs WHERE a BETWEEN 1000 AND 2000;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (ChScan) on cs (actual rows=1001.00 loops=1)
+         Filter: ((a >= 1000) AND (a <= 2000))
+         Rows Removed by Filter: 1047
+         Columns: a, c
+         Pruning: ((a >= 1000) AND (a <= 2000))
+         Granules: 2 read of 100, parts pruned: 4
+(7 rows)
+
+SELECT count(*), sum(c) FROM cs WHERE a BETWEEN 1000 AND 2000;
+ count |    sum    
+-------+-----------
+  1001 | 375375.00
+(1 row)
+
+SELECT same_answer('SELECT a, b, c FROM cs WHERE a BETWEEN 1000 AND 2000');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- comparisons of every kind, constant first or last, and the rows they keep
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT a FROM cs WHERE a = 54321;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (ChScan) on cs (actual rows=1.00 loops=1)
+   Filter: (a = 54321)
+   Rows Removed by Filter: 1023
+   Columns: a
+   Pruning: (a = 54321)
+   Granules: 1 read of 100, parts pruned: 4
+(6 rows)
+
+SELECT same_answer('SELECT a FROM cs WHERE a = 54321');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT a FROM cs WHERE 99990 < a;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Custom Scan (ChScan) on cs (actual rows=10.00 loops=1)
+   Filter: (99990 < a)
+   Rows Removed by Filter: 534
+   Columns: a
+   Pruning: (99990 < a)
+   Granules: 1 read of 100, parts pruned: 4
+(6 rows)
+
+SELECT same_answer('SELECT a FROM cs WHERE 99990 < a');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE a <= 3');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE a >= 99998');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT count(*) FROM cs WHERE a <> 7');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a FROM cs WHERE a IN (5, 50000, 99999);
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (ChScan) on cs (actual rows=3.00 loops=1)
+   Filter: (a = ANY ('{5,50000,99999}'::integer[]))
+   Rows Removed by Filter: 2589
+   Columns: a
+   Pruning: (a = ANY ('{5,50000,99999}'::integer[]))
+   Granules: 3 read of 100, parts pruned: 2
+(6 rows)
+
+SELECT same_answer('SELECT a, b FROM cs WHERE a IN (5, 50000, 99999)');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE a = ANY (ARRAY[1, NULL, 77777])');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a FROM cs WHERE a < 100 OR a > 99900;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Custom Scan (ChScan) on cs (actual rows=199.00 loops=1)
+   Filter: ((a < 100) OR (a > 99900))
+   Rows Removed by Filter: 1369
+   Columns: a
+   Pruning: ((a < 100) OR (a > 99900))
+   Granules: 2 read of 100, parts pruned: 3
+(6 rows)
+
+SELECT same_answer('SELECT a FROM cs WHERE a < 100 OR a > 99900');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- an OR with a branch that cannot be translated prunes nothing
+EXPLAIN (COSTS OFF) SELECT a FROM cs WHERE a < 100 OR g > 5;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Custom Scan (ChScan) on cs
+   Filter: ((a < 100) OR (g > '5'::double precision))
+   Columns: a, g
+(3 rows)
+
+SELECT same_answer('SELECT a FROM cs WHERE a < 100 OR g > 5');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- nor one whose branch is a column with no least and greatest values kept
+SELECT granules('SELECT a FROM cs WHERE a < 100 OR b = ''k5''');
+             granules             
+----------------------------------
+ 100 read of 100, parts pruned: 0
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE a < 100 OR b = ''k5''');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- across integer widths; constants a column cannot hold
+SELECT same_answer('SELECT a FROM cs WHERE a = 54321::int8');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE a < 10::int2');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT a FROM cs WHERE a > 10000000000;
+              QUERY PLAN               
+---------------------------------------
+ Custom Scan (ChScan) on cs
+   Filter: (a > '10000000000'::bigint)
+   Columns: a
+(3 rows)
+
+SELECT same_answer('SELECT a FROM cs WHERE a > 10000000000');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE a = ANY (ARRAY[3, 10000000000])');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- columns that are not the key: their parts' statistics
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT count(*) FROM cs WHERE f > 99000000;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (ChScan) on cs (actual rows=900.00 loops=1)
+         Filter: (f > 99000000)
+         Rows Removed by Filter: 19100
+         Columns: f
+         Pruning: (f > 99000000)
+         Granules: 20 read of 100, parts pruned: 4
+(7 rows)
+
+SELECT same_answer('SELECT a, f FROM cs WHERE f > 99000000');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT count(*) FROM cs WHERE f IS NULL');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT count(*) FROM cs WHERE f IS NOT NULL AND a < 50');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT count(*) FROM cs WHERE c < 100;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (ChScan) on cs (actual rows=399.00 loops=1)
+         Filter: (c < '100'::numeric)
+         Rows Removed by Filter: 19601
+         Columns: c
+         Pruning: (c < '100'::numeric)
+         Granules: 20 read of 100, parts pruned: 4
+(7 rows)
+
+SELECT same_answer('SELECT a, c FROM cs WHERE c < 100');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- numeric constants: exact at the column's scale, or one no value can equal
+SELECT same_answer('SELECT a FROM cs WHERE c = 2.25');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE c = 2.251');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE c > 24999.75');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE c > 1e30');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(*) FROM cs WHERE d >= date '2022-09-01';
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (ChScan) on cs (actual rows=2601.00 loops=1)
+         Filter: (d >= '09-01-2022'::date)
+         Rows Removed by Filter: 17399
+         Columns: d
+         Pruning: (d >= '09-01-2022'::date)
+         Granules: 20 read of 100, parts pruned: 4
+(7 rows)
+
+SELECT same_answer('SELECT a, d FROM cs WHERE d >= date ''2022-09-01''');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE e AND a < 30');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE NOT e AND a < 30');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- text: equality under the database's collation; floats are left to the executor
+SELECT same_answer('SELECT count(*) FROM cs WHERE b = ''k42''');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT count(*) FROM cs WHERE b < ''k2'' COLLATE "C"');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT a FROM cs WHERE g > 12000;
+                QUERY PLAN                 
+-------------------------------------------
+ Custom Scan (ChScan) on cs
+   Filter: (g > '12000'::double precision)
+   Columns: a, g
+(3 rows)
+
+SELECT same_answer('SELECT a FROM cs WHERE g > 12000');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a FROM cs WHERE g = ''NaN''::float8');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- the columns read: none for count(*), the row id for ctid
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cs;
+            QUERY PLAN            
+----------------------------------
+ Aggregate
+   ->  Custom Scan (ChScan) on cs
+         Columns: none
+(3 rows)
+
+SELECT count(*) FROM cs;
+ count  
+--------
+ 100000
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT ctid, a FROM cs WHERE a = 77;
+         QUERY PLAN         
+----------------------------
+ Custom Scan (ChScan) on cs
+   Filter: (a = 77)
+   Columns: a, ctid
+   Pruning: (a = 77)
+(4 rows)
+
+SELECT ctid AS tid FROM cs WHERE a = 77 \gset
+SELECT a FROM cs WHERE ctid = :'tid';
+ a  
+----
+ 77
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT cs FROM cs WHERE a = 1;
+           QUERY PLAN           
+--------------------------------
+ Custom Scan (ChScan) on cs
+   Filter: (a = 1)
+   Columns: a, b, c, d, e, f, g
+   Pruning: (a = 1)
+(4 rows)
+
+SELECT cs FROM cs WHERE a = 1;
+                 cs                  
+-------------------------------------
+ (1,k1,0.25,01-01-2020,f,1000,0.125)
+(1 row)
+
+-- a cursor's scan gives its rows' TIDs, whatever it names: WHERE CURRENT OF takes them
+BEGIN;
+DECLARE c CURSOR FOR SELECT a FROM cs WHERE a < 3;
+FETCH 1 FROM c;
+ a 
+---
+ 1
+(1 row)
+
+DELETE FROM cs WHERE CURRENT OF c;
+ERROR:  DELETE is not supported on tables of the ClickHouse engines yet
+DETAIL:  It comes in phase CH2 of ch_table_engines.md.
+ROLLBACK;
+-- NULL constants, stable functions and parameters prune nothing
+SELECT same_answer('SELECT a FROM cs WHERE a = NULL::int');
+ same_answer 
+-------------
+ same
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT a FROM cs WHERE d > now()::date - 10000;
+               QUERY PLAN                
+-----------------------------------------
+ Custom Scan (ChScan) on cs
+   Filter: (d > ((now())::date - 10000))
+   Columns: a, d
+(3 rows)
+
+PREPARE p(int) AS SELECT count(*) FROM cs WHERE a < $1;
+EXECUTE p(10);
+ count 
+-------
+     9
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE p(10);
+            QUERY PLAN            
+----------------------------------
+ Aggregate
+   ->  Custom Scan (ChScan) on cs
+         Filter: (a < $1)
+         Columns: a
+(4 rows)
+
+EXECUTE p(10);
+ count 
+-------
+     9
+(1 row)
+
+RESET plan_cache_mode;
+DEALLOCATE p;
+-- the inner side of a nested loop, rescanned for each outer row
+CREATE TABLE outer_keys (k int);
+INSERT INTO outer_keys VALUES (10), (20000), (99999);
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+EXPLAIN (COSTS OFF) SELECT k, a FROM outer_keys JOIN cs ON a = k;
+              QUERY PLAN              
+--------------------------------------
+ Nested Loop
+   Join Filter: (outer_keys.k = cs.a)
+   ->  Seq Scan on outer_keys
+   ->  Custom Scan (ChScan) on cs
+         Columns: a
+(5 rows)
+
+SELECT k, a FROM outer_keys JOIN cs ON a = k ORDER BY k;
+   k   |   a   
+-------+-------
+    10 |    10
+ 20000 | 20000
+ 99999 | 99999
+(3 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+-- a column added after the parts were written: their rows have its default, and no statistics
+ALTER TABLE cs ADD COLUMN h int DEFAULT 7;
+INSERT INTO cs (a, h) VALUES (100001, 8);
+SELECT same_answer('SELECT count(*), sum(h) FROM cs WHERE h = 7');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT a, h FROM cs WHERE h > 7');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- parallel: the participants share the units, and EXPLAIN ANALYZE adds up what they read
+ALTER TABLE cs SET (parallel_workers = 4);
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 4;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(c) FROM cs WHERE a > 50000;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 4
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (ChScan) on cs
+                     Filter: (a > 50000)
+                     Columns: a, c
+                     Pruning: (a > 50000)
+(8 rows)
+
+SELECT granules('SELECT count(*), sum(c) FROM cs WHERE a > 50000');
+            granules             
+---------------------------------
+ 52 read of 101, parts pruned: 2
+(1 row)
+
+SELECT count(*), sum(c) FROM cs WHERE a > 50000;
+ count |     sum      
+-------+--------------
+ 50001 | 937506250.00
+(1 row)
+
+SELECT same_answer('SELECT a, b, c, d, e, f, g, h FROM cs WHERE a > 50000');
+ same_answer 
+-------------
+ same
+(1 row)
+
+SELECT same_answer('SELECT count(*), sum(a) FROM cs');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- the workers, without the option: as a SeqScan's over a heap table of the
+-- rows read, the columns read in them -- a count(*) reads no column, but
+-- 100,001 rows, 2.7 MB in heap's tuples
+ALTER TABLE cs RESET (parallel_workers);
+SET min_parallel_table_scan_size = '1MB';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cs;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 1
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (ChScan) on cs
+                     Columns: none
+(6 rows)
+
+SET min_parallel_table_scan_size = '4MB';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cs;
+            QUERY PLAN            
+----------------------------------
+ Aggregate
+   ->  Custom Scan (ChScan) on cs
+         Columns: none
+(3 rows)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+-- the files store answers alike
+CREATE TABLE cf (a int, b text) USING mergetree WITH (storage = 'files', order_by = 'a',
+  settings = 'index_granularity = 1024');
+INSERT INTO cf SELECT i, 'v' || i FROM generate_series(1, 50000) i;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT b FROM cf WHERE a = 4096;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (ChScan) on cf (actual rows=1.00 loops=1)
+   Filter: (a = 4096)
+   Rows Removed by Filter: 1023
+   Columns: a, b
+   Pruning: (a = 4096)
+   Granules: 1 read of 49
+(6 rows)
+
+SELECT b FROM cf WHERE a = 4096;
+   b   
+-------
+ v4096
+(1 row)
+
+SELECT same_answer('SELECT a, b FROM cf WHERE a BETWEEN 300 AND 5000');
+ same_answer 
+-------------
+ same
+(1 row)
+
+-- off, the plain scan
+SET ch.enable_chscan = off;
+EXPLAIN (COSTS OFF) SELECT a FROM cs WHERE a = 5;
+    QUERY PLAN     
+-------------------
+ Seq Scan on cs
+   Filter: (a = 5)
+(2 rows)
+
+RESET ch.enable_chscan;
+DROP TABLE cs, cf, outer_keys;
+DROP FUNCTION same_answer(text), granules(text);

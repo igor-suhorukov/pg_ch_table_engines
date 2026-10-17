@@ -23,7 +23,8 @@
 #                        default_table_access_method = mergetree, its
 #                        differences kept for review
 #   run.sh hits          10M ClickBench rows by COPY into heap and mergetree
-#                        in both stores, their answers compared
+#                        in both stores, their answers compared, and six
+#                        reads timed
 #   run.sh all           core, spike, suite, tap
 #
 # Settings, from the environment:

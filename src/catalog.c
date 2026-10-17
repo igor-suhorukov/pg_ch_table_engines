@@ -59,7 +59,7 @@
 #define Anum_tables_library 9
 
 /* ch.parts's columns */
-#define Natts_parts 10
+#define Natts_parts 11
 #define Anum_parts_tablespace 1
 #define Anum_parts_relfilenumber 2
 #define Anum_parts_backend 3
@@ -69,7 +69,8 @@
 #define Anum_parts_min_rowid 7
 #define Anum_parts_max_rowid 8
 #define Anum_parts_level 9
-#define Anum_parts_manifest 10
+#define Anum_parts_marks 10
+#define Anum_parts_manifest 11
 
 static bool
 twin(const ChStorageId *id)
@@ -171,9 +172,25 @@ update_with_index(Relation catalog, ItemPointer otid, HeapTuple newtup)
 	}
 }
 
+/* Parts in the order of their rows: their first row ids, which rows get as they enter */
+static int
+part_order(const ListCell *a, const ListCell *b)
+{
+	const ChPart *pa = lfirst(a);
+	const ChPart *pb = lfirst(b);
+
+	if (pa->min_rowid != pb->min_rowid)
+		return pa->min_rowid < pb->min_rowid ? -1 : 1;
+	return strcmp(pa->name, pb->name);
+}
+
 /*
- * The parts of a storage a snapshot sees.  A scan without a snapshot (ANALYZE)
- * and SnapshotAny take the parts no one can see anymore out (scan.c).
+ * The parts of a storage a snapshot sees, in the order their rows entered --
+ * the catalog's index orders them by name, where all_10_10_0 comes before
+ * all_2_2_0 -- so that a scan reads the rows of a table never merged in the
+ * order they were inserted, as heap's does.  A scan without a snapshot
+ * (ANALYZE) and SnapshotAny take the parts no one can see anymore out
+ * (scan.c).
  */
 List *
 ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
@@ -201,12 +218,14 @@ ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
 		p->min_rowid = DatumGetInt64(values[Anum_parts_min_rowid - 1]);
 		p->max_rowid = DatumGetInt64(values[Anum_parts_max_rowid - 1]);
 		p->level = DatumGetInt32(values[Anum_parts_level - 1]);
+		p->marks = DatumGetInt32(values[Anum_parts_marks - 1]);
 		p->manifest = nulls[Anum_parts_manifest - 1] ? NULL :
 			DatumGetByteaPCopy(values[Anum_parts_manifest - 1]);
 		parts = lappend(parts, p);
 	}
 	systable_endscan(scan);
 	table_close(catalog, AccessShareLock);
+	list_sort(parts, part_order);
 	return parts;
 }
 
@@ -229,6 +248,7 @@ ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid)
 	values[Anum_parts_min_rowid - 1] = Int64GetDatum(part->min_rowid);
 	values[Anum_parts_max_rowid - 1] = Int64GetDatum(part->max_rowid);
 	values[Anum_parts_level - 1] = Int32GetDatum(part->level);
+	values[Anum_parts_marks - 1] = Int32GetDatum(part->marks);
 	if (part->manifest)
 		values[Anum_parts_manifest - 1] = PointerGetDatum(part->manifest);
 	else
@@ -472,10 +492,13 @@ ch_counters_allocate(const ChStorageId *id, uint64 nrowids, uint64 nblocks,
 	/*
 	 * A block number names a part's directory before the transaction commits,
 	 * so it is durable first: a crash must not hand it out again while a dead
-	 * writer's directory has the name.
+	 * writer's directory has the name.  The in-place update's record is the
+	 * last this backend inserted: its end is flushed, not the insert
+	 * position, which past a page's end is the next record's start, beyond
+	 * what can be flushed ("xlog flush request ... is not satisfied").
 	 */
 	if (nblocks > 0 && !twin(id))
-		XLogFlush(GetXLogInsertRecPtr());
+		XLogFlush(XactLastRecEnd);
 }
 
 /* Writes the counters kept in the backend before the transaction commits */

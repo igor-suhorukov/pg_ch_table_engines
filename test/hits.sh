@@ -3,7 +3,8 @@
 #
 # 10M ClickBench rows by COPY into heap and into mergetree in both stores
 # (ch_table_engines.md §5 CH0, §6 "hits"), in a dev container: count(*),
-# per-column checksums and pg_stats compared, the loads timed.  The data is mounted at /data
+# per-column checksums and pg_stats compared, the loads timed; and CH1's
+# reads, timed and compared.  The data is mounted at /data
 # (hits_10m.tsv); ClickBench's table, from its PostgreSQL entry, with its
 # primary key as the mergetree's order_by (§4).
 #
@@ -76,6 +77,44 @@ for t in hits_mt hits_mtp; do
 		diff <(tr '|' '\n' < "$WORK/checksums.hits_heap") <(tr '|' '\n' < "$WORK/checksums.$t") | head -20
 		status=1
 	fi
+done
+
+# CH1's reads: a few queries of ClickBench's kinds, each the fastest of three
+# runs, the answers compared with heap's; ChScan's columns and granules for
+# the mergetree tables in reads.plans
+READS=(
+	"count|SELECT count(*) FROM %t"
+	"one column|SELECT sum(AdvEngineID), count(*) FROM %t"
+	"key prefix|SELECT count(*), sum(ResolutionWidth) FROM %t WHERE CounterID = 62"
+	"key range|SELECT count(*), sum(IsRefresh) FROM %t WHERE CounterID = 62 AND EventDate >= '2013-07-15' AND EventDate < '2013-07-16'"
+	"min and max|SELECT min(EventDate), max(EventDate) FROM %t"
+	"a wide column|SELECT count(*) FROM %t WHERE URL LIKE '%google%'"
+)
+: > "$WORK/reads.tsv"
+: > "$WORK/reads.plans"
+for r in "${READS[@]}"; do
+	name="${r%%|*}"
+	q="${r#*|}"
+	ref=""
+	for t in hits_heap hits_mt hits_mtp; do
+		sql="${q//%t/$t}"
+		best=""
+		for i in 1 2 3; do
+			s=$(now_ms)
+			got=$("${PSQL[@]}" -d hits -c "$sql") || fail "$name on $t"
+			e=$(now_ms)
+			[ -z "$best" ] || [ $((e - s)) -lt "$best" ] && best=$((e - s))
+		done
+		printf '%s	%s	%d
+' "$name" "$t" "$best" | tee -a "$WORK/reads.tsv"
+		if [ "$t" = hits_heap ]; then
+			ref="$got"
+		elif [ "$got" != "$ref" ]; then
+			echo "hits: $name on $t answers $got, heap $ref"
+			status=1
+		fi
+		[ "$t" = hits_heap ] || { echo "== $name, $t"; "${PSQL[@]}" -d hits -c "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) $sql"; } >> "$WORK/reads.plans"
+	done
 done
 
 # pg_stats of the two, side by side: the difference is recorded, not failed on (§5 CH0)

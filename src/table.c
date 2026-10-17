@@ -332,30 +332,37 @@ codec(const char *compression)
 	return "CODEC(LZ4)";
 }
 
+/* Whether settings, "name = value, ...", name a setting, as a word of its own */
+static bool
+mentions_setting(const char *settings, const char *name)
+{
+	char	   *lower = asc_tolower(settings, strlen(settings));
+	char	   *at = strstr(lower, name);
+
+	while (at)
+	{
+		char		before = at == lower ? ' ' : at[-1];
+		char		after = at[strlen(name)];
+
+		if (!isalnum((unsigned char) before) && before != '_' &&
+			!isalnum((unsigned char) after) && after != '_')
+			return true;
+		at = strstr(at + 1, name);
+	}
+	return false;
+}
+
 /* MergeTree settings a table may not set: where its data lives is the extension's */
 static void
 check_user_settings(const char *settings)
 {
 	static const char *const refused[] = {"storage_policy", "disk", "table_disk"};
-	char	   *lower = asc_tolower(settings, strlen(settings));
 
 	for (int i = 0; i < lengthof(refused); i++)
-	{
-		char	   *at = strstr(lower, refused[i]);
-
-		while (at)
-		{
-			char		before = at == lower ? ' ' : at[-1];
-			char		after = at[strlen(refused[i])];
-
-			if (!isalnum((unsigned char) before) && before != '_' &&
-				!isalnum((unsigned char) after) && after != '_')
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("setting \"%s\" cannot be given to a table of the ClickHouse engines", refused[i])));
-			at = strstr(at + 1, refused[i]);
-		}
-	}
+		if (mentions_setting(settings, refused[i]))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("setting \"%s\" cannot be given to a table of the ClickHouse engines", refused[i])));
 }
 
 /* The ClickHouse CREATE TABLE of a relation, as the engine library compiles it */
@@ -445,6 +452,14 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 	/* the parts are synced before their catalog rows commit, as PostgreSQL syncs */
 	appendStringInfo(&buf, ", fsync_after_insert = %d, fsync_part_directory = %d",
 					 enableFsync ? 1 : 0, enableFsync ? 1 : 0);
+	/*
+	 * ClickHouse's statistics of every column, "basic" alone: exact least and
+	 * greatest values and NULLs of each part, which part pruning and the
+	 * source's aggregates read (§2.8); its default adds uniq_v2's sketches,
+	 * which nothing of the extension's reads.
+	 */
+	if (!opts->settings || !mentions_setting(opts->settings, "auto_statistics_types"))
+		appendStringInfoString(&buf, ", auto_statistics_types = 'basic'");
 	if (opts->settings && opts->settings[0])
 	{
 		check_user_settings(opts->settings);

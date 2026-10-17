@@ -25,6 +25,7 @@
 #include "utils/numeric.h"
 
 #include "chte.h"
+#include "vexec/vexec_sink.h"
 
 /* A growable byte array */
 typedef struct Bytes
@@ -511,4 +512,160 @@ ch_vector_to_datum(const ChColumn *col, const chte_vector *v, uint32 row, Datum 
 			*value = (Datum) 0;
 			break;
 	}
+}
+
+/* ---- a batch by column, from vexec's sink (vexec.c) ---- */
+
+static inline bool
+column_valid(const VexecColumn *vc, uint32 i)
+{
+	return vc->validity == NULL || (vc->validity[i / 64] >> (i % 64)) & 1;
+}
+
+/* The batch's NULLs as the builder keeps them, a byte a row; whether there was one */
+static bool
+append_nulls(ChVectorBuilder *b, BuilderColumn *bc, const VexecColumn *vc, uint32 nrows)
+{
+	uint8	   *nulls;
+	bool		any = false;
+
+	bytes_reserve(b->cxt, &bc->nulls, nrows);
+	nulls = (uint8 *) bc->nulls.data + bc->nulls.len;
+	for (uint32 i = 0; i < nrows; i++)
+	{
+		nulls[i] = column_valid(vc, i) ? 0 : 1;
+		any |= nulls[i];
+	}
+	bc->nulls.len += nrows;
+	bc->has_nulls |= any;
+	return any;
+}
+
+/* Fixed-width values, at their stride, of width bytes each; NULL rows zero */
+static void
+append_fixed(ChVectorBuilder *b, BuilderColumn *bc, const VexecColumn *vc, uint32 nrows, int width,
+			 bool nulls)
+{
+	char	   *dst;
+	const char *src = vc->values;
+
+	bytes_reserve(b->cxt, &bc->values, (Size) nrows * width);
+	dst = bc->values.data + bc->values.len;
+	if (vc->stride == width)
+		memcpy(dst, src, (Size) nrows * width);
+	else
+		for (uint32 i = 0; i < nrows; i++)
+			memcpy(dst + (Size) i * width, src + (Size) i * vc->stride, width);
+	if (nulls)
+		for (uint32 i = 0; i < nrows; i++)
+			if (!column_valid(vc, i))
+				memset(dst + (Size) i * width, 0, width);
+	bc->values.len += (Size) nrows * width;
+}
+
+/*
+ * nrows rows of the relation's attributes, a column each in the layout the
+ * sink took it in (vexec.c), and their row ids: the batch appended column by
+ * column, as ch_builder_add() appends a row.
+ */
+void
+ch_builder_add_columns(ChVectorBuilder *b, const VexecColumn *columns, uint32 nrows, const uint64 *rowids)
+{
+	for (int c = 0; c < b->ncols; c++)
+	{
+		BuilderColumn *bc = &b->cols[c];
+		const ChColumn *col = bc->col;
+		const VexecColumn *vc;
+		bool		nulls;
+
+		if (b->attnums[c] < 0)
+		{
+			bytes_append(b->cxt, &bc->values, rowids, sizeof(uint64) * nrows);
+			continue;
+		}
+		vc = &columns[b->attnums[c]];
+		nulls = append_nulls(b, bc, vc, nrows);
+		switch (col->kind)
+		{
+			case CH_COL_FIXED:
+				append_fixed(b, bc, vc, nrows, col->width, nulls);
+				break;
+			case CH_COL_NUMERIC:
+				if (vc->width == col->width)
+					append_fixed(b, bc, vc, nrows, col->width, nulls);
+				else
+				{
+					/* a numeric(p, s) with p <= 9 is a Decimal32: int64 scaled values narrowed */
+					const int64 *src = vc->values;
+					int32	   *dst;
+
+					Assert(vc->width == 8 && col->width == 4);
+					bytes_reserve(b->cxt, &bc->values, sizeof(int32) * nrows);
+					dst = (int32 *) (bc->values.data + bc->values.len);
+					for (uint32 i = 0; i < nrows; i++)
+						dst[i] = column_valid(vc, i) ? (int32) src[i] : 0;
+					bc->values.len += sizeof(int32) * nrows;
+				}
+				break;
+			case CH_COL_SIGN:
+				for (uint32 i = 0; i < nrows; i++)
+				{
+					const char *p = (const char *) vc->values + (Size) i * vc->stride;
+					int64		v = 0;
+					int8		b8;
+
+					if (column_valid(vc, i))
+						v = vc->width == 2 ? *(const int16 *) p : vc->width == 4 ? *(const int32 *) p :
+							*(const int64 *) p;
+					if (v < PG_INT8_MIN || v > PG_INT8_MAX)
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("sign value " INT64_FORMAT " is out of range", v),
+								 errhint("A collapsing engine's sign is 1 or -1.")));
+					b8 = (int8) v;
+					bytes_append(b->cxt, &bc->values, &b8, 1);
+				}
+				break;
+			case CH_COL_VARLENA:
+				if (vc->layout == VEXEC_OFFSETS)
+				{
+					const int32 *off = vc->values;
+					const char *bytes = vc->buffers[0];
+					uint64		base = bc->values.len;
+					uint64	   *dst;
+
+					bytes_append(b->cxt, &bc->values, bytes + off[0], off[nrows] - off[0]);
+					bytes_reserve(b->cxt, &bc->offsets, sizeof(uint64) * nrows);
+					dst = (uint64 *) (bc->offsets.data + bc->offsets.len);
+					for (uint32 i = 0; i < nrows; i++)
+						dst[i] = base + (uint64) (off[i + 1] - off[0]);
+					bc->offsets.len += sizeof(uint64) * nrows;
+				}
+				else
+				{
+					/* DATUM: headered values, never external or compressed (vexec_sink.h) */
+					const Datum *datums = vc->values;
+
+					for (uint32 i = 0; i < nrows; i++)
+					{
+						uint64		end;
+
+						if (column_valid(vc, i))
+						{
+							struct varlena *v = (struct varlena *) DatumGetPointer(datums[i]);
+
+							bytes_append(b->cxt, &bc->values, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v));
+						}
+						end = bc->values.len;
+						bytes_append(b->cxt, &bc->offsets, &end, sizeof(end));
+					}
+				}
+				break;
+			case CH_COL_CSTRING:
+			case CH_COL_DROPPED:
+				elog(ERROR, "a column of kind %d cannot be taken from a batch", (int) col->kind);
+				break;
+		}
+	}
+	b->nrows += nrows;
 }

@@ -164,6 +164,13 @@ ch_engine(void)
 	LOAD(drop_part, "chte_drop_part");
 	LOAD(pages_attach, "chte_pages_attach");
 	LOAD(pages_detach, "chte_pages_detach");
+	LOAD(filter_create, "chte_filter_create");
+	LOAD(filter_free, "chte_filter_free");
+	LOAD(part_select, "chte_part_select");
+	LOAD(part_column_bytes, "chte_part_column_bytes");
+	LOAD(part_stats, "chte_part_stats");
+	LOAD(read_retain, "chte_read_retain");
+	LOAD(batch_release, "chte_batch_release");
 
 	memset(&options, 0, sizeof(options));
 	options.abi_version = CHTE_ABI_VERSION;
@@ -253,11 +260,11 @@ ch_engine_raise(const chte_error *err, const char *what)
 }
 
 /*
- * Readers and writers of the engine library belong to the resource owner they
- * were opened under -- a portal's, for a scan -- and are closed when it is
- * released: an error or an aborted subtransaction leaves no ClickHouse object
- * or open file behind, and a cursor's reader outlives a savepoint rolled back
- * inside the cursor's transaction.
+ * The engine library's readers, writers, filters and retained batches belong
+ * to the resource owner they were made under -- a portal's, for a scan -- and
+ * are freed when it is released: an error or an aborted subtransaction leaves
+ * no ClickHouse object or open file behind, and a cursor's reader outlives a
+ * savepoint rolled back inside the cursor's transaction.
  */
 static void
 reader_release(Datum res)
@@ -273,21 +280,48 @@ writer_release(Datum res)
 		engine.write_close((chte_writer *) DatumGetPointer(res));
 }
 
-static const ResourceOwnerDesc reader_desc = {
-	.name = "ch_table_engines reader",
-	.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
-	.release_priority = RELEASE_PRIO_FIRST,
-	.ReleaseResource = reader_release,
+static void
+filter_release(Datum res)
+{
+	if (loaded)
+		engine.filter_free((chte_filter *) DatumGetPointer(res));
+}
+
+static void
+batch_release(Datum res)
+{
+	if (loaded)
+		engine.batch_release((chte_batch *) DatumGetPointer(res));
+}
+
+static const ResourceOwnerDesc handle_descs[] = {
+	[CH_HANDLE_READER] = {
+		.name = "ch_table_engines reader",
+		.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+		.release_priority = RELEASE_PRIO_FIRST,
+		.ReleaseResource = reader_release,
+	},
+	[CH_HANDLE_WRITER] = {
+		.name = "ch_table_engines writer",
+		.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+		.release_priority = RELEASE_PRIO_FIRST,
+		.ReleaseResource = writer_release,
+	},
+	[CH_HANDLE_FILTER] = {
+		.name = "ch_table_engines filter",
+		.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+		.release_priority = RELEASE_PRIO_FIRST,
+		.ReleaseResource = filter_release,
+	},
+	[CH_HANDLE_BATCH] = {
+		.name = "ch_table_engines batch",
+		.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+		.release_priority = RELEASE_PRIO_FIRST,
+		.ReleaseResource = batch_release,
+	},
 };
 
-static const ResourceOwnerDesc writer_desc = {
-	.name = "ch_table_engines writer",
-	.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
-	.release_priority = RELEASE_PRIO_FIRST,
-	.ReleaseResource = writer_release,
-};
-
-/* Before a handle is opened: the owner then has room for it */
+/* Before a handle is made: the owner then has room for it */
 ResourceOwner
 ch_handle_reserve(void)
 {
@@ -296,13 +330,13 @@ ch_handle_reserve(void)
 }
 
 void
-ch_handle_opened(ResourceOwner owner, bool reader, void *ptr)
+ch_handle_opened(ResourceOwner owner, ChHandleKind kind, void *ptr)
 {
-	ResourceOwnerRemember(owner, PointerGetDatum(ptr), reader ? &reader_desc : &writer_desc);
+	ResourceOwnerRemember(owner, PointerGetDatum(ptr), &handle_descs[kind]);
 }
 
 void
-ch_handle_closing(ResourceOwner owner, bool reader, void *ptr)
+ch_handle_closing(ResourceOwner owner, ChHandleKind kind, void *ptr)
 {
-	ResourceOwnerForget(owner, PointerGetDatum(ptr), reader ? &reader_desc : &writer_desc);
+	ResourceOwnerForget(owner, PointerGetDatum(ptr), &handle_descs[kind]);
 }

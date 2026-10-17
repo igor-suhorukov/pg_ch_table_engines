@@ -7,8 +7,10 @@ OBJS = \
 	src/am.o \
 	src/buffer.o \
 	src/catalog.o \
+	src/chscan.o \
 	src/convert.o \
 	src/engine.o \
+	src/filter.o \
 	src/functions.o \
 	src/module.o \
 	src/options.o \
@@ -16,7 +18,8 @@ OBJS = \
 	src/scan.o \
 	src/store.o \
 	src/table.o \
-	src/types.o
+	src/types.o \
+	src/vexec.o
 
 EXTENSION = ch_table_engines
 DATA = sql/ch_table_engines--0.1.sql

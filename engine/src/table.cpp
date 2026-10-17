@@ -20,7 +20,13 @@
 #include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/ProjectionsDescription.h>
+#include <Storages/Statistics/Statistics.h>
 #include <Storages/StorageInMemoryMetadata.h>
+
+namespace DB::MergeTreeSetting
+{
+    extern const MergeTreeSettingsString auto_statistics_types;
+}
 
 namespace DB::ErrorCodes
 {
@@ -171,6 +177,21 @@ MergeTreeData::MutableDataPartPtr PgMergeTree::loadPart(const String & part_name
     return part;
 }
 
+MergeTreeData::DataPartPtr PgMergeTree::getPart(const String & part_name) const
+{
+    auto it = parts.find(part_name);
+    if (it != parts.end())
+        return it->second;
+    DataPartPtr part = loadPart(part_name);
+    parts.emplace(part_name, part);
+    return part;
+}
+
+void PgMergeTree::forgetPart(const String & part_name) const
+{
+    parts.erase(part_name);
+}
+
 }
 
 using namespace chte;
@@ -251,6 +272,12 @@ extern "C" int chte_table_open(const chte_table_def * def, chte_table ** table, 
         if (storage_def.settings)
             metadata.settings_changes = storage_def.settings->ptr();
 
+        /// Statistics of every column, as registerStorageMergeTree.cpp:1022-1027 adds them: the
+        /// parts' least and greatest values and NULLs, built as a part is written or merged.
+        String statistics_types = (*settings)[MergeTreeSetting::auto_statistics_types];
+        if (!statistics_types.empty())
+            addImplicitStatistics(metadata.columns, statistics_types);
+
         StorageID id("chte", def->name && *def->name ? def->name : "table");
         std::shared_ptr<PagesDisk> pages_disk;
         if (def->pages)
@@ -259,7 +286,7 @@ extern "C" int chte_table_open(const chte_table_def * def, chte_table ** table, 
                                                      std::move(pages_disk));
         StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
         StorageMetadataPtr snapshot = handle;
-        *table = new chte_table{storage, snapshot, context};
+        *table = new chte_table{storage, snapshot, context, {}};
     });
 }
 

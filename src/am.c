@@ -132,7 +132,7 @@ not_yet(const char *what, const char *phase)
  * a trigger's tuple has it, as heap's have.  JIT declines slot types it does
  * not know (llvmjit_deform.c), and a filled virtual slot is never deformed.
  */
-static TupleTableSlotOps ch_slot_ops;
+TupleTableSlotOps ch_slot_ops;
 
 static HeapTuple
 ch_slot_copy_heap_tuple(TupleTableSlot *slot)
@@ -216,6 +216,8 @@ ch_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 option
 				BulkInsertStateData *bistate)
 {
 	ch_buffer_insert(rel, slot, cid);
+	/* as heap_insert() counts it */
+	pgstat_count_heap_insert(rel, 1);
 }
 
 static void
@@ -237,6 +239,8 @@ ch_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 {
 	for (int i = 0; i < nslots; i++)
 		ch_buffer_insert(rel, slots[i], cid);
+	/* as heap_multi_insert() counts them */
+	pgstat_count_heap_insert(rel, nslots);
 }
 
 static TM_Result
@@ -665,6 +669,15 @@ handler(ChEngineKind kind)
 	if (!routines_made)
 		make_routines();
 	PG_RETURN_POINTER(&routines[kind]);
+}
+
+/* An engine's routine, the key of its vexec source and sink, made by _PG_init */
+const TableAmRoutine *
+ch_am_routine(ChEngineKind kind)
+{
+	if (!routines_made)
+		make_routines();
+	return &routines[kind];
 }
 
 #define HANDLER(fn, kind) \

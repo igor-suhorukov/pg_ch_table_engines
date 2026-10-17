@@ -35,6 +35,13 @@ API(chte_read_vector);
 API(chte_read_end);
 API(chte_merge);
 API(chte_drop_part);
+API(chte_filter_create);
+API(chte_filter_free);
+API(chte_part_select);
+API(chte_part_column_bytes);
+API(chte_part_stats);
+API(chte_read_retain);
+API(chte_batch_release);
 
 static chte_error err;
 static int	failures;
@@ -139,7 +146,7 @@ check_part(chte_table *t, const char *part, uint64_t first, uint64_t n, int chec
 	uint64_t	prev = 0;
 	double		t0 = now();
 
-	CHECK(p_chte_read_begin(t, part, "id, v, s, n, _pg_rowid, _part_offset", &r, &err));
+	CHECK(p_chte_read_begin(t, part, "id, v, s, n, _pg_rowid, _part_offset", NULL, 0, &r, &err));
 	for (;;)
 	{
 		chte_vector id, v, s, nv, rowid, off;
@@ -183,6 +190,152 @@ check_part(chte_table *t, const char *part, uint64_t first, uint64_t n, int chec
 	p_chte_read_end(r);
 	EXPECT(seen == n, "%s: %" PRIu64 " rows read, %" PRIu64 " expected", part, seen, n);
 	printf("read %s: %" PRIu64 " rows in %.3f s\n", part, seen, now() - t0);
+}
+
+
+/* The granules a filter keeps of a part, and their rows */
+static size_t
+select_part(chte_table *t, const char *part, const chte_filter_node *nodes, size_t nnodes,
+			chte_mark_range *ranges, size_t max, uint64_t *rows)
+{
+	chte_filter *f = NULL;
+	size_t		n;
+
+	if (nnodes > 0)
+		CHECK(p_chte_filter_create(t, nodes, nnodes, &f, &err));
+	CHECK(p_chte_part_select(t, part, f, 0, 0, ranges, max, &n, rows, &err));
+	if (f)
+		p_chte_filter_free(f);
+	EXPECT(n <= max, "%zu ranges, room for %zu", n, max);
+	return n;
+}
+
+/*
+ * CH1: the merged part of ids 0..2n-1, sorted by id, pruned by filters through
+ * ClickHouse's key and statistics analysis; its statistics, sizes, a read of
+ * selected granules, and a batch retained past the next.
+ */
+static void
+pruning(chte_table *t, const char *part, uint64_t total)
+{
+	chte_mark_range ranges[64];
+	uint64_t	rows;
+	size_t		n;
+	uint64_t	lo = 100000, hi = 110000, big = 10000000;
+	uint64_t	in[3] = {5, 300000, 599999};
+	int64_t		nv = 9;
+	chte_column_stats st;
+	uint64_t	comp, uncomp;
+	chte_reader *r;
+	uint32_t	nrows;
+	uint64_t	seen = 0;
+
+	n = select_part(t, part, NULL, 0, ranges, 64, &rows);
+	EXPECT(n == 1 && rows == total, "no filter: %zu ranges, %" PRIu64 " rows", n, rows);
+	{
+		chte_filter_node f[3] = {
+			{CHTE_FILTER_AND, 2, NULL, 0, {NULL, NULL, NULL}},
+			{CHTE_FILTER_GE, 0, "id", 1, {&lo, NULL, NULL}},
+			{CHTE_FILTER_LT, 0, "id", 1, {&hi, NULL, NULL}},
+		};
+
+		n = select_part(t, part, f, 3, ranges, 64, &rows);
+		printf("pruning: id in [%" PRIu64 ", %" PRIu64 "): %zu ranges, %" PRIu64 " rows of %" PRIu64 "\n",
+			   lo, hi, n, rows, total);
+		EXPECT(n == 1 && rows >= hi - lo && rows <= hi - lo + 2 * 8192, "a range by the key: %zu, %" PRIu64, n, rows);
+		CHECK(p_chte_read_begin(t, part, "id", ranges, n, &r, &err));
+		{
+			uint64_t	matching = 0;
+
+			while (p_chte_read_next(r, &nrows, &err) == 0 && nrows > 0)
+			{
+				chte_vector id;
+
+				CHECK(p_chte_read_vector(r, 0, &id, &err));
+				for (uint32_t i = 0; i < nrows; i++, seen++)
+				{
+					uint64_t	k = ((const uint64_t *) id.values)[i];
+
+					if (k >= lo && k < hi)
+						matching++;
+				}
+			}
+			EXPECT(seen == rows && matching == hi - lo, "read %" PRIu64 " rows, %" PRIu64 " matching", seen, matching);
+		}
+		p_chte_read_end(r);
+	}
+	{
+		chte_filter_node f[1] = {{CHTE_FILTER_GT, 0, "id", 1, {&big, NULL, NULL}}};
+
+		n = select_part(t, part, f, 1, ranges, 64, &rows);
+		EXPECT(n == 0 && rows == 0, "id > %" PRIu64 ": %zu ranges", big, n);
+	}
+	{
+		/* not the key: the statistics alone, which keep every row of a part */
+		chte_filter_node f[1] = {{CHTE_FILTER_EQ, 0, "n", 1, {&nv, NULL, NULL}}};
+
+		n = select_part(t, part, f, 1, ranges, 64, &rows);
+		EXPECT(rows == total, "n = %" PRId64 ": %" PRIu64 " rows", nv, rows);
+	}
+	{
+		int64_t		huge = 1000000000;
+		chte_filter_node f[1] = {{CHTE_FILTER_GT, 0, "n", 1, {&huge, NULL, NULL}}};
+
+		n = select_part(t, part, f, 1, ranges, 64, &rows);
+		EXPECT(n == 0, "n > %" PRId64 ": the statistics rule the part out, %zu ranges", huge, n);
+	}
+	{
+		chte_filter_node f[1] = {{CHTE_FILTER_IN, 0, "id", 3, {in, NULL, NULL}}};
+
+		n = select_part(t, part, f, 1, ranges, 64, &rows);
+		printf("pruning: id in (5, 300000, 599999): %zu ranges, %" PRIu64 " rows\n", n, rows);
+		EXPECT(n == 3 && rows <= 3 * 8192, "IN: %zu ranges, %" PRIu64 " rows", n, rows);
+	}
+	{
+		chte_filter_node f[2] = {
+			{CHTE_FILTER_NOT, 0, NULL, 0, {NULL, NULL, NULL}},
+			{CHTE_FILTER_LT, 0, "id", 1, {&lo, NULL, NULL}},
+		};
+
+		n = select_part(t, part, f, 2, ranges, 64, &rows);
+		EXPECT(n == 1 && rows >= total - lo && rows <= total - lo + 8192, "NOT id < %" PRIu64 ": %" PRIu64, lo, rows);
+	}
+
+	CHECK(p_chte_part_stats(t, part, "id", &st, &err));
+	EXPECT(st.has_stats && st.has_minmax && st.rows == total &&
+		   *(const uint64_t *) st.min.values == 0 && *(const uint64_t *) st.max.values == total - 1,
+		   "statistics of id: %d %d %" PRIu64, st.has_stats, st.has_minmax, st.rows);
+	CHECK(p_chte_part_stats(t, part, "n", &st, &err));
+	EXPECT(st.has_stats && st.has_null_count && st.null_count == total / 10 && st.has_minmax &&
+		   *(const int64_t *) st.max.values == (int64_t) (total - 1) * 3,
+		   "statistics of n: nulls %" PRIu64, st.null_count);
+	CHECK(p_chte_part_stats(t, part, "s", &st, &err));
+	EXPECT(st.has_stats && !st.has_minmax, "statistics of s: no min/max for strings");
+	CHECK(p_chte_part_column_bytes(t, part, "id, v", &comp, &uncomp, &err));
+	printf("pruning: id and v, %" PRIu64 " bytes compressed, %" PRIu64 " uncompressed\n", comp, uncomp);
+	EXPECT(comp > 0 && uncomp == total * 12, "bytes of id and v: %" PRIu64 ", %" PRIu64, comp, uncomp);
+
+	/* a batch kept past the next */
+	CHECK(p_chte_read_begin(t, part, "id", NULL, 0, &r, &err));
+	{
+		chte_vector first;
+		chte_batch *kept;
+		uint64_t	v0;
+		uint32_t	n0;
+
+		CHECK(p_chte_read_next(r, &nrows, &err));
+		CHECK(p_chte_read_vector(r, 0, &first, &err));
+		n0 = nrows;
+		v0 = ((const uint64_t *) first.values)[n0 - 1];
+		kept = p_chte_read_retain(r);
+		EXPECT(kept != NULL, "no batch retained");
+		for (int i = 0; i < 3; i++)
+			CHECK(p_chte_read_next(r, &nrows, &err));
+		EXPECT(((const uint64_t *) first.values)[0] == 0 && v0 == n0 - 1 &&
+			   ((const uint64_t *) first.values)[n0 - 1] == v0, "a retained batch changed");
+		p_chte_batch_release(kept);
+	}
+	p_chte_read_end(r);
 }
 
 static int
@@ -239,7 +392,7 @@ replacing(const char *data)
 	CHECK(p_chte_merge(t, names, 2, &merged, &err));
 	printf("replacing: merged %s + %s -> %s (%" PRIu64 " rows)\n", p1.name, p2.name, merged.name, merged.rows);
 	EXPECT(merged.rows == 4, "ReplacingMergeTree kept %" PRIu64 " rows", merged.rows);
-	CHECK(p_chte_read_begin(t, merged.name, "k, ver, x", &r, &err));
+	CHECK(p_chte_read_begin(t, merged.name, "k, ver, x", NULL, 0, &r, &err));
 	while (p_chte_read_next(r, &rows, &err) == 0 && rows > 0)
 	{
 		chte_vector k, ver, x;
@@ -310,6 +463,13 @@ main(int argc, char **argv)
 	LOAD(chte_read_end);
 	LOAD(chte_merge);
 	LOAD(chte_drop_part);
+	LOAD(chte_filter_create);
+	LOAD(chte_filter_free);
+	LOAD(chte_part_select);
+	LOAD(chte_part_column_bytes);
+	LOAD(chte_part_stats);
+	LOAD(chte_read_retain);
+	LOAD(chte_batch_release);
 	printf("dlopen: %.3f s, threads %d\n", now() - t0, p_chte_thread_count());
 
 	snprintf(path, sizeof(path), "%s/", argv[2]);
@@ -361,6 +521,8 @@ main(int argc, char **argv)
 	snprintf(path, sizeof(path), "%s/spike/%s/_pg_rowid_index.proj", argv[2], merged.name);
 	EXPECT(dir_exists(path), "projection directory %s missing after merge", path);
 	expect_threads("after merge");
+	pruning(t, merged.name, 2 * (uint64_t) n);
+	expect_threads("after pruning");
 
 	CHECK(p_chte_drop_part(t, p1.name, &err));
 	CHECK(p_chte_drop_part(t, p2.name, &err));

@@ -81,12 +81,15 @@ typedef struct ChStorageId
 #define CH_MAX_ROWID ((uint64) MaxBlockNumber * CH_ROWS_PER_BLOCK)
 
 /* module.c */
+extern bool ch_enable_chscan;
 extern int	ch_insert_buffer_rows;
 extern int	ch_insert_buffer_bytes;
 extern int	ch_default_storage;
 extern bool ch_preloaded;
 
 /* am.c */
+extern PGDLLIMPORT TupleTableSlotOps ch_slot_ops;
+extern const TableAmRoutine *ch_am_routine(ChEngineKind kind);
 extern bool ch_is_engine_am(Oid amoid, ChEngineKind *kind);
 extern bool ch_is_engine_rel(Relation rel, ChEngineKind *kind);
 extern const char *ch_engine_name(ChEngineKind kind);
@@ -144,6 +147,7 @@ typedef struct ChTable
 	MemoryContext private_cxt;	/* a private table's (ch_table_private) */
 	MemoryContext own_cxt;		/* a cached table's: where it lives */
 	chte_pages_ops pages_ops;	/* the pages store's read_page, its ctx this table */
+	struct HTAB *attached;		/* the pages store's: parts whose files the library has */
 	int			refcount;		/* scans and write buffers using it */
 	bool		stale;			/* out of the cache, freed with its last pin */
 } ChTable;
@@ -173,6 +177,7 @@ typedef struct ChPart
 	int64		min_rowid;
 	int64		max_rowid;
 	int32		level;
+	int32		marks;			/* granules */
 	bytea	   *manifest;		/* the pages store's: the files' pages; NULL in the files store */
 } ChPart;
 
@@ -199,9 +204,14 @@ extern bool ch_builder_fetch(ChVectorBuilder *b, uint32 row, TupleTableSlot *slo
 extern void ch_builder_reset(ChVectorBuilder *b);
 extern void ch_vector_to_datum(const ChColumn *col, const chte_vector *v, uint32 row,
 							   Datum *value, bool *isnull, char **arena);
+struct VexecColumn;
+extern void ch_builder_add_columns(ChVectorBuilder *b, const struct VexecColumn *columns, uint32 nrows,
+								   const uint64 *rowids);
 
 /* buffer.c: the write buffer (§2.7) */
 extern void ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid);
+extern ChVectorBuilder *ch_buffer_batch_begin(Relation rel, CommandId cid, uint32 nrows, uint64 *rowids);
+extern void ch_buffer_batch_done(Relation rel);
 extern void ch_buffer_flush_relation(Relation rel);
 extern void ch_buffer_flush_for_scan(Relation rel, Snapshot snapshot);
 extern void ch_buffer_flush_all(void);
@@ -244,5 +254,11 @@ extern Snapshot ch_parts_snapshot(Relation rel, Snapshot snapshot, SnapshotData 
 extern bool ch_scan_analyze_next_block(TableScanDesc scan, struct ReadStream *stream);
 extern bool ch_scan_analyze_next_tuple(TableScanDesc scan, double *liverows, double *deadrows,
 									   TupleTableSlot *slot);
+
+/* chscan.c: ChScan (§2.8) */
+extern void ch_chscan_init(void);
+
+/* vexec.c: vexec's batch source and sink (§3) */
+extern void ch_vexec_register(void);
 
 #endif							/* CHTE_H */

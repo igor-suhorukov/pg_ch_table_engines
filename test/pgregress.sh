@@ -6,8 +6,13 @@
 # the suite and its libraries at the server's commit (/cb/pgregress), against
 # a server that preloads the library, in a database with the extension.  Its
 # differences are kept for review; a crash, an assertion or a PANIC fails the
-# leg.  A lock timeout keeps what an unsupported statement leaves behind -- a
-# prepared transaction its test expected to fail -- from hanging the leg.
+# leg.  What an unsupported statement leaves behind must not hang it:
+# prepared_xacts' regress_foo5, which was to fail on a write skew with an
+# UPDATE refused until CH2, stays prepared, and its test's DROP TABLE waits
+# for its lock, and the deferrable transaction of transactions, in the same
+# group, for a safe snapshot.  A lock timeout ends the first wait; a watchdog
+# rolls back a transaction prepared more than 30 s before, which no test of
+# the suite leaves so long, ending the second, and summary.txt names each.
 #
 #   CHTE_WORK   the run's directory: pgregress/ (results, regression.diffs),
 #               summary.txt, server.log
@@ -38,11 +43,24 @@ PSQL=("$BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$D/sock" -U postgres)
 out="$WORK/pgregress"
 mkdir -p "$out"
 cd "$out" || exit 1
+(
+	while sleep 5; do
+		"${PSQL[@]}" -F ' ' -d postgres -c "SELECT database, quote_literal(gid) FROM pg_prepared_xacts
+			WHERE prepared < now() - interval '30 seconds'" 2> /dev/null |
+		while read -r db gid; do
+			"${PSQL[@]}" -d "$db" -c "ROLLBACK PREPARED $gid" > /dev/null 2>&1 &&
+				echo "rolled back the prepared transaction $gid in $db" >> "$WORK/watchdog.log"
+		done
+	done
+) &
+watchdog=$!
 PGOPTIONS="-c default_table_access_method=mergetree -c lock_timeout=60s" "$PG_REGRESS" --use-existing \
 	--inputdir="$R" --outputdir="$out" --bindir="$BINDIR" --dlpath="$R" \
 	--host="$D/sock" --port=5432 --user=postgres --dbname=regression \
 	--schedule="$R/parallel_schedule" --max-connections=20 > "$out/pg_regress.log" 2>&1
 rc=$?
+kill "$watchdog" 2> /dev/null
+wait "$watchdog" 2> /dev/null
 
 server_stop "$D"
 cp "$D/log" "$WORK/server.log"
@@ -52,6 +70,7 @@ cp "$D/log" "$WORK/server.log"
 	grep -cE "^not ok " "$out/pg_regress.log" | sed 's/^/tests failed: /'
 	echo "errors the extension raised, by message, in the differences:"
 	grep -E "^\+ERROR:" "$out/regression.diffs" 2>/dev/null | sed -E 's/"[^"]*"/"..."/g' | sort | uniq -c | sort -rn | head -30
+	[ -s "$WORK/watchdog.log" ] && { echo "the watchdog:"; cat "$WORK/watchdog.log"; }
 } | tee "$WORK/summary.txt"
 if log_failures "$D"; then
 	echo "pgregress: the server log has failures"

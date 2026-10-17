@@ -100,7 +100,7 @@ flush(ChBuffer *b)
 
 	owner = ch_handle_reserve();
 	CH_CALL("starting a part", eng->write_begin(table->handle, block, &writer, CH_ERR));
-	ch_handle_opened(owner, false, writer);
+	ch_handle_opened(owner, CH_HANDLE_WRITER, writer);
 	PG_TRY();
 	{
 		CH_CALL("writing a part", eng->write_batch(writer, nrows, ch_builder_vectors(b->builder), CH_ERR));
@@ -126,6 +126,7 @@ flush(ChBuffer *b)
 			part.min_rowid = b->first_rowid;
 			part.max_rowid = ch_builder_rowid(b->builder, nrows - 1);
 			part.level = info.level;
+			part.marks = (int32) info.marks;
 			ch_part_insert(&b->storage, &part, b->cid);
 			if (part.manifest)
 				ch_pages_attach(table, &part);
@@ -140,19 +141,19 @@ flush(ChBuffer *b)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	ch_handle_closing(owner, false, writer);
+	ch_handle_closing(owner, CH_HANDLE_WRITER, writer);
 	eng->write_close(writer);
 
 	relation_close(rel, NoLock);
 	ch_builder_reset(b->builder);
 }
 
-void
-ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
+/* The buffer of (rel, cid) in this subtransaction: another's flushed first */
+static ChBuffer *
+buffer_for(Relation rel, CommandId cid)
 {
 	ChBuffer   *b = find_buffer(RelationGetRelid(rel));
 	SubTransactionId subid = GetCurrentSubTransactionId();
-	uint64		rowid;
 	ChStorageId storage;
 
 	ch_storage_id(rel, &rel->rd_locator, &storage);
@@ -184,6 +185,14 @@ ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 		buffers = lappend(buffers, b);
 		MemoryContextSwitchTo(old);
 	}
+	return b;
+}
+
+/* The next row id, from the range taken, a new range taken when it is used up */
+static uint64
+take_rowid(ChBuffer *b)
+{
+	uint64		rowid;
 
 	if (b->next_rowid == b->end_rowid)
 	{
@@ -194,15 +203,56 @@ ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 		b->chunk = Min(b->chunk * 2, (uint64) ch_insert_buffer_rows);
 	}
 	rowid = b->next_rowid++;
+	return rowid;
+}
+
+/* At the buffer's limits its rows become a part */
+static void
+check_limits(ChBuffer *b)
+{
+	if (ch_builder_rows(b->builder) >= (uint32) ch_insert_buffer_rows ||
+		ch_builder_bytes(b->builder) >= (Size) ch_insert_buffer_bytes * 1024)
+		flush(b);
+}
+
+void
+ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
+{
+	ChBuffer   *b = buffer_for(rel, cid);
+	uint64		rowid = take_rowid(b);
+
 	if (ch_builder_rows(b->builder) == 0)
 		b->first_rowid = rowid;
 	ch_builder_add(b->builder, slot, rowid);
 	ItemPointerSet(&slot->tts_tid, CH_ROWID_TO_BLOCK(rowid), CH_ROWID_TO_OFFSET(rowid));
 	slot->tts_tableOid = RelationGetRelid(rel);
+	check_limits(b);
+}
 
-	if (ch_builder_rows(b->builder) >= (uint32) ch_insert_buffer_rows ||
-		ch_builder_bytes(b->builder) >= (Size) ch_insert_buffer_bytes * 1024)
-		flush(b);
+/*
+ * A batch of rows by column, from vexec's sink (vexec.c): the buffer of
+ * (rel, cid), the batch's row ids taken in rowids[], its builder for the
+ * caller to append the rows to; ch_buffer_batch_done() after.
+ */
+ChVectorBuilder *
+ch_buffer_batch_begin(Relation rel, CommandId cid, uint32 nrows, uint64 *rowids)
+{
+	ChBuffer   *b = buffer_for(rel, cid);
+
+	for (uint32 i = 0; i < nrows; i++)
+		rowids[i] = take_rowid(b);
+	if (nrows > 0 && ch_builder_rows(b->builder) == 0)
+		b->first_rowid = rowids[0];
+	return b->builder;
+}
+
+void
+ch_buffer_batch_done(Relation rel)
+{
+	ChBuffer   *b = find_buffer(RelationGetRelid(rel));
+
+	if (b)
+		check_limits(b);
 }
 
 void

@@ -29,6 +29,7 @@
 #include "storage/bufpage.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -159,18 +160,37 @@ manifest_files(bytea *manifest, size_t *nfiles)
 	return files;
 }
 
-/* A part's files for the library, before it reads or merges the part */
+/*
+ * A part's files for the library, before it reads, analyzes or merges the
+ * part; once for the table's handle, a committed part's files never moving.
+ */
 void
 ch_pages_attach(ChTable *t, const ChPart *part)
 {
 	size_t		n;
 	chte_page_file *files;
+	bool		found;
 
+	if (t->attached == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = NAMEDATALEN * 2;
+		ctl.entrysize = NAMEDATALEN * 2;
+		ctl.hcxt = GetMemoryChunkContext(t);
+		t->attached = hash_create("ch attached parts", 64, &ctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+	if (strlen(part->name) >= NAMEDATALEN * 2)
+		elog(ERROR, "part name \"%s\" is too long", part->name);
+	(void) hash_search(t->attached, part->name, HASH_FIND, &found);
+	if (found)
+		return;
 	if (part->manifest == NULL)
 		elog(ERROR, "part %s of a table of the pages store has no manifest", part->name);
 	files = manifest_files(part->manifest, &n);
 	CH_CALL("attaching a part", ch_engine()->pages_attach(t->handle, part->name, files, n, CH_ERR));
 	pfree(files);
+	(void) hash_search(t->attached, part->name, HASH_ENTER, NULL);
 }
 
 /*

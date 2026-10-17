@@ -35,6 +35,18 @@ own: `ver`, `is_deleted`, `sign`, `sum_columns`.  `ch.parts(rel)`,
 `ch.definition(rel)`, `ch.table_size(rel)`, `ch.engine_info()` and
 `ch.remove_orphans(rel)` describe and keep the tables.
 
+Reads.  The planner offers **ChScan** beside the sequential scan
+(`ch.enable_chscan`): it reads only the columns a query needs, in parallel
+where the planner gives it workers, and gives its quals to ClickHouse's
+analysis, so that the granules the primary key and the parts' statistics rule
+out are not read; `EXPLAIN` shows its columns and the quals it prunes by,
+`EXPLAIN ANALYZE` the granules it read.  With
+[vexec](https://github.com/igor-suhorukov/pg_accel) preloaded, the tables have
+a batch source -- vexec's scans read ClickHouse's columns as they lie, prune
+as ChScan does, answer `count(*)` and the integers' `min` and `max` from the
+parts' statistics, and pass parts a sort's bound rules out over -- and a
+batch sink, through which vexec's INSERT writes columns into a table.
+
 ## Building and testing
 
 Everything builds and runs in containers (`test/run.sh`, `docker/`):
@@ -45,7 +57,7 @@ test/run.sh engine     # the builder image and libchte_engine.so
 test/run.sh images     # the dev images
 test/run.sh all        # core, spike, suite, tap
 test/run.sh pgregress  # PostgreSQL's own suite with default_table_access_method = mergetree
-test/run.sh hits       # 10M ClickBench rows into heap and both stores, compared
+test/run.sh hits       # 10M ClickBench rows into heap and both stores, compared, and reads timed
 ```
 
 ## Licence

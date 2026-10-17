@@ -149,6 +149,12 @@ public:
     /// Part object for an existing directory under the table's path.
     MutableDataPartPtr loadPart(const String & part_name) const;
 
+    /// A committed part, loaded once: a part's directory never changes once committed, and
+    /// its name is never reused in a table's storage.  The pages store's files are attached
+    /// before a part is first loaded.
+    DataPartPtr getPart(const String & part_name) const;
+    void forgetPart(const String & part_name) const;
+
     MergeTreeDataWriter writer;
     MergeTreeDataMergerMutator merger;
 
@@ -180,7 +186,16 @@ public:
 
 private:
     [[noreturn]] static void unsupported(const char * what);
+
+    mutable std::map<String, DataPartPtr> parts;
 };
+
+/// Appends value i of a vector of the caller's layout (chte_engine.h) to a ClickHouse column.
+void appendValue(IColumn & column, const chte_vector & vector, size_t i);
+/// Appends nrows values.
+void appendVector(IColumn & column, uint32_t nrows, const chte_vector & vector);
+/// A column's values in the caller's layout, pointing into the column.
+chte_vector vectorOf(const IColumn & column);
 
 }
 
@@ -189,4 +204,6 @@ struct chte_table
     std::shared_ptr<chte::PgMergeTree> storage;
     DB::StorageMetadataPtr metadata;
     DB::ContextMutablePtr context;
+    /// what a call's result points into, until the next such call
+    DB::Columns scratch;
 };

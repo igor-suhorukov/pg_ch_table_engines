@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-#define CHTE_ABI_VERSION 1
+#define CHTE_ABI_VERSION 2
 
 /* The library is built -fvisibility=hidden; these are the only symbols it exports. */
 #if defined(__GNUC__)
@@ -34,6 +34,8 @@ extern "C" {
 typedef struct chte_table chte_table;
 typedef struct chte_writer chte_writer;
 typedef struct chte_reader chte_reader;
+typedef struct chte_filter chte_filter;
+typedef struct chte_batch chte_batch;
 
 typedef struct chte_error
 {
@@ -152,11 +154,94 @@ CHTE_API int			chte_write_commit(chte_writer *writer, chte_error *error);
 CHTE_API void		chte_write_close(chte_writer *writer);
 
 /*
+ * Filters (ch_table_engines.md §2.8): conditions on a table's columns that
+ * ClickHouse's own analysis -- the primary key's KeyCondition and the parts'
+ * statistics -- prunes parts and granules by.  A filter only prunes: a part or a
+ * granule it keeps may hold rows it would reject, and the caller evaluates its
+ * own conditions on every row read.  Nodes are in prefix order: AND and OR are
+ * followed by their nargs subtrees, NOT by one; the others are leaves on one
+ * column, comparing it with constants of the column's own type (without
+ * Nullable), laid out as chte_vector lays out values, with no NULL.
+ */
+typedef enum chte_filter_op
+{
+	CHTE_FILTER_AND,
+	CHTE_FILTER_OR,
+	CHTE_FILTER_NOT,
+	CHTE_FILTER_EQ,				/* column = value */
+	CHTE_FILTER_NE,
+	CHTE_FILTER_LT,
+	CHTE_FILTER_LE,
+	CHTE_FILTER_GT,
+	CHTE_FILTER_GE,
+	CHTE_FILTER_IN,				/* column = one of nvalues values */
+	CHTE_FILTER_IS_NULL,
+	CHTE_FILTER_IS_NOT_NULL
+} chte_filter_op;
+
+typedef struct chte_filter_node
+{
+	int32_t		op;				/* chte_filter_op */
+	uint32_t	nargs;			/* AND, OR: the subtrees that follow */
+	const char *column;			/* leaves: the column's name */
+	uint32_t	nvalues;		/* comparisons 1, IN at least 1, IS [NOT] NULL 0 */
+	chte_vector values;
+} chte_filter_node;
+
+CHTE_API int			chte_filter_create(chte_table *table, const chte_filter_node *nodes, size_t nnodes,
+							   chte_filter **filter, chte_error *error);
+CHTE_API void		chte_filter_free(chte_filter *filter);
+
+/* A range of a part's granules: marks [begin, end) */
+typedef struct chte_mark_range
+{
+	uint32_t	begin;
+	uint32_t	end;
+} chte_mark_range;
+
+/*
+ * The granules of marks [begin, end) of a part that a filter keeps (filter NULL:
+ * all of them; end 0: the part's last mark), as at most max_ranges ranges into
+ * ranges[], and the rows they hold.  *nranges larger than max_ranges asks for a
+ * call with room for that many; none when the part's statistics or its key rule
+ * every row out.
+ */
+CHTE_API int			chte_part_select(chte_table *table, const char *part_name, chte_filter *filter,
+							 uint32_t begin, uint32_t end, chte_mark_range *ranges, size_t max_ranges,
+							 size_t *nranges, uint64_t *rows, chte_error *error);
+
+/* The compressed and uncompressed bytes of a part's named columns (comma-separated) */
+CHTE_API int			chte_part_column_bytes(chte_table *table, const char *part_name, const char *columns,
+								   uint64_t *compressed, uint64_t *uncompressed, chte_error *error);
+
+/*
+ * The statistics ClickHouse keeps of a part's column ("basic", exact): its rows,
+ * NULLs, and least and greatest values that are not NULL, numeric and temporal
+ * types only.  min and max hold one value each, in the column's own type, valid
+ * until the next call on the table.
+ */
+typedef struct chte_column_stats
+{
+	int32_t		has_stats;
+	int32_t		has_null_count;
+	int32_t		has_minmax;		/* none: every value NULL, or no min/max kept */
+	uint64_t	rows;
+	uint64_t	null_count;
+	chte_vector min;
+	chte_vector max;
+} chte_column_stats;
+
+CHTE_API int			chte_part_stats(chte_table *table, const char *part_name, const char *column,
+							chte_column_stats *stats, chte_error *error);
+
+/*
  * Reading one part: columns is a comma-separated list of names (virtual columns such as
- * _part_offset allowed).  next returns 0 rows at the end; vectors stay valid until the
- * following next or end.
+ * _part_offset allowed); ranges, when nranges is not 0, the granules to read, in order.
+ * next returns 0 rows at the end; vectors stay valid until the following next or end,
+ * or, for a batch retained, until it is released.
  */
 CHTE_API int			chte_read_begin(chte_table *table, const char *part_name, const char *columns,
+							const chte_mark_range *ranges, size_t nranges,
 							chte_reader **reader, chte_error *error);
 CHTE_API int			chte_read_next(chte_reader *reader, uint32_t *nrows, chte_error *error);
 CHTE_API int			chte_read_vector(chte_reader *reader, uint32_t column, chte_vector *vector,
@@ -168,6 +253,10 @@ CHTE_API void		chte_read_end(chte_reader *reader);
  * column was added (the library then reads its default); virtual columns are present.
  */
 CHTE_API int			chte_read_present(chte_reader *reader, uint32_t column);
+
+/* The current batch's columns kept past the next chte_read_next(), until released */
+CHTE_API chte_batch *chte_read_retain(chte_reader *reader);
+CHTE_API void		chte_batch_release(chte_batch *batch);
 
 /* Merges parts with the table's merging mode into one part, committed under its final name. */
 CHTE_API int			chte_merge(chte_table *table, const char *const *part_names, size_t nparts,

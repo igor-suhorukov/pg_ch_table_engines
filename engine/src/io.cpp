@@ -34,10 +34,9 @@ namespace DB::ErrorCodes
 
 using namespace chte;
 
-namespace
+namespace chte
 {
 
-/// Appends nrows values of the caller's layout (chte_engine.h) to a ClickHouse column.
 void appendVector(IColumn & column, uint32_t nrows, const chte_vector & v)
 {
     if (auto * nullable = typeid_cast<ColumnNullable *>(&column))
@@ -86,6 +85,53 @@ void appendVector(IColumn & column, uint32_t nrows, const chte_vector & v)
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "columns of type {} are not supported yet", column.getName());
 }
 
+void appendValue(IColumn & column, const chte_vector & v, size_t i)
+{
+    const IColumn * nested = &column;
+    if (const auto * nullable = typeid_cast<const ColumnNullable *>(&column))
+        nested = &nullable->getNestedColumn();
+    chte_vector one{};
+    one.nulls = v.nulls ? v.nulls + i : nullptr;
+    if (v.offsets)
+    {
+        one.values = v.values;
+        one.offsets = v.offsets + i;
+    }
+    else
+        one.values = static_cast<const char *>(v.values) + i * nested->sizeOfValueIfFixed();
+    appendVector(column, 1, one);
+}
+
+chte_vector vectorOf(const IColumn & column)
+{
+    chte_vector vector{};
+    const IColumn * c = &column;
+    if (const auto * nullable = typeid_cast<const ColumnNullable *>(c))
+    {
+        vector.nulls = reinterpret_cast<const uint8_t *>(nullable->getNullMapData().data());
+        c = &nullable->getNestedColumn();
+    }
+    if (const auto * strings = typeid_cast<const ColumnString *>(c))
+    {
+        vector.values = reinterpret_cast<const uint8_t *>(strings->getChars().data());
+        /// PODArray keeps zeroed padding before its data, so offsets[-1] is 0: the
+        /// nrows + 1 offsets of chte_vector are ClickHouse's own (PODArray.h).
+        vector.offsets = strings->getOffsets().data() - 1;
+        return vector;
+    }
+    if (c->isFixedAndContiguous())
+    {
+        vector.values = c->getRawData().data();
+        return vector;
+    }
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "columns of type {} are not supported yet", c->getName());
+}
+
+}
+
+namespace
+{
+
 void fillPartInfo(const IMergeTreeDataPart & part, chte_part_info & info)
 {
     memset(&info, 0, sizeof(info));
@@ -96,7 +142,7 @@ void fillPartInfo(const IMergeTreeDataPart & part, chte_part_info & info)
     info.level = part.info.level;
     info.rows = part.rows_count;
     info.bytes_on_disk = part.getBytesOnDisk();
-    info.marks = part.getMarksCount();
+    info.marks = part.index_granularity->getMarksCountWithoutFinal();
 }
 
 /// Gives a finished part its final directory name.
@@ -223,12 +269,17 @@ struct chte_reader
     chte_table * table = nullptr;
     QueryPipeline pipeline;
     std::unique_ptr<PullingPipelineExecutor> executor;
-    Block block;
     Columns columns;
     std::vector<uint8_t> present;
 };
 
-extern "C" int chte_read_begin(chte_table * table, const char * part_name, const char * columns, chte_reader ** reader, chte_error * error)
+struct chte_batch
+{
+    Columns columns;
+};
+
+extern "C" int chte_read_begin(chte_table * table, const char * part_name, const char * columns, const chte_mark_range * ranges,
+                               size_t nranges, chte_reader ** reader, chte_error * error)
 {
     return guarded(error, [&]
     {
@@ -242,14 +293,29 @@ extern "C" int chte_read_begin(chte_table * table, const char * part_name, const
         if (names.empty())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_read_begin: no columns");
 
-        MergeTreeData::DataPartPtr part = storage.loadPart(part_name);
+        MergeTreeData::DataPartPtr part = storage.getPart(part_name);
         auto snapshot = storage.getStorageSnapshot(table->metadata, table->context);
         auto mutations = storage.getMutationsSnapshot({});
         auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table->context);
 
+        std::optional<MarkRanges> mark_ranges;
+        if (nranges > 0)
+        {
+            size_t marks = part->index_granularity->getMarksCountWithoutFinal();
+            mark_ranges.emplace();
+            for (size_t i = 0; i < nranges; ++i)
+            {
+                if (ranges[i].begin >= ranges[i].end || ranges[i].end > marks
+                    || (i > 0 && ranges[i].begin < ranges[i - 1].end))
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_read_begin: marks [{}, {}) are not a range of part {} in order",
+                                    ranges[i].begin, ranges[i].end, part_name);
+                mark_ranges->push_back(MarkRange(ranges[i].begin, ranges[i].end));
+            }
+        }
+
         Pipe pipe = createMergeTreeSequentialSource(
             MergeTreeSequentialSourceType::Merge, storage, snapshot, RangesInDataPart(part), alter_conversions,
-            /* merged_part_offsets= */ nullptr, names, /* mark_ranges= */ std::nullopt,
+            /* merged_part_offsets= */ nullptr, names, std::move(mark_ranges),
             std::make_shared<std::atomic<size_t>>(0), /* apply_deleted_mask= */ false,
             /* read_with_direct_io= */ false, /* prefetch= */ false);
 
@@ -290,27 +356,7 @@ extern "C" int chte_read_vector(chte_reader * reader, uint32_t i, chte_vector * 
     {
         if (i >= reader->columns.size())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "no column {}", i);
-        const IColumn * column = reader->columns[i].get();
-        *vector = {};
-        if (const auto * nullable = typeid_cast<const ColumnNullable *>(column))
-        {
-            vector->nulls = reinterpret_cast<const uint8_t *>(nullable->getNullMapData().data());
-            column = &nullable->getNestedColumn();
-        }
-        if (const auto * strings = typeid_cast<const ColumnString *>(column))
-        {
-            vector->values = reinterpret_cast<const uint8_t *>(strings->getChars().data());
-            /// PODArray keeps zeroed padding before its data, so offsets[-1] is 0: the
-            /// nrows + 1 offsets of chte_vector are ClickHouse's own (PODArray.h).
-            vector->offsets = strings->getOffsets().data() - 1;
-            return;
-        }
-        if (column->isFixedAndContiguous())
-        {
-            vector->values = column->getRawData().data();
-            return;
-        }
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "columns of type {} are not supported yet", column->getName());
+        *vector = vectorOf(*reader->columns[i]);
     });
 }
 
@@ -324,6 +370,24 @@ extern "C" int chte_read_present(chte_reader * reader, uint32_t column)
     return column < reader->present.size() ? reader->present[column] : 0;
 }
 
+/// The batch's columns are shared: the reader's next block is new columns, never these.
+extern "C" chte_batch * chte_read_retain(chte_reader * reader)
+{
+    try
+    {
+        return new chte_batch{reader->columns};
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+extern "C" void chte_batch_release(chte_batch * batch)
+{
+    delete batch;
+}
+
 extern "C" int chte_merge(chte_table * table, const char * const * part_names, size_t nparts, chte_part_info * result, chte_error * error)
 {
     return guarded(error, [&]
@@ -333,7 +397,7 @@ extern "C" int chte_merge(chte_table * table, const char * const * part_names, s
         auto & storage = *table->storage;
         MergeTreeData::DataPartsVector parts;
         for (size_t i = 0; i < nparts; ++i)
-            parts.push_back(storage.loadPart(part_names[i]));
+            parts.push_back(storage.getPart(part_names[i]));
         std::sort(parts.begin(), parts.end(), [](const auto & a, const auto & b) { return a->info < b->info; });
 
         auto future = std::make_shared<FutureMergedMutatedPart>();
@@ -362,6 +426,7 @@ extern "C" int chte_drop_part(chte_table * table, const char * part_name, chte_e
 {
     return guarded(error, [&]
     {
+        table->storage->forgetPart(part_name);
         auto disk = table->storage->getStoragePolicy()->getDisks().at(0);
         disk->removeRecursive(fs::path(table->storage->getRelativeDataPath()) / part_name);
     });
