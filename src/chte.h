@@ -198,6 +198,7 @@ extern void ch_catalog_insert(Relation catalog, HeapTuple tuple, CommandId cid);
 extern List *ch_parts_visible(const ChStorageId *id, Snapshot snapshot);
 extern void ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid);
 extern List *ch_parts_manifests(const ChStorageId *id);
+extern List *ch_parts_names(const ChStorageId *id);
 extern void ch_part_delete(const ChStorageId *id, const char *name);
 extern void ch_parts_delete_all(const ChStorageId *id);
 extern void ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage);

@@ -22,10 +22,13 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/toast_internals.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/index.h"
@@ -45,6 +48,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "varatt.h"
 
 #include "chte.h"
 
@@ -199,7 +203,8 @@ part_order(const ListCell *a, const ListCell *b)
  * all_2_2_0 -- so that a scan reads the rows of a table never merged in the
  * order they were inserted, as heap's does.  A scan without a snapshot
  * (ANALYZE) and SnapshotAny take the parts no one can see anymore out
- * (scan.c).
+ * (scan.c).  Never SnapshotAny itself: a dead row's manifest may have lost
+ * its TOAST chunks (manifest_kept()).
  */
 List *
 ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
@@ -211,6 +216,7 @@ ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
 	List	   *parts = NIL;
 	int			nkeys;
 
+	Assert(snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_ANY);
 	catalog = open_catalog("parts", id, AccessShareLock);
 	nkeys = storage_keys(id, keys);
 	scan = systable_beginscan(catalog, catalog_index(catalog), true, snapshot, nkeys, keys);
@@ -240,10 +246,93 @@ ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
 }
 
 /*
+ * A manifest read with SnapshotAny, or NULL once its TOAST chunks are gone.
+ * A row's deletion deletes its chunks in the same transaction, and the TOAST
+ * table is pruned and vacuumed apart from ch.parts -- a read prunes its full
+ * pages, where ch.parts's, with room, stay -- so a dead row may outlive them.
+ * Its part is then one no snapshot sees, a standby's included: the record
+ * that removed the chunks resolved the conflicts of those that might, as
+ * ch.parts's own would.  The chunks are read as heap_fetch_toast_slice()
+ * reads them, which raises an error at a missing one.
+ */
+static bytea *
+manifest_kept(Datum value)
+{
+	varlena    *attr = (varlena *) DatumGetPointer(value);
+	varatt_external pointer;
+	int32		size;
+	int32		nchunks;
+	int32		next = 0;
+	varlena    *result;
+	Relation	toastrel;
+	Relation   *toastidxs;
+	int			nindexes;
+	int			valid;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	chunk_tuple;
+
+	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
+		return DatumGetByteaPCopy(value);	/* in the row, no chunk to lose */
+	VARATT_EXTERNAL_GET_POINTER(pointer, attr);
+	size = VARATT_EXTERNAL_GET_EXTSIZE(pointer);
+	nchunks = size > 0 ? (size - 1) / TOAST_MAX_CHUNK_SIZE + 1 : 0;
+	result = palloc(size + VARHDRSZ);
+	if (VARATT_EXTERNAL_IS_COMPRESSED(pointer))
+		SET_VARSIZE_COMPRESSED(result, size + VARHDRSZ);
+	else
+		SET_VARSIZE(result, size + VARHDRSZ);
+
+	toastrel = table_open(pointer.va_toastrelid, AccessShareLock);
+	valid = toast_open_indexes(toastrel, AccessShareLock, &toastidxs, &nindexes);
+	ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(pointer.va_valueid));
+	scan = systable_beginscan_ordered(toastrel, toastidxs[valid], get_toast_snapshot(), 1, &key);
+	while ((chunk_tuple = systable_getnext_ordered(scan, ForwardScanDirection)) != NULL)
+	{
+		bool		isnull;
+		int32		seq = DatumGetInt32(fastgetattr(chunk_tuple, 2, RelationGetDescr(toastrel), &isnull));
+		Pointer		chunk = DatumGetPointer(fastgetattr(chunk_tuple, 3, RelationGetDescr(toastrel), &isnull));
+		int32		len = VARATT_IS_SHORT(chunk) ? VARSIZE_SHORT(chunk) - VARHDRSZ_SHORT : VARSIZE(chunk) - VARHDRSZ;
+		int32		expected = seq < nchunks - 1 ? TOAST_MAX_CHUNK_SIZE : size - (nchunks - 1) * TOAST_MAX_CHUNK_SIZE;
+
+		if (seq > next)
+			break;				/* one before it is gone */
+		if (seq < next || seq >= nchunks || len != expected ||
+			(VARATT_IS_EXTENDED(chunk) && !VARATT_IS_SHORT(chunk)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg_internal("unexpected chunk %d of %d, %d bytes, for toast value %u in %s",
+									 seq, nchunks, len, pointer.va_valueid,
+									 RelationGetRelationName(toastrel))));
+		memcpy(VARDATA(result) + seq * TOAST_MAX_CHUNK_SIZE,
+			   VARATT_IS_SHORT(chunk) ? VARDATA_SHORT(chunk) : VARDATA(chunk), len);
+		next++;
+	}
+	systable_endscan_ordered(scan);
+	toast_close_indexes(toastidxs, nindexes, AccessShareLock);
+	table_close(toastrel, AccessShareLock);
+
+	if (next < nchunks)
+	{
+		pfree(result);
+		return NULL;
+	}
+	if (VARATT_IS_COMPRESSED(result))
+	{
+		varlena    *plain = detoast_attr(result);
+
+		pfree(result);
+		result = plain;
+	}
+	return (bytea *) result;
+}
+
+/*
  * The manifests of every part row of a storage still in ch.parts, whatever
  * its visibility -- a writer's in progress, an aborted one's, one a merge
- * deleted -- until VACUUM of ch.parts prunes it (SnapshotAny): the pages
- * store's pages they name are not free (pages.c).
+ * deleted -- until VACUUM of ch.parts prunes it or its manifest's chunks go
+ * (SnapshotAny, manifest_kept()): the pages store's pages they name are not
+ * free (pages.c).
  */
 List *
 ch_parts_manifests(const ChStorageId *id)
@@ -262,13 +351,44 @@ ch_parts_manifests(const ChStorageId *id)
 	{
 		bool		isnull;
 		Datum		manifest = heap_getattr(tuple, Anum_parts_manifest, RelationGetDescr(catalog), &isnull);
+		bytea	   *kept = isnull ? NULL : manifest_kept(manifest);
 
-		if (!isnull)
-			manifests = lappend(manifests, DatumGetByteaPCopy(manifest));
+		if (kept)
+			manifests = lappend(manifests, kept);
 	}
 	systable_endscan(scan);
 	table_close(catalog, AccessShareLock);
 	return manifests;
+}
+
+/*
+ * The names of every part row of a storage still in ch.parts, whatever its
+ * visibility, for the sweep (store.c): SnapshotAny, the name alone, never the
+ * manifest, whose chunks a dead row may outlive (manifest_kept()).
+ */
+List *
+ch_parts_names(const ChStorageId *id)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+	List	   *names = NIL;
+	int			nkeys;
+
+	catalog = open_catalog("parts", id, AccessShareLock);
+	nkeys = storage_keys(id, keys);
+	scan = systable_beginscan(catalog, catalog_index(catalog), true, SnapshotAny, nkeys, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		name = heap_getattr(tuple, Anum_parts_name, RelationGetDescr(catalog), &isnull);
+
+		names = lappend(names, TextDatumGetCString(name));
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return names;
 }
 
 void

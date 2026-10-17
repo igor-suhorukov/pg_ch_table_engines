@@ -624,7 +624,7 @@ ch_store_sweep(Relation rel, const ChStorageId *id)
 	List	   *names = NIL;
 	int			removed = 0;
 	ListCell   *lc;
-	List	   *parts;
+	List	   *kept;
 	struct stat st;
 
 	if (stat(dir, &st) != 0)
@@ -634,8 +634,9 @@ ch_store_sweep(Relation rel, const ChStorageId *id)
 	 * goes once VACUUM of ch.parts has pruned its row, which no snapshot then
 	 * sees -- a standby's included, the prune's record resolving the recovery
 	 * conflicts of those that might, before this removal's record replays.
+	 * Their names only: a dead row may outlive its manifest's TOAST chunks.
 	 */
-	parts = ch_parts_visible(id, SnapshotAny);
+	kept = ch_parts_names(id);
 
 	d = AllocateDir(dir);
 	while ((de = ReadDir(d, dir)) != NULL)
@@ -645,8 +646,8 @@ ch_store_sweep(Relation rel, const ChStorageId *id)
 		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
 			strcmp(de->d_name, "detached") == 0 || strcmp(de->d_name, "format_version.txt") == 0)
 			continue;
-		foreach(lc, parts)
-			if (strcmp(((ChPart *) lfirst(lc))->name, de->d_name) == 0)
+		foreach(lc, kept)
+			if (strcmp(lfirst(lc), de->d_name) == 0)
 				named = true;
 		if (!named)
 			names = lappend(names, pstrdup(de->d_name));

@@ -156,6 +156,47 @@ SELECT count(*), sum(a), count(DISTINCT b) FROM m_pages;
 SELECT ch.optimize('m_pages', true) AS merged;
 SELECT count(*), sum(a), count(DISTINCT b) FROM m_pages;
 
+-- a wide part's manifest is out of line, in ch.parts's TOAST table, which is
+-- pruned and vacuumed apart from ch.parts: the chunks of a part row a merge
+-- deleted, which go with its deletion, may be removed while the row stays.
+-- Here VACUUM of the TOAST table alone removes them.  VACUUM's sweep reads
+-- every part row still in ch.parts, and the next part's free pages every
+-- manifest -- first in a temporary table's insert, which counts no parts for
+-- the back-pressure -- and both go on without them
+DO $$
+BEGIN
+  EXECUTE 'CREATE TABLE m_toast (k int, ' || (SELECT string_agg(format('c%s int', i), ', ') FROM generate_series(1, 100) i)
+    || ') USING mergetree WITH (order_by = ''k'', storage = ''pages'', settings = ''min_bytes_for_wide_part = 0'')';
+  EXECUTE 'CREATE TEMP TABLE m_toast_temp (LIKE m_toast) USING mergetree WITH (order_by = ''k'', storage = ''pages'', settings = ''min_bytes_for_wide_part = 0'')';
+  FOR p IN 1..3 LOOP
+    EXECUTE format('INSERT INTO m_toast SELECT g, %s FROM generate_series(%s, %s) g',
+                   (SELECT string_agg('g', ', ') FROM generate_series(1, 100)), p * 10, p * 10 + 9);
+    EXECUTE format('INSERT INTO m_toast_temp SELECT g, %s FROM generate_series(%s, %s) g',
+                   (SELECT string_agg('g', ', ') FROM generate_series(1, 100)), p * 10, p * 10 + 9);
+  END LOOP;
+END
+$$;
+SELECT count(*) AS parts, bool_and(pg_column_toast_chunk_id(manifest) IS NOT NULL) AS out_of_line
+  FROM ch.parts WHERE relfilenumber = pg_relation_filenode('m_toast');
+SELECT count(*) AS parts, bool_and(pg_column_toast_chunk_id(manifest) IS NOT NULL) AS out_of_line
+  FROM ch.parts_unlogged WHERE relfilenumber = pg_relation_filenode('m_toast_temp');
+SELECT ch.optimize('m_toast', true) AS merged, ch.optimize('m_toast_temp', true) AS merged_temp;
+SELECT reltoastrelid::regclass AS parts_toast FROM pg_class WHERE oid = 'ch.parts'::regclass \gset
+SELECT reltoastrelid::regclass AS parts_unlogged_toast FROM pg_class WHERE oid = 'ch.parts_unlogged'::regclass \gset
+VACUUM :parts_toast, :parts_unlogged_toast;
+VACUUM m_toast;
+DO $$
+BEGIN
+  EXECUTE format('INSERT INTO m_toast_temp SELECT g, %s FROM generate_series(40, 49) g',
+                 (SELECT string_agg('g', ', ') FROM generate_series(1, 100)));
+  EXECUTE format('INSERT INTO m_toast SELECT g, %s FROM generate_series(40, 49) g',
+                 (SELECT string_agg('g', ', ') FROM generate_series(1, 100)));
+END
+$$;
+SELECT count(*), sum(k), sum(c100) FROM m_toast;
+SELECT count(*), sum(k), sum(c100) FROM m_toast_temp;
+DROP TABLE m_toast, m_toast_temp;
+
 -- back-pressure: a part's insert waits from parts_to_delay_insert parts on,
 -- and fails at parts_to_throw_insert, as ClickHouse's inserts do
 CREATE TABLE m_bp (a int) USING mergetree
