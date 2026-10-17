@@ -6,10 +6,14 @@
  *	  time into a virtual slot; parallel scans share out the parts; a row
  *	  fetched by its TID.
  *
- *	  A scan reads units: a part each, or, in a parallel scan, runs of
- *	  CH_UNIT_MARKS of a part's granules, numbered in the parts' order, which
- *	  every participant derives alike from the same snapshot and takes
- *	  through an atomic counter.  A plain scan reads every column; ChScan
+ *	  A scan reads units: a part each, or, in a parallel scan, runs of a
+ *	  part's granules, numbered in the parts' order, which every participant
+ *	  derives alike from the same snapshot and takes through an atomic
+ *	  counter.  A run is the parts' granules over CH_UNITS, between
+ *	  CH_UNIT_MIN_MARKS and CH_UNIT_MAX_MARKS, so that the participants end
+ *	  near one another: with a million rows a unit, 10M rows made 11 units,
+ *	  and of a Gather's 7 participants the last ran twice as long as the
+ *	  average.  A plain scan reads every column; ChScan
  *	  and vexec's source name the columns they need and may give a filter,
  *	  which ClickHouse's analysis prunes parts and granules by (filter.c): a
  *	  unit is read as the granules the filter keeps.  A scan that needs no
@@ -58,8 +62,15 @@
 #include "scan.h"
 #include "tombstones.h"
 
-/* The granules of a unit of a parallel scan: a million rows at 8,192 rows a granule */
-#define CH_UNIT_MARKS 128
+/*
+ * The units of a parallel scan: about CH_UNITS of them, each a run of at
+ * least CH_UNIT_MIN_MARKS granules -- 64K rows at 8,192 rows a granule, so
+ * that a unit's reader is begun no more often than that -- and at most
+ * CH_UNIT_MAX_MARKS, a million rows
+ */
+#define CH_UNITS 64
+#define CH_UNIT_MIN_MARKS 8
+#define CH_UNIT_MAX_MARKS 128
 
 typedef struct ChParallelScan
 {
@@ -74,6 +85,7 @@ typedef struct ChScanDescData
 	List	   *parts;			/* ChPart, the snapshot's */
 	int			nparts;
 	uint32	   *unit_start;		/* parallel: each part's first unit; NULL in a serial scan */
+	uint32		unit_marks;		/* parallel: the granules of a unit */
 	uint32		nunits;
 	uint32		next_unit;		/* serial */
 
@@ -292,11 +304,16 @@ load_deletions(ChScanDesc scan, Snapshot snapshot)
 		scan->dead = ch_tombstones_visible(&scan->table->storage, snapshot, 0, PG_INT64_MAX, &scan->ndead);
 }
 
-/* The units of a parallel scan: each part's runs of CH_UNIT_MARKS granules */
+/*
+ * The units of a parallel scan: each part's runs of unit_marks granules, the
+ * parts' granules over CH_UNITS within its bounds -- the same in every
+ * participant, whose snapshot sees the same parts
+ */
 static void
 setup_units(ChScanDesc scan)
 {
 	ListCell   *lc;
+	uint64		marks = 0;
 	int			i = 0;
 
 	scan->nparts = list_length(scan->parts);
@@ -305,12 +322,17 @@ setup_units(ChScanDesc scan)
 		scan->nunits = scan->nparts;
 		return;
 	}
+	foreach(lc, scan->parts)
+		marks += ((ChPart *) lfirst(lc))->marks;
+	scan->unit_marks = (uint32) Min(Max((marks + CH_UNITS - 1) / CH_UNITS, CH_UNIT_MIN_MARKS),
+									CH_UNIT_MAX_MARKS);
 	scan->unit_start = palloc(sizeof(uint32) * (scan->nparts + 1));
 	scan->nunits = 0;
 	foreach(lc, scan->parts)
 	{
 		ChPart	   *p = lfirst(lc);
-		uint32		n = p->marks > CH_UNIT_MARKS ? (p->marks + CH_UNIT_MARKS - 1) / CH_UNIT_MARKS : 1;
+		uint32		n = p->marks > scan->unit_marks ?
+			(p->marks + scan->unit_marks - 1) / scan->unit_marks : 1;
 
 		scan->unit_start[i++] = scan->nunits;
 		scan->nunits += n;
@@ -388,9 +410,9 @@ claim_one_unit(ChScanDesc scan)
 		part = list_nth(scan->parts, p);
 		k = u - scan->unit_start[p];
 		scan->unit_whole = scan->unit_start[p + 1] - scan->unit_start[p] == 1;
-		scan->unit_begin = scan->unit_whole ? 0 : k * CH_UNIT_MARKS;
-		scan->unit_end = scan->unit_whole || (k + 1) * CH_UNIT_MARKS >= (uint32) part->marks ?
-			0 : (k + 1) * CH_UNIT_MARKS;
+		scan->unit_begin = scan->unit_whole ? 0 : k * scan->unit_marks;
+		scan->unit_end = scan->unit_whole || (k + 1) * scan->unit_marks >= (uint32) part->marks ?
+			0 : (k + 1) * scan->unit_marks;
 	}
 	scan->part = list_nth(scan->parts, p);
 	scan->selected = false;
@@ -444,6 +466,23 @@ select_unit(ChScanDesc scan)
 	}
 	if (scan->unit_whole && scan->nranges == 0)
 		scan->counts.parts_pruned++;
+	else if (!scan->unit_whole && scan->unit_begin == 0 && scan->filter != NULL)
+	{
+		/*
+		 * A part a parallel scan reads as several units: the participant
+		 * that claims its first one asks whether the filter keeps any of
+		 * the part's granules, so that the parts pruned are counted once,
+		 * as a serial scan counts them
+		 */
+		size_t		n;
+		uint64		rows;
+
+		CH_CALL("analyzing a part",
+				eng->part_select(scan->table->handle, scan->part->name, scan->filter, 0, 0,
+								 NULL, 0, &n, &rows, CH_ERR));
+		if (n == 0)
+			scan->counts.parts_pruned++;
+	}
 	scan->selected = true;
 }
 
