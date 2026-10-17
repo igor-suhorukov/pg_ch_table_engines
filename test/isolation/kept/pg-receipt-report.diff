@@ -1,0 +1,568 @@
+--- /work/isolation/pg-receipt-report.heap	2026-10-17 01:59:31.512421775 +0000
++++ /work/isolation/pg-receipt-report.mergetree	2026-10-17 01:59:34.772690700 +0000
+@@ -1217,10 +1217,11 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+ k      |deposit_date
+ -------+------------
+-receipt|  2008-12-23
++receipt|  2008-12-22
+ (1 row)
+ 
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+@@ -1244,6 +1245,7 @@
+ (1 row)
+ 
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ receipt_no|deposit_date|amount
+ ----------+------------+------
+@@ -1273,6 +1275,7 @@
+ (3 rows)
+ 
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rxwy1 c1 rx3 ry3 c3 c2
+@@ -1295,12 +1298,14 @@
+ 
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rxwy1 c2 c1 rx3 ry3 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+ k      |deposit_date
+ -------+------------
+@@ -1312,8 +1317,7 @@
+ ----------+------------+------
+          1|  2008-12-22|  1.00
+          2|  2008-12-22|  2.00
+-         3|  2008-12-22|  4.00
+-(3 rows)
++(2 rows)
+ 
+ step c3: COMMIT;
+ 
+@@ -1328,8 +1332,14 @@
+ (1 row)
+ 
+ step c1: COMMIT;
+-step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ ERROR:  could not serialize access due to read/write dependencies among transactions
++step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
++receipt_no|deposit_date|amount
++----------+------------+------
++         1|  2008-12-22|  1.00
++         2|  2008-12-22|  2.00
++(2 rows)
++
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rxwy1 c2 rx3 ry3 c1 c3
+@@ -1385,6 +1395,7 @@
+ 
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ receipt_no|deposit_date|amount
+ ----------+------------+------
+@@ -1412,6 +1423,7 @@
+ (2 rows)
+ 
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rxwy1 rx3 c1 ry3 c3 c2
+@@ -1433,6 +1445,7 @@
+ 
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rxwy1 rx3 c2 c1 ry3 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1445,6 +1458,7 @@
+ 
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ receipt_no|deposit_date|amount
+ ----------+------------+------
+@@ -1472,6 +1486,7 @@
+ (2 rows)
+ 
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rxwy1 rx3 c2 ry3 c3 c1
+@@ -1493,6 +1508,7 @@
+ 
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rxwy1 rx3 ry3 c1 c2 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1512,6 +1528,7 @@
+ 
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rxwy1 rx3 ry3 c1 c3 c2
+@@ -1533,6 +1550,7 @@
+ step c1: COMMIT;
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rxwy1 rx3 ry3 c2 c1 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1552,6 +1570,7 @@
+ 
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rxwy1 rx3 ry3 c2 c3 c1
+@@ -1573,6 +1592,7 @@
+ step c2: COMMIT;
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rxwy1 rx3 ry3 c3 c1 c2
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1593,6 +1613,7 @@
+ step c3: COMMIT;
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rxwy1 rx3 ry3 c3 c2 c1
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1613,6 +1634,7 @@
+ step c3: COMMIT;
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 c2 rxwy1 c1 rx3 ry3 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1825,6 +1847,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ receipt_no|deposit_date|amount
+ ----------+------------+------
+@@ -1852,6 +1875,7 @@
+ (2 rows)
+ 
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rx3 rxwy1 c1 ry3 c3 c2
+@@ -1873,6 +1897,7 @@
+ 
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 rxwy1 c2 c1 ry3 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1885,6 +1910,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ receipt_no|deposit_date|amount
+ ----------+------------+------
+@@ -1912,6 +1938,7 @@
+ (2 rows)
+ 
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rx3 rxwy1 c2 ry3 c3 c1
+@@ -1933,6 +1960,7 @@
+ 
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 rxwy1 ry3 c1 c2 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1952,6 +1980,7 @@
+ 
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rx3 rxwy1 ry3 c1 c3 c2
+@@ -1973,6 +2002,7 @@
+ step c1: COMMIT;
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 rxwy1 ry3 c2 c1 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -1992,6 +2022,7 @@
+ 
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rx3 rxwy1 ry3 c2 c3 c1
+@@ -2013,6 +2044,7 @@
+ step c2: COMMIT;
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 rxwy1 ry3 c3 c1 c2
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2033,6 +2065,7 @@
+ step c3: COMMIT;
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 rxwy1 ry3 c3 c2 c1
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2053,6 +2086,7 @@
+ step c3: COMMIT;
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 c2 rxwy1 c1 ry3 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2192,6 +2226,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rx3 ry3 rxwy1 c1 c3 c2
+@@ -2213,6 +2248,7 @@
+ step c1: COMMIT;
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 ry3 rxwy1 c2 c1 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2232,6 +2268,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: wx2 rx3 ry3 rxwy1 c2 c3 c1
+@@ -2253,6 +2290,7 @@
+ step c2: COMMIT;
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 ry3 rxwy1 c3 c1 c2
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2273,6 +2311,7 @@
+ step c3: COMMIT;
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 ry3 rxwy1 c3 c2 c1
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2293,6 +2332,7 @@
+ step c3: COMMIT;
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 ry3 c2 rxwy1 c1 c3
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2373,6 +2413,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 ry3 c3 rxwy1 c2 c1
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -2393,6 +2434,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: wx2 rx3 ry3 c3 c2 rxwy1 c1
+ step wx2: UPDATE ctl SET deposit_date = DATE '2008-12-23' WHERE k = 'receipt';
+@@ -3025,6 +3067,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ receipt_no|deposit_date|amount
+ ----------+------------+------
+@@ -3052,6 +3095,7 @@
+ (2 rows)
+ 
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 wx2 rxwy1 c1 ry3 c3 c2
+@@ -3073,6 +3117,7 @@
+ 
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 rxwy1 c2 c1 ry3 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3085,6 +3130,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step ry3: SELECT * FROM receipt WHERE deposit_date = DATE '2008-12-22';
+ receipt_no|deposit_date|amount
+ ----------+------------+------
+@@ -3112,6 +3158,7 @@
+ (2 rows)
+ 
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 wx2 rxwy1 c2 ry3 c3 c1
+@@ -3133,6 +3180,7 @@
+ 
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 rxwy1 ry3 c1 c2 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3152,6 +3200,7 @@
+ 
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 wx2 rxwy1 ry3 c1 c3 c2
+@@ -3173,6 +3222,7 @@
+ step c1: COMMIT;
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 rxwy1 ry3 c2 c1 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3192,6 +3242,7 @@
+ 
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 wx2 rxwy1 ry3 c2 c3 c1
+@@ -3213,6 +3264,7 @@
+ step c2: COMMIT;
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 rxwy1 ry3 c3 c1 c2
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3233,6 +3285,7 @@
+ step c3: COMMIT;
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 rxwy1 ry3 c3 c2 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3253,6 +3306,7 @@
+ step c3: COMMIT;
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 c2 rxwy1 c1 ry3 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3392,6 +3446,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 wx2 ry3 rxwy1 c1 c3 c2
+@@ -3413,6 +3468,7 @@
+ step c1: COMMIT;
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 ry3 rxwy1 c2 c1 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3432,6 +3488,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 wx2 ry3 rxwy1 c2 c3 c1
+@@ -3453,6 +3510,7 @@
+ step c2: COMMIT;
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 ry3 rxwy1 c3 c1 c2
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3473,6 +3531,7 @@
+ step c3: COMMIT;
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 ry3 rxwy1 c3 c2 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3493,6 +3552,7 @@
+ step c3: COMMIT;
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 ry3 c2 rxwy1 c1 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3573,6 +3633,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 ry3 c3 rxwy1 c2 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3593,6 +3654,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 wx2 ry3 c3 c2 rxwy1 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3872,6 +3934,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 ry3 wx2 rxwy1 c1 c3 c2
+@@ -3893,6 +3956,7 @@
+ step c1: COMMIT;
+ step c3: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 wx2 rxwy1 c2 c1 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3912,6 +3976,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c3: COMMIT;
+ 
+ starting permutation: rx3 ry3 wx2 rxwy1 c2 c3 c1
+@@ -3933,6 +3998,7 @@
+ step c2: COMMIT;
+ step c3: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 wx2 rxwy1 c3 c1 c2
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3953,6 +4019,7 @@
+ step c3: COMMIT;
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 wx2 rxwy1 c3 c2 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -3973,6 +4040,7 @@
+ step c3: COMMIT;
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 wx2 c2 rxwy1 c1 c3
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -4053,6 +4121,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 wx2 c3 rxwy1 c2 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -4073,6 +4142,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 wx2 c3 c2 rxwy1 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -4173,6 +4243,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c1: COMMIT;
+ step c2: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 c3 wx2 rxwy1 c2 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';
+@@ -4193,6 +4264,7 @@
+ step rxwy1: INSERT INTO receipt VALUES (3, (SELECT deposit_date FROM ctl WHERE k = 'receipt'), 4.00);
+ step c2: COMMIT;
+ step c1: COMMIT;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rx3 ry3 c3 wx2 c2 rxwy1 c1
+ step rx3: SELECT * FROM ctl WHERE k = 'receipt';

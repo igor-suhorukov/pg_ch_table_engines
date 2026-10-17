@@ -1,0 +1,27 @@
+--- /work/isolation/pg-skip-locked-2.heap	2026-10-17 01:59:34.946357632 +0000
++++ /work/isolation/pg-skip-locked-2.mergetree	2026-10-17 01:59:35.030424780 +0000
+@@ -10,7 +10,7 @@
+ step s2a: SELECT * FROM queue ORDER BY id FOR SHARE SKIP LOCKED LIMIT 1;
+ id|data|status
+ --+----+------
+- 1|foo |NEW   
++ 2|bar |NEW   
+ (1 row)
+ 
+ step s2b: SELECT * FROM queue ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1;
+@@ -32,13 +32,13 @@
+ step s1a: SELECT * FROM queue ORDER BY id FOR SHARE SKIP LOCKED LIMIT 1;
+ id|data|status
+ --+----+------
+- 1|foo |NEW   
++ 2|bar |NEW   
+ (1 row)
+ 
+ step s2b: SELECT * FROM queue ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1;
+ id|data|status
+ --+----+------
+- 2|bar |NEW   
++ 1|foo |NEW   
+ (1 row)
+ 
+ step s1b: COMMIT;

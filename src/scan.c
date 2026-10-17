@@ -15,6 +15,21 @@
  *	  unit is read as the granules the filter keeps.  A scan that needs no
  *	  column reads nothing: its rows are the granules' counts.
  *
+ *	  Deleted rows (§2.10): a scan takes the row ids of the deletions and
+ *	  updates its snapshot sees once, as it begins (tombstones.c), and passes
+ *	  over the rows they name; a unit of a part with any of them in its row
+ *	  id range reads the row ids with its columns to find them.  SnapshotAny
+ *	  sees every row, as heap's does: index builds and rewrites judge each
+ *	  row's tombstones themselves.
+ *
+ *	  A row by its TID: the parts that may hold it asked for its offset
+ *	  through their _pg_rowid projection, and the granule holding it read
+ *	  (the engine library's chte_part_locate and chte_read_rows).  A bitmap
+ *	  scan's TID block is read the same way, its row ids a part at a time.
+ *	  Where a running scan that reads every column has just returned the
+ *	  row -- an UPDATE's old row, which ModifyTable fetches by TID, a DELETE's
+ *	  for RETURNING and triggers, a lock's -- the row is taken from its batch.
+ *
  * SPDX-License-Identifier: Apache-2.0
  *
  *-------------------------------------------------------------------------
@@ -29,7 +44,9 @@
 #include "access/tableam.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "nodes/tidbitmap.h"
 #include "pgstat.h"
+#include "lib/ilist.h"
 #include "port/atomics.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
@@ -39,6 +56,7 @@
 
 #include "chte.h"
 #include "scan.h"
+#include "tombstones.h"
 
 /* The granules of a unit of a parallel scan: a million rows at 8,192 rows a granule */
 #define CH_UNIT_MARKS 128
@@ -63,7 +81,9 @@ typedef struct ChScanDescData
 	int			ncols;
 	int		   *attnos;			/* per column read: the attribute's index, -1 the row id */
 	char	   *columns;		/* their names, for the library */
-	chte_vector *vectors;
+	char	   *columns_rowid;	/* the same, and the row id where it is not among them */
+	int			asked_rowid;	/* the row id's column among them, or -1 */
+	chte_vector *vectors;		/* ncols + 1: the row id last where the reader adds it */
 	bool	   *missing;		/* per column read: not in the current part */
 	bool		all_columns;	/* every column and the row id, as getnextslot reads */
 	chte_filter *filter;		/* NULL: every granule */
@@ -87,6 +107,25 @@ typedef struct ChScanDescData
 	uint32		nrows;			/* of the batch */
 	uint32		row;			/* the next row of it */
 
+	/* deletions the snapshot sees (tombstones.c), and the claimed unit's share */
+	bool		apply_deleted;	/* not for SnapshotAny */
+	uint64	   *dead;			/* their row ids, ascending */
+	int			ndead;
+	int			dead_lo;		/* the claimed unit's part's: dead[dead_lo, dead_hi) */
+	int			dead_hi;
+	int			rowid_col;		/* the reader's row id column, or -1 */
+	uint64		*visible;		/* ch_scan_next_batch(): the batch's live rows as bits, or NULL */
+
+	/* a bitmap scan: the rows of the current TID block, materialized */
+	MemoryContext bm_cxt;
+	HeapTuple  *bm_rows;
+	int			bm_nrows;
+	int			bm_pos;
+
+	/* among the running scans, for a fetch of the row it has just returned */
+	struct RunningScan *running;
+	bool		whole_row;		/* it reads every column and the row id */
+
 	ChScanCounts counts;
 	MemoryContext batch_cxt;	/* the slot's values of a batch */
 	SnapshotData nonvacuumable;
@@ -104,20 +143,70 @@ typedef struct ChScanDescData
 typedef ChScanDescData *ChScanDesc;
 
 /*
- * The snapshot the catalog is read with: a scan without one (ANALYZE) reads
- * with the transaction's, and SnapshotAny with the rows no one can see any
- * more left out, so that an aborted writer's part is not read.
+ * The running scans of this backend (fetch_from_scan()), each entry in
+ * TopMemoryContext and owned by the resource owner the scan began under: a
+ * statement's error frees its portal's executor memory, the scan's, before
+ * the resource owners are released (portalmem.c, AtAbort_Portals()), so the
+ * release touches the entry alone, never the scan.
+ */
+typedef struct RunningScan
+{
+	dlist_node	node;
+	ChScanDescData *scan;
+	ResourceOwner owner;
+} RunningScan;
+
+static dlist_head running_scans = DLIST_STATIC_INIT(running_scans);
+
+static void
+scan_running(ChScanDesc scan)
+{
+	RunningScan *r = MemoryContextAlloc(TopMemoryContext, sizeof(RunningScan));
+
+	r->scan = scan;
+	r->owner = ch_handle_reserve();
+	dlist_push_head(&running_scans, &r->node);
+	scan->running = r;
+	ch_handle_opened(r->owner, CH_HANDLE_SCAN, r);
+}
+
+static void
+scan_done(ChScanDesc scan)
+{
+	RunningScan *r = scan->running;
+
+	if (r == NULL)
+		return;
+	ch_handle_closing(r->owner, CH_HANDLE_SCAN, r);
+	dlist_delete(&r->node);
+	pfree(r);
+	scan->running = NULL;
+}
+
+/* A scan that never ended, at its resource owner's release: its entry goes, the scan untouched */
+void
+ch_scan_forget(void *ptr)
+{
+	RunningScan *r = ptr;
+
+	dlist_delete(&r->node);
+	pfree(r);
+}
+
+/*
+ * The snapshot the parts are read with: a scan without one (ANALYZE) and
+ * SnapshotAny read the parts the latest snapshot sees, the catalog's.  An
+ * aborted writer's part is not among them; one another transaction is
+ * writing cannot be either, under the locks a scan of every row takes
+ * (index builds, rewrites) or for a row the caller has already seen (a
+ * fetch); and a part folded away (VACUUM) holds no row that its successor,
+ * which is among them, does not, but those deleted for every snapshot.
  */
 Snapshot
 ch_parts_snapshot(Relation rel, Snapshot snapshot, SnapshotData *buf)
 {
-	if (snapshot == NULL)
+	if (snapshot == NULL || snapshot->snapshot_type == SNAPSHOT_ANY)
 		return NULL;			/* the catalog's, registered by systable_beginscan() */
-	if (snapshot->snapshot_type == SNAPSHOT_ANY)
-	{
-		InitNonVacuumableSnapshot(*buf, GlobalVisTestFor(rel));
-		return buf;
-	}
 	return snapshot;
 }
 
@@ -142,6 +231,65 @@ release_unit(ChScanDesc scan)
 	scan->part = NULL;
 	scan->selected = false;
 	scan->count_left = 0;
+	scan->dead_lo = scan->dead_hi = 0;
+}
+
+/* The first of the sorted ids at or above v */
+static int
+lower_bound(const uint64 *ids, int n, uint64 v)
+{
+	int			lo = 0;
+	int			hi = n;
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (ids[mid] < v)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* The deletions within the claimed part's row id range */
+static void
+unit_deletions(ChScanDesc scan)
+{
+	if (scan->ndead == 0)
+	{
+		scan->dead_lo = scan->dead_hi = 0;
+		return;
+	}
+	scan->dead_lo = lower_bound(scan->dead, scan->ndead, (uint64) scan->part->min_rowid);
+	scan->dead_hi = lower_bound(scan->dead, scan->ndead, (uint64) scan->part->max_rowid + 1);
+}
+
+/* Whether row r of the batch is deleted for the scan's snapshot */
+static inline bool
+row_dead(ChScanDesc scan, uint32 r)
+{
+	uint64		rowid;
+
+	if (scan->dead_lo == scan->dead_hi)
+		return false;
+	rowid = ((const uint64 *) scan->vectors[scan->rowid_col].values)[r];
+	return ch_rowid_in(scan->dead + scan->dead_lo, scan->dead_hi - scan->dead_lo, rowid);
+}
+
+/*
+ * The deletions and updates the scan's snapshot sees, as it begins: a scan
+ * without a snapshot (ANALYZE) takes the catalog's, and SnapshotAny none.
+ */
+static void
+load_deletions(ChScanDesc scan, Snapshot snapshot)
+{
+	scan->apply_deleted = snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_ANY;
+	scan->dead = NULL;
+	scan->ndead = 0;
+	if (scan->apply_deleted)
+		scan->dead = ch_tombstones_visible(&scan->table->storage, snapshot, 0, PG_INT64_MAX, &scan->ndead);
 }
 
 /* The units of a parallel scan: each part's runs of CH_UNIT_MARKS granules */
@@ -185,6 +333,7 @@ claim_unit(ChScanDesc scan)
 		unit.part = scan->part;
 		unit.whole = scan->unit_whole && scan->filter == NULL;
 		unit.rows = 0;
+		unit.deletions = scan->dead_lo < scan->dead_hi;
 		if (scan->unit_check(scan->unit_check_arg, &unit))
 			return true;
 		scan->counts.units_passed++;
@@ -246,6 +395,7 @@ claim_one_unit(ChScanDesc scan)
 	scan->part = list_nth(scan->parts, p);
 	scan->selected = false;
 	scan->counts.units++;
+	unit_deletions(scan);
 	if (scan->table->options.storage == CH_STORAGE_PAGES)
 		ch_pages_attach(scan->table, scan->part);
 	return true;
@@ -301,10 +451,18 @@ static void
 begin_reader(ChScanDesc scan)
 {
 	const ChEngine *eng = ch_engine();
+	const char *columns = scan->columns;
 
+	/* a unit with deletions reads the row ids, to know its rows; one of no column, to count them */
+	scan->rowid_col = scan->asked_rowid;
+	if ((scan->dead_lo < scan->dead_hi || scan->ncols == 0) && scan->asked_rowid < 0)
+	{
+		columns = scan->columns_rowid;
+		scan->rowid_col = scan->ncols;
+	}
 	scan->reader_owner = ch_handle_reserve();
 	CH_CALL("reading a part",
-			eng->read_begin(scan->table->handle, scan->part->name, scan->columns,
+			eng->read_begin(scan->table->handle, scan->part->name, columns,
 							scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader, CH_ERR));
 	ch_handle_opened(scan->reader_owner, CH_HANDLE_READER, scan->reader);
 	/* a part written before a column was added has none: its rows take the column's missing value */
@@ -327,8 +485,10 @@ next_batch(ChScanDesc scan)
 			CH_CALL("reading a part", eng->read_next(scan->reader, &n, CH_ERR));
 			if (n > 0)
 			{
+				int			nvec = scan->rowid_col == scan->ncols ? scan->ncols + 1 : scan->ncols;
+
 				MemoryContextReset(scan->batch_cxt);
-				for (int c = 0; c < scan->ncols; c++)
+				for (int c = 0; c < nvec; c++)
 					CH_CALL("reading a part", eng->read_vector(scan->reader, c, &scan->vectors[c], CH_ERR));
 				scan->nrows = n;
 				scan->row = 0;
@@ -361,7 +521,8 @@ next_batch(ChScanDesc scan)
 			release_unit(scan);
 			continue;
 		}
-		if (scan->ncols == 0)
+		/* no column to read: the granules' rows, where no deletion leaves some out */
+		if (scan->ncols == 0 && scan->dead_lo == scan->dead_hi)
 		{
 			scan->count_left = scan->unit_rows;
 			continue;
@@ -384,8 +545,9 @@ set_columns(ChScanDesc scan, int n, const int *attnos)
 		pfree(scan->missing);
 	scan->ncols = n;
 	scan->attnos = palloc(sizeof(int) * Max(n, 1));
-	scan->vectors = palloc0(sizeof(chte_vector) * Max(n, 1));
+	scan->vectors = palloc0(sizeof(chte_vector) * (n + 1));
 	scan->missing = palloc0(sizeof(bool) * Max(n, 1));
+	scan->asked_rowid = -1;
 	initStringInfo(&names);
 	for (int c = 0; c < n; c++)
 	{
@@ -393,13 +555,20 @@ set_columns(ChScanDesc scan, int n, const int *attnos)
 		if (c > 0)
 			appendStringInfoString(&names, ", ");
 		if (attnos[c] < 0)
+		{
 			appendStringInfoString(&names, CH_ROWID_COLUMN);
+			scan->asked_rowid = c;
+		}
 		else
 			appendStringInfo(&names, "c%d", attnos[c] + 1);
 	}
 	if (scan->columns)
 		pfree(scan->columns);
+	if (scan->columns_rowid)
+		pfree(scan->columns_rowid);
 	scan->columns = names.data;
+	scan->columns_rowid = scan->asked_rowid >= 0 ? pstrdup(names.data) :
+		psprintf("%s%s" CH_ROWID_COLUMN, names.data, n > 0 ? ", " : "");
 }
 
 /* Every column of the scan's table, then the row id: what getnextslot reads */
@@ -416,6 +585,7 @@ setup_all_columns(ChScanDesc scan)
 	attnos[n++] = -1;
 	set_columns(scan, n, attnos);
 	scan->all_columns = true;
+	scan->whole_row = true;
 	pfree(attnos);
 }
 
@@ -444,10 +614,10 @@ fit_slot(ChScanDesc scan, TupleTableSlot *slot)
 		scan->next_unit = 0;
 }
 
+/* Row row of the batch into slot, its values' memory in cxt */
 static void
-fill_slot(ChScanDesc scan, TupleTableSlot *slot)
+fill_row(ChScanDesc scan, uint32 row, TupleTableSlot *slot, MemoryContext cxt)
 {
-	uint32		row = scan->row++;
 	ChTable    *t = scan->table;
 	MemoryContext old;
 	bool		have_rowid = false;
@@ -459,7 +629,7 @@ fill_slot(ChScanDesc scan, TupleTableSlot *slot)
 		slot->tts_values[i] = (Datum) 0;
 		slot->tts_isnull[i] = true;
 	}
-	old = MemoryContextSwitchTo(scan->batch_cxt);
+	old = MemoryContextSwitchTo(cxt);
 	for (int c = 0; c < scan->ncols; c++)
 	{
 		int			att = scan->attnos[c];
@@ -484,6 +654,42 @@ fill_slot(ChScanDesc scan, TupleTableSlot *slot)
 	else
 		ItemPointerSetInvalid(&slot->tts_tid);
 	slot->tts_tableOid = RelationGetRelid(scan->base.rs_rd);
+}
+
+static void
+fill_slot(ChScanDesc scan, TupleTableSlot *slot)
+{
+	fill_row(scan, scan->row++, slot, scan->batch_cxt);
+}
+
+/*
+ * The row a running scan of the relation has just returned, where the scan
+ * reads every column: an UPDATE's old row, fetched by TID right after its
+ * scan returned it (nodeModifyTable.c, ExecModifyTable()), and a DELETE's
+ * or a lock's, needs no read of the parts.
+ */
+static bool
+fetch_from_scan(Relation rel, uint64 rowid, TupleTableSlot *slot)
+{
+	dlist_iter	it;
+
+	dlist_foreach(it, &running_scans)
+	{
+		ChScanDesc	s = dlist_container(RunningScan, node, it.cur)->scan;
+		uint32		r;
+
+		if (RelationGetRelid(s->base.rs_rd) != RelationGetRelid(rel) || !s->whole_row ||
+			s->private_table != NULL || s->part == NULL || s->row == 0 || s->row > s->nrows ||
+			s->rowid_col < 0)
+			continue;
+		r = s->row - 1;
+		if (((const uint64 *) s->vectors[s->rowid_col].values)[r] != rowid)
+			continue;
+		fill_row(s, r, slot, CurrentMemoryContext);
+		ExecMaterializeSlot(slot);
+		return true;
+	}
+	return false;
 }
 
 TableScanDesc
@@ -511,11 +717,13 @@ ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	scan->parts = ch_parts_visible(&t->storage, ch_parts_snapshot(rel, snapshot, &scan->nonvacuumable));
 	setup_units(scan);
 	scan->counts.parts = scan->nparts;
-	/* SERIALIZABLE: the relation's predicate lock, and the parts' writers it cannot see */
+	load_deletions(scan, snapshot);
+	/* SERIALIZABLE: the relation's predicate lock, and the writers of parts and deletions it cannot see */
 	if (snapshot && IsMVCCSnapshot(snapshot) && CheckForSerializableConflictOutNeeded(rel, snapshot))
 	{
 		PredicateLockRelation(rel, snapshot);
 		ch_parts_conflict_out(rel, &t->storage, snapshot);
+		ch_tombstones_conflict_out(rel, &t->storage, snapshot);
 	}
 	scan->batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "ch scan batch", ALLOCSET_DEFAULT_SIZES);
 	setup_all_columns(scan);
@@ -534,6 +742,7 @@ ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 
 	if (flags & SO_TEMP_SNAPSHOT)
 		Assert(snapshot != NULL);
+	scan_running(scan);
 	return &scan->base;
 }
 
@@ -542,6 +751,7 @@ ch_scan_end(TableScanDesc sscan)
 {
 	ChScanDesc	scan = (ChScanDesc) sscan;
 
+	scan_done(scan);
 	release_unit(scan);
 	if (scan->filter)
 	{
@@ -554,8 +764,12 @@ ch_scan_end(TableScanDesc sscan)
 	if (scan->pinned)
 		ch_table_unpin(scan->pinned);
 	MemoryContextDelete(scan->batch_cxt);
+	if (scan->bm_cxt)
+		MemoryContextDelete(scan->bm_cxt);
 	if (scan->base.rs_flags & SO_TEMP_SNAPSHOT)
 		UnregisterSnapshot(scan->base.rs_snapshot);
+	if (scan->dead)
+		pfree(scan->dead);
 	pfree(scan->attnos);
 	pfree(scan->vectors);
 	pfree(scan->missing);
@@ -572,6 +786,7 @@ ch_scan_rescan(TableScanDesc sscan, ScanKeyData *key, bool set_params,
 	scan->next_unit = 0;
 	scan->position = 0;
 	scan->block_end = 0;
+	scan->bm_nrows = scan->bm_pos = 0;
 }
 
 bool
@@ -586,10 +801,20 @@ ch_scan_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot
 	CHECK_FOR_INTERRUPTS();
 	if (scan->all_columns)
 		fit_slot(scan, slot);
-	if (scan->row >= scan->nrows && !next_batch(scan))
+	for (;;)
 	{
-		ExecClearTuple(slot);
-		return false;
+		if (scan->row >= scan->nrows && !next_batch(scan))
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+		/* deleted for the snapshot: passed over */
+		if (row_dead(scan, scan->row))
+		{
+			scan->row++;
+			continue;
+		}
+		break;
 	}
 	fill_slot(scan, slot);
 	/* as heap's getnextslot counts each row it returns */
@@ -646,6 +871,15 @@ ch_scan_set_columns(TableScanDesc sscan, int n, const AttrNumber *attnums, bool 
 	set_columns(scan, k, attnos);
 	scan->all_columns = false;
 	scan->fitted = true;
+	/* every column and the row id: a fetch of its rows may take them from it */
+	{
+		int			live = 0;
+
+		for (int i = 0; i < scan->table->natts; i++)
+			if (scan->table->columns[i].kind != CH_COL_DROPPED)
+				live++;
+		scan->whole_row = rowid && n == live;
+	}
 	pfree(attnos);
 	MemoryContextSwitchTo(old);
 }
@@ -678,6 +912,25 @@ ch_scan_next_batch(TableScanDesc sscan, ChScanBatch *batch)
 	batch->vectors = scan->vectors;
 	batch->missing = scan->missing;
 	batch->reader = scan->reader;
+	batch->visible = NULL;
+	batch->nvisible = scan->nrows;
+	if (scan->dead_lo < scan->dead_hi)
+	{
+		uint64	   *bits = MemoryContextAllocZero(scan->batch_cxt, sizeof(uint64) * ((scan->nrows + 63) / 64));
+		uint32		live = 0;
+
+		for (uint32 r = 0; r < scan->nrows; r++)
+			if (!row_dead(scan, r))
+			{
+				bits[r / 64] |= UINT64CONST(1) << (r % 64);
+				live++;
+			}
+		if (live < scan->nrows)
+		{
+			batch->visible = bits;
+			batch->nvisible = live;
+		}
+	}
 	scan->row = scan->nrows;
 	return true;
 }
@@ -704,6 +957,7 @@ ch_scan_claim_unit(TableScanDesc sscan, ChScanUnit *unit)
 	unit->part = scan->part;
 	unit->whole = scan->unit_whole && scan->filter == NULL;
 	unit->rows = scan->unit_rows;
+	unit->deletions = scan->dead_lo < scan->dead_hi;
 	return true;
 }
 
@@ -798,22 +1052,182 @@ ch_scan_analyze_next_tuple(TableScanDesc sscan, double *liverows, double *deadro
 {
 	ChScanDesc	scan = (ChScanDesc) sscan;
 
-	if (scan->position >= scan->block_end)
-		return false;
-	if (!ch_scan_getnextslot(sscan, ForwardScanDirection, slot))
+	if (scan->all_columns)
+		fit_slot(scan, slot);
+	while (scan->position < scan->block_end)
 	{
-		scan->block_end = scan->position;
-		return false;
+		if (scan->row >= scan->nrows && !next_batch(scan))
+		{
+			scan->block_end = scan->position;
+			return false;
+		}
+		scan->position++;
+		if (row_dead(scan, scan->row))
+		{
+			scan->row++;
+			*deadrows += 1;
+			continue;
+		}
+		fill_slot(scan, slot);
+		*liverows += 1;
+		return true;
 	}
-	scan->position++;
-	*liverows += 1;
+	return false;
+}
+
+/*
+ * The rows of a part with the given row ids (ascending), those it holds:
+ * their offsets through its _pg_rowid projection, then the granules holding
+ * them read, each row found materialized into rows[] in its offset's order,
+ * its row id into ids[].  Returns how many.
+ */
+static int
+read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, int n, TupleDesc desc,
+				HeapTuple *rows, uint64 *ids)
+{
+	const ChEngine *eng = ch_engine();
+	uint64	   *offsets = palloc(sizeof(uint64) * n);
+	uint64	   *found = palloc(sizeof(uint64) * n);
+	int			nfound = 0;
+	ChScanDescData scan;
+	ResourceOwner owner;
+	TupleTableSlot *slot;
+	int			out = 0;
+
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, part);
+	CH_CALL("finding rows by their TIDs", eng->part_locate(t->handle, part->name, rowids, n, offsets, CH_ERR));
+	for (int i = 0; i < n; i++)
+		if (offsets[i] != PG_UINT64_MAX)
+			found[nfound++] = offsets[i];
+	if (nfound == 0)
+	{
+		pfree(offsets);
+		pfree(found);
+		return 0;
+	}
+	/* the offsets ascending, as the reader wants them */
+	qsort(found, nfound, sizeof(uint64), ch_compare_uint64);
+
+	memset(&scan, 0, sizeof(scan));
+	scan.base.rs_rd = rel;
+	scan.table = t;
+	scan.fitted = true;
+	scan.scan_cxt = CurrentMemoryContext;
+	scan.batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "ch fetch", ALLOCSET_DEFAULT_SIZES);
+	setup_all_columns(&scan);
+	scan.part = part;
+	scan.rowid_col = scan.asked_rowid;
+	owner = ch_handle_reserve();
+	CH_CALL("reading rows by their TIDs",
+			eng->read_rows(t->handle, part->name, scan.columns, found, nfound, &scan.reader, CH_ERR));
+	ch_handle_opened(owner, CH_HANDLE_READER, scan.reader);
+	scan.reader_owner = owner;
+	for (int c = 0; c < scan.ncols; c++)
+		scan.missing[c] = !eng->read_present(scan.reader, c);
+
+	slot = MakeSingleTupleTableSlot(desc, &ch_slot_ops);
+	for (;;)
+	{
+		uint32		nrows;
+
+		CH_CALL("reading rows by their TIDs", eng->read_next(scan.reader, &nrows, CH_ERR));
+		if (nrows == 0)
+			break;
+		MemoryContextReset(scan.batch_cxt);
+		for (int c = 0; c < scan.ncols; c++)
+			CH_CALL("reading rows by their TIDs", eng->read_vector(scan.reader, c, &scan.vectors[c], CH_ERR));
+		scan.nrows = nrows;
+		for (scan.row = 0; scan.row < nrows && out < nfound;)
+		{
+			ids[out] = ((const uint64 *) scan.vectors[scan.asked_rowid].values)[scan.row];
+			fill_slot(&scan, slot);
+			rows[out++] = ExecCopySlotHeapTuple(slot);
+		}
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	end_reader(&scan);
+	MemoryContextDelete(scan.batch_cxt);
+	pfree(scan.attnos);
+	pfree(scan.vectors);
+	pfree(scan.missing);
+	pfree(offsets);
+	pfree(found);
+	return out;
+}
+
+/*
+ * Whether the deletions of a row leave it to the snapshot: SnapshotAny sees
+ * every row; SnapshotDirty a row being deleted, its deleter's xid in xmax, as
+ * HeapTupleSatisfiesDirty() does; others a row no deletion they see names.
+ */
+static bool
+row_survives(ChTable *t, uint64 rowid, Snapshot snapshot)
+{
+	if (snapshot && snapshot->snapshot_type == SNAPSHOT_ANY)
+		return true;
+	if (snapshot && snapshot->snapshot_type == SNAPSHOT_DIRTY)
+	{
+		ChRowState	st;
+
+		snapshot->xmin = snapshot->xmax = InvalidTransactionId;
+		ch_row_state(&t->storage, rowid, &st);
+		if (st.status == CH_ROW_MODIFIED || st.status == CH_ROW_SELF_MODIFIED)
+			return false;
+		if (st.status == CH_ROW_BEING_MODIFIED && !st.lock_only)
+			snapshot->xmax = st.xid;
+		return true;
+	}
+	return !ch_tombstone_visible(&t->storage, snapshot, rowid, NULL);
+}
+
+/*
+ * The row the last fetch by TID read from a part, for a fetch of it with
+ * SnapshotAny right after: an UPDATE's or DELETE's of the row an index scan
+ * has just returned (ExecModifyTable(), nodeModifyTable.c:4744-4747), a row
+ * lock's.  Reading a row is reading a granule of every column, so the second
+ * fetch would cost as much as the first.  A row id's values never change once
+ * it is given (§2.6) -- a fold or a merge writes them again as they were --
+ * so the copy is the row's for its relation, storage and descriptor.
+ */
+static struct
+{
+	Oid			relid;
+	RelFileNumber relfilenumber;
+	int			natts;
+	uint64		rowid;
+	HeapTuple	tuple;			/* in TopMemoryContext */
+} last_fetch;
+
+static void
+remember_fetch(Relation rel, uint64 rowid, TupleDesc desc, HeapTuple row)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+	if (last_fetch.tuple)
+		heap_freetuple(last_fetch.tuple);
+	last_fetch.tuple = heap_copytuple(row);
+	MemoryContextSwitchTo(old);
+	last_fetch.relid = RelationGetRelid(rel);
+	last_fetch.relfilenumber = rel->rd_locator.relNumber;
+	last_fetch.natts = desc->natts;
+	last_fetch.rowid = rowid;
+}
+
+static bool
+fetch_from_last(Relation rel, uint64 rowid, TupleTableSlot *slot)
+{
+	if (last_fetch.tuple == NULL || last_fetch.rowid != rowid || last_fetch.relid != RelationGetRelid(rel) ||
+		last_fetch.relfilenumber != rel->rd_locator.relNumber ||
+		last_fetch.natts != slot->tts_tupleDescriptor->natts)
+		return false;
+	ExecForceStoreHeapTuple(heap_copytuple(last_fetch.tuple), slot, true);
 	return true;
 }
 
 /*
- * A row by its TID: from the write buffer, or from a part whose row id range
- * holds it, read until the row is found.  CH2 finds it through the _pg_rowid
- * projection instead.
+ * A row by its TID, visible to the snapshot: from the write buffer, or from
+ * the part the snapshot sees that holds it (§2.8 rule 7).
  */
 bool
 ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
@@ -823,6 +1237,7 @@ ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *s
 	SnapshotData nonvacuumable;
 	List	   *parts;
 	ListCell   *lc;
+	bool		found = false;
 
 	if (!ItemPointerIsValid(tid) || ItemPointerGetOffsetNumberNoCheck(tid) > CH_ROWS_PER_BLOCK)
 		return false;
@@ -831,51 +1246,153 @@ ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *s
 		PredicateLockRelation(rel, snapshot);
 	if (ch_buffer_fetch(rel, rowid, snapshot, slot))
 		return true;
-
-	t = ch_table(rel);
-	parts = ch_parts_visible(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
-	ch_table_pin(t);
-	foreach(lc, parts)
+	/* SnapshotAny: the row whatever its deletions, which a running scan or the last fetch may have at hand */
+	if (snapshot && snapshot->snapshot_type == SNAPSHOT_ANY)
 	{
-		ChPart	   *p = lfirst(lc);
-		ChScanDescData scan;
-		bool		found = false;
-
-		if ((int64) rowid < p->min_rowid || (int64) rowid > p->max_rowid)
-			continue;
-		memset(&scan, 0, sizeof(scan));
-		scan.base.rs_rd = rel;
-		scan.table = t;
-		scan.fitted = true;
-		scan.parts = list_make1(p);
-		scan.scan_cxt = CurrentMemoryContext;
-		setup_units(&scan);
-		scan.batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "ch fetch", ALLOCSET_DEFAULT_SIZES);
-		setup_all_columns(&scan);
-		while (!found && next_batch(&scan))
+		if (fetch_from_scan(rel, rowid, slot))
+			return true;
+		if (fetch_from_last(rel, rowid, slot))
 		{
-			const uint64 *ids = scan.vectors[scan.ncols - 1].values;
-
-			for (uint32 r = 0; r < scan.nrows; r++)
-				if (ids[r] == rowid)
-				{
-					scan.row = r;
-					fill_slot(&scan, slot);
-					ExecMaterializeSlot(slot);
-					found = true;
-					break;
-				}
-		}
-		release_unit(&scan);
-		MemoryContextDelete(scan.batch_cxt);
-		if (found)
-		{
-			ch_table_unpin(t);
+			slot->tts_tid = *tid;
+			slot->tts_tableOid = RelationGetRelid(rel);
 			return true;
 		}
 	}
-	ch_table_unpin(t);
-	return false;
+
+	t = ch_table(rel);
+	ch_table_pin(t);
+	PG_TRY();
+	{
+		if (row_survives(t, rowid, snapshot))
+		{
+			parts = ch_parts_visible(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
+			foreach(lc, parts)
+			{
+				ChPart	   *p = lfirst(lc);
+				HeapTuple	row;
+				uint64		id;
+
+				if ((int64) rowid < p->min_rowid || (int64) rowid > p->max_rowid)
+					continue;
+				if (read_rows_by_id(rel, t, p, &rowid, 1, slot->tts_tupleDescriptor, &row, &id) == 1)
+				{
+					remember_fetch(rel, rowid, slot->tts_tupleDescriptor, row);
+					ExecForceStoreHeapTuple(row, slot, true);
+					slot->tts_tid = *tid;
+					slot->tts_tableOid = RelationGetRelid(rel);
+					found = true;
+					break;
+				}
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		ch_table_unpin(t);
+	}
+	PG_END_TRY();
+	return found;
+}
+
+/*
+ * A bitmap scan's next row: the TIDs of the bitmap's next block, exact or
+ * the whole block where it is lossy, those no deletion the snapshot sees
+ * names, read from the parts holding them, materialized for the block.
+ */
+bool
+ch_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot, bool *recheck, uint64 *lossy_pages,
+						  uint64 *exact_pages)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	while (scan->bm_pos >= scan->bm_nrows)
+	{
+		TBMIterateResult res;
+		OffsetNumber offsets[TBM_MAX_TUPLES_PER_PAGE];
+		uint64		rowids[TBM_MAX_TUPLES_PER_PAGE];
+		uint64		ids[TBM_MAX_TUPLES_PER_PAGE];
+		int			n = 0;
+		ListCell   *lc;
+		MemoryContext old;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!tbm_iterate(&scan->base.st.rs_tbmiterator, &res))
+			return false;
+		*recheck = res.recheck;
+		if (res.lossy)
+		{
+			(*lossy_pages)++;
+			for (int i = 0; i < CH_ROWS_PER_BLOCK; i++)
+				rowids[n++] = (uint64) res.blockno * CH_ROWS_PER_BLOCK + i;
+		}
+		else
+		{
+			int			noff = tbm_extract_page_tuple(&res, offsets, TBM_MAX_TUPLES_PER_PAGE);
+
+			(*exact_pages)++;
+			for (int i = 0; i < noff; i++)
+				if (offsets[i] >= 1 && offsets[i] <= CH_ROWS_PER_BLOCK)
+					rowids[n++] = (uint64) res.blockno * CH_ROWS_PER_BLOCK + offsets[i] - 1;
+		}
+		/* the rows no deletion the snapshot sees names */
+		if (scan->ndead > 0)
+		{
+			int			k = 0;
+
+			for (int i = 0; i < n; i++)
+				if (!ch_rowid_in(scan->dead, scan->ndead, rowids[i]))
+					rowids[k++] = rowids[i];
+			n = k;
+		}
+		if (scan->bm_cxt == NULL)
+			scan->bm_cxt = AllocSetContextCreate(scan->scan_cxt, "ch bitmap block", ALLOCSET_DEFAULT_SIZES);
+		MemoryContextReset(scan->bm_cxt);
+		old = MemoryContextSwitchTo(scan->bm_cxt);
+		scan->bm_rows = palloc(sizeof(HeapTuple) * TBM_MAX_TUPLES_PER_PAGE);
+		scan->bm_nrows = 0;
+		scan->bm_pos = 0;
+		foreach(lc, scan->parts)
+		{
+			ChPart	   *p = lfirst(lc);
+			uint64		lo;
+			uint64		hi;
+			int			first;
+			int			last;
+			int			got;
+
+			if (n == 0)
+				break;
+			lo = (uint64) p->min_rowid;
+			hi = (uint64) p->max_rowid;
+			if (rowids[n - 1] < lo || rowids[0] > hi)
+				continue;
+			first = lower_bound(rowids, n, lo);
+			last = lower_bound(rowids, n, hi + 1);
+			if (first >= last)
+				continue;
+			got = read_rows_by_id(scan->base.rs_rd, scan->table, p, rowids + first, last - first,
+								  RelationGetDescr(scan->base.rs_rd), scan->bm_rows + scan->bm_nrows, ids);
+			/* rows found leave the list: no other part holds them */
+			if (got > 0)
+			{
+				int			k = 0;
+
+				qsort(ids, got, sizeof(uint64), ch_compare_uint64);
+				for (int i = 0; i < n; i++)
+					if (!ch_rowid_in(ids, got, rowids[i]))
+						rowids[k++] = rowids[i];
+				n = k;
+			}
+			scan->bm_nrows += got;
+		}
+		MemoryContextSwitchTo(old);
+	}
+	ExecForceStoreHeapTuple(scan->bm_rows[scan->bm_pos], slot, false);
+	slot->tts_tid = scan->bm_rows[scan->bm_pos]->t_self;
+	slot->tts_tableOid = RelationGetRelid(scan->base.rs_rd);
+	scan->bm_pos++;
+	pgstat_count_heap_fetch(scan->base.rs_rd);
+	return true;
 }
 
 /* ---- estimates (scan.h) ---- */

@@ -1,0 +1,330 @@
+--- /work/isolation/pg-lock-committed-update.heap	2026-10-17 01:53:05.732167481 +0000
++++ /work/isolation/pg-lock-committed-update.mergetree	2026-10-17 01:59:06.440400635 +0000
+@@ -21,7 +21,7 @@
+ step s2l: <... completed>
+ id|value
+ --+-----
+- 1|one  
++ 1|two  
+ (1 row)
+ 
+ step s2c: COMMIT;
+@@ -57,7 +57,7 @@
+ step s2l: <... completed>
+ id|value
+ --+-----
+- 1|one  
++ 1|two  
+ (1 row)
+ 
+ step s2c: COMMIT;
+@@ -94,7 +94,9 @@
+  1|one  
+ (1 row)
+ 
+-step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1;
++step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1; <waiting ...>
++step s1u: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+@@ -124,13 +126,14 @@
+ t                 
+ (1 row)
+ 
+-step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE;
++step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE; <waiting ...>
++step s1c: COMMIT;
++step s2l: <... completed>
+ id|value
+ --+-----
+- 1|one  
++ 1|two  
+ (1 row)
+ 
+-step s1c: COMMIT;
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -170,7 +173,7 @@
+ step s2l: <... completed>
+ id|value
+ --+-----
+- 1|one  
++ 1|two  
+ (1 row)
+ 
+ step s2c: COMMIT;
+@@ -212,7 +215,7 @@
+ step s2l: <... completed>
+ id|value
+ --+-----
+- 1|one  
++ 1|two  
+ (1 row)
+ 
+ step s2c: COMMIT;
+@@ -249,12 +252,14 @@
+  1|one  
+ (1 row)
+ 
+-step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1;
++step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1; <waiting ...>
++step s1u: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s1c: COMMIT;
+ step s1hint: SELECT * FROM lcu_table;
+ id|value
+ --+-----
+- 1|two  
++ 1|one  
+ (1 row)
+ 
+ step s2c: COMMIT;
+@@ -285,13 +290,14 @@
+ t                 
+ (1 row)
+ 
+-step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE;
++step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE; <waiting ...>
++step s1c: COMMIT;
++step s2l: <... completed>
+ id|value
+ --+-----
+- 1|one  
++ 1|two  
+ (1 row)
+ 
+-step s1c: COMMIT;
+ step s1hint: SELECT * FROM lcu_table;
+ id|value
+ --+-----
+@@ -329,11 +335,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -365,11 +367,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -404,7 +402,9 @@
+  1|one  
+ (1 row)
+ 
+-step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1;
++step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1; <waiting ...>
++step s1u: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+@@ -434,13 +434,10 @@
+ t                 
+ (1 row)
+ 
+-step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE;
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
++step s2l: <... completed>
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -478,11 +475,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -520,11 +513,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -559,12 +548,14 @@
+  1|one  
+ (1 row)
+ 
+-step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1;
++step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1; <waiting ...>
++step s1u: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s1c: COMMIT;
+ step s1hint: SELECT * FROM lcu_table;
+ id|value
+ --+-----
+- 1|two  
++ 1|one  
+ (1 row)
+ 
+ step s2c: COMMIT;
+@@ -595,13 +586,10 @@
+ t                 
+ (1 row)
+ 
+-step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE;
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
++step s2l: <... completed>
++ERROR:  could not serialize access due to concurrent update
+ step s1hint: SELECT * FROM lcu_table;
+ id|value
+ --+-----
+@@ -639,11 +627,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -675,11 +659,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -714,7 +694,9 @@
+  1|one  
+ (1 row)
+ 
+-step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1;
++step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1; <waiting ...>
++step s1u: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+@@ -744,13 +726,10 @@
+ t                 
+ (1 row)
+ 
+-step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE;
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
++step s2l: <... completed>
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -788,11 +767,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -830,11 +805,7 @@
+ (1 row)
+ 
+ step s2l: <... completed>
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ ----------------------
+@@ -869,12 +840,14 @@
+  1|one  
+ (1 row)
+ 
+-step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1;
++step s1u: UPDATE lcu_table SET value = 'two' WHERE id = 1; <waiting ...>
++step s1u: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s1c: COMMIT;
+ step s1hint: SELECT * FROM lcu_table;
+ id|value
+ --+-----
+- 1|two  
++ 1|one  
+ (1 row)
+ 
+ step s2c: COMMIT;
+@@ -905,13 +878,10 @@
+ t                 
+ (1 row)
+ 
+-step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE;
+-id|value
+---+-----
+- 1|one  
+-(1 row)
+-
++step s2l: SELECT * FROM lcu_table WHERE pg_advisory_lock(380170116) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
++step s2l: <... completed>
++ERROR:  could not serialize access due to concurrent update
+ step s1hint: SELECT * FROM lcu_table;
+ id|value
+ --+-----

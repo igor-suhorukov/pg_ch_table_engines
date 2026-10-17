@@ -1,0 +1,34 @@
+--- /work/isolation/pg-nowait-2.heap	2026-10-17 01:59:07.742572775 +0000
++++ /work/isolation/pg-nowait-2.mergetree	2026-10-17 01:59:07.820401786 +0000
+@@ -8,13 +8,9 @@
+ (1 row)
+ 
+ step s2a: SELECT * FROM foo FOR SHARE NOWAIT;
+-id|data
+---+----
+- 1|x   
+-(1 row)
+-
+-step s2b: SELECT * FROM foo FOR UPDATE NOWAIT;
+ ERROR:  could not obtain lock on row in relation "foo"
++step s2b: SELECT * FROM foo FOR UPDATE NOWAIT;
++ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ step s1b: COMMIT;
+ step s2c: COMMIT;
+ 
+@@ -26,13 +22,13 @@
+ (1 row)
+ 
+ step s1a: SELECT * FROM foo FOR SHARE NOWAIT;
++ERROR:  could not obtain lock on row in relation "foo"
++step s2b: SELECT * FROM foo FOR UPDATE NOWAIT;
+ id|data
+ --+----
+  1|x   
+ (1 row)
+ 
+-step s2b: SELECT * FROM foo FOR UPDATE NOWAIT;
+-ERROR:  could not obtain lock on row in relation "foo"
+ step s1b: COMMIT;
+ step s2c: COMMIT;
+ 

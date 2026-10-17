@@ -21,6 +21,11 @@
 #                             checkout (the "pgsrc" build context), as the
 #                             base takes its regression suite: the server is
 #                             built without TAP support, so PGXS installs none
+#   isolationtester           PostgreSQL's isolation tester at the server's
+#                             commit, for the isolation leg (§6), and its
+#                             specs at /cb/isolation: the server's install
+#                             has neither
+#   bison, flex               what the isolation tester's parser is made with
 
 ARG BASE_IMAGE=pg_accel/vexec-dev:vanilla
 
@@ -28,7 +33,7 @@ FROM ${BASE_IMAGE}
 USER root
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        liblz4-dev libzstd-dev libipc-run-perl \
+        liblz4-dev libzstd-dev libipc-run-perl bison flex \
     && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=bind,from=pgsrc,target=/pgsrc,ro \
@@ -50,6 +55,23 @@ RUN --mount=type=bind,from=pgsrc,target=/pgsrc,ro \
         gcc -O2 -fPIC -shared -I"$inc" -o "/cb/pgregress/src/test/regress/$(basename "$f" .c).so" "/cb/pgregress/$f" || exit 1; \
     done \
  && chown -R postgres:postgres /cb/pgregress
+
+# PostgreSQL's isolation tester and specs at the server's commit, linked
+# against the server's libpq, libpgcommon and libpgport as
+# src/test/isolation/Makefile links it
+RUN --mount=type=bind,from=pgsrc,target=/pgsrc,ro \
+    mkdir -p /cb/isolation \
+ && git -C /pgsrc archive "$(cat /usr/local/pgsql/.pg_ref_commit)" src/test/isolation \
+        | tar -x -C /cb/isolation \
+ && cd /cb/isolation/src/test/isolation \
+ && bison -d -o specparse.c specparse.y \
+ && flex -o specscanner.c specscanner.l \
+ && inc="$(/usr/local/pgsql/bin/pg_config --includedir)" \
+ && gcc -O2 -I. -I"$inc" -I"$inc/internal" -I"$(/usr/local/pgsql/bin/pg_config --includedir-server)" \
+        isolationtester.c specparse.c specscanner.c \
+        -L"$(/usr/local/pgsql/bin/pg_config --libdir)" -lpgcommon -lpgport -lpq -lm \
+        -o /usr/local/pgsql/bin/isolationtester \
+ && chown -R postgres:postgres /cb/isolation
 
 ENV PATH=/usr/local/pgsql/bin:$PATH \
     TMPDIR=/tmp

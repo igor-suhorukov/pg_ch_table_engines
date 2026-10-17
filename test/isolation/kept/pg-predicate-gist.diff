@@ -1,0 +1,145 @@
+--- /work/isolation/pg-predicate-gist.heap	2026-10-17 01:59:09.290213369 +0000
++++ /work/isolation/pg-predicate-gist.mergetree	2026-10-17 01:59:11.121404544 +0000
+@@ -476,6 +476,7 @@
+ step c1: commit;
+ step wy4: insert into gist_point_tbl (id, p)
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: rxy3 wx3 rxy4 wy4 c1 c2
+@@ -497,6 +498,7 @@
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 wx3 rxy4 wy4 c2 c1
+ step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
+@@ -517,6 +519,7 @@
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wx3 c1 wy4 c2
+ step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
+@@ -536,6 +539,7 @@
+ step c1: commit;
+ step wy4: insert into gist_point_tbl (id, p)
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: rxy3 rxy4 wx3 wy4 c1 c2
+@@ -557,6 +561,7 @@
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wx3 wy4 c2 c1
+ step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
+@@ -577,6 +582,7 @@
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wy4 wx3 c1 c2
+ step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
+@@ -597,6 +603,7 @@
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wy4 wx3 c2 c1
+ step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
+@@ -617,6 +624,7 @@
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wy4 c2 wx3 c1
+ step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
+@@ -636,6 +644,7 @@
+ step c2: commit;
+ step wx3: insert into gist_point_tbl (id, p)
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c1: commit;
+ 
+ starting permutation: rxy4 rxy3 wx3 c1 wy4 c2
+@@ -656,6 +665,7 @@
+ step c1: commit;
+ step wy4: insert into gist_point_tbl (id, p)
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: rxy4 rxy3 wx3 wy4 c1 c2
+@@ -677,6 +687,7 @@
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wx3 wy4 c2 c1
+ step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
+@@ -697,6 +708,7 @@
+ 			  select g, point(g*50, g*50) from generate_series(1, 20) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wy4 wx3 c1 c2
+ step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
+@@ -717,6 +729,7 @@
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wy4 wx3 c2 c1
+ step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
+@@ -737,6 +750,7 @@
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wy4 c2 wx3 c1
+ step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
+@@ -756,6 +770,7 @@
+ step c2: commit;
+ step wx3: insert into gist_point_tbl (id, p)
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c1: commit;
+ 
+ starting permutation: rxy4 wy4 rxy3 wx3 c1 c2
+@@ -777,6 +792,7 @@
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 wy4 rxy3 wx3 c2 c1
+ step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
+@@ -797,6 +813,7 @@
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 wy4 rxy3 c2 wx3 c1
+ step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
+@@ -816,5 +833,6 @@
+ step c2: commit;
+ step wx3: insert into gist_point_tbl (id, p)
+ 			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c1: commit;
+ exit 0

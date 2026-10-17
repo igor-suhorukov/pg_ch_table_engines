@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-#define CHTE_ABI_VERSION 2
+#define CHTE_ABI_VERSION 3
 
 /* The library is built -fvisibility=hidden; these are the only symbols it exports. */
 #if defined(__GNUC__)
@@ -137,6 +137,7 @@ typedef struct chte_part_info
 	uint64_t	rows;
 	uint64_t	bytes_on_disk;
 	uint64_t	marks;
+	char		temp_dir[160];	/* where it is until committed */
 } chte_part_info;
 
 /*
@@ -257,6 +258,33 @@ CHTE_API int			chte_read_present(chte_reader *reader, uint32_t column);
 /* The current batch's columns kept past the next chte_read_next(), until released */
 CHTE_API chte_batch *chte_read_retain(chte_reader *reader);
 CHTE_API void		chte_batch_release(chte_batch *batch);
+
+/*
+ * Rows by their row ids (Appendix E): the offsets in a part of the rows whose
+ * _pg_rowid are rowids[0 .. n), ascending, found through the part's _pg_rowid
+ * projection; offsets[i] is UINT64_MAX where the part has no such row.
+ */
+CHTE_API int			chte_part_locate(chte_table *table, const char *part_name, const uint64_t *rowids,
+							 size_t n, uint64_t *offsets, chte_error *error);
+
+/*
+ * A reader of the rows of a part at offsets[0 .. n), ascending, and of no other:
+ * the granules holding them read, as chte_read_begin reads, the rest left out.
+ */
+CHTE_API int			chte_read_rows(chte_table *table, const char *part_name, const char *columns,
+						   const uint64_t *offsets, size_t n, chte_reader **reader,
+						   chte_error *error);
+
+/*
+ * A part written again without the rows whose _pg_rowid are dead[0 .. n),
+ * ascending -- deletions every snapshot sees, folded into it -- as a new part
+ * numbered block_number, through the writer an insert uses: *nparts is how
+ * many parts it made (none where every row was dead), which chte_write_part
+ * describes, chte_write_commit names and chte_write_close removes uncommitted.
+ */
+CHTE_API int			chte_rewrite_part(chte_table *table, const char *part_name, const uint64_t *dead,
+							  size_t n, uint64_t block_number, chte_writer **writer, size_t *nparts,
+							  chte_error *error);
 
 /* Merges parts with the table's merging mode into one part, committed under its final name. */
 CHTE_API int			chte_merge(chte_table *table, const char *const *part_names, size_t nparts,

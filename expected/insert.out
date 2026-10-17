@@ -127,17 +127,11 @@ SELECT count(*) FROM ins WHERE b = 'fn';
      2
 (1 row)
 
--- what is not yet supported
-UPDATE ins SET b = 'u' WHERE a = 1;
-ERROR:  UPDATE is not supported on tables of the ClickHouse engines yet
-DETAIL:  It comes in phase CH2 of ch_table_engines.md.
-DELETE FROM ins WHERE a = 1;
-ERROR:  DELETE is not supported on tables of the ClickHouse engines yet
-DETAIL:  It comes in phase CH2 of ch_table_engines.md.
+-- ON CONFLICT without an arbiter index inserts; a unique index (CH5) and TABLESAMPLE (CH5) are not yet supported
 INSERT INTO ins VALUES (1, 'x') ON CONFLICT DO NOTHING;
-CREATE INDEX ON ins (a);
-ERROR:  an index is not supported on tables of the ClickHouse engines yet
-DETAIL:  It comes in phase CH2 of ch_table_engines.md.
+CREATE UNIQUE INDEX ON ins (a);
+ERROR:  a unique index is not supported on tables of the ClickHouse engines yet
+DETAIL:  It comes in phase CH5 of ch_table_engines.md.
 SELECT * FROM ins TABLESAMPLE system (10);
 ERROR:  TABLESAMPLE is not supported on tables of the ClickHouse engines yet
 DETAIL:  It comes in phase CH5 of ch_table_engines.md.

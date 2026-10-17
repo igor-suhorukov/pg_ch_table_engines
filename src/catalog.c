@@ -2,7 +2,8 @@
  *
  * catalog.c
  *	  The extension's catalogs, ch.tables and ch.parts, and their UNLOGGED
- *	  twins for UNLOGGED and temporary tables (ch_table_engines.md §2.6).
+ *	  twins for UNLOGGED and temporary tables (ch_table_engines.md §2.6);
+ *	  ch.tombstones has a file of its own (tombstones.c).
  *
  *	  A part is visible to a snapshot when its ch.parts row is.  The rows of
  *	  a statement's part are inserted under the command id their rows were
@@ -78,8 +79,8 @@ twin(const ChStorageId *id)
 	return id->persistence != RELPERSISTENCE_PERMANENT;
 }
 
-static Oid
-catalog_relid(const char *name, bool unlogged)
+Oid
+ch_catalog_relid(const char *name, bool unlogged)
 {
 	Oid			nsp = get_namespace_oid("ch", false);
 	char		buf[NAMEDATALEN];
@@ -94,15 +95,20 @@ catalog_relid(const char *name, bool unlogged)
 	return relid;
 }
 
-static Relation
-open_catalog(const char *name, const ChStorageId *id, LOCKMODE lockmode)
+Relation
+ch_catalog_open(const char *name, const ChStorageId *id, LOCKMODE lockmode)
 {
-	return table_open(catalog_relid(name, twin(id)), lockmode);
+	return table_open(ch_catalog_relid(name, twin(id)), lockmode);
 }
 
-/* The unique index of a catalog: its only index */
-static Oid
-catalog_index(Relation catalog)
+#define open_catalog ch_catalog_open
+#define catalog_index ch_catalog_index
+#define storage_keys ch_catalog_storage_keys
+#define insert_with_cid ch_catalog_insert
+
+/* The index of a catalog: its only one */
+Oid
+ch_catalog_index(Relation catalog)
 {
 	List	   *indexes = RelationGetIndexList(catalog);
 
@@ -111,8 +117,8 @@ catalog_index(Relation catalog)
 	return linitial_oid(indexes);
 }
 
-static int
-storage_keys(const ChStorageId *id, ScanKeyData *keys)
+int
+ch_catalog_storage_keys(const ChStorageId *id, ScanKeyData *keys)
 {
 	ScanKeyInit(&keys[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(id->locator.spcOid));
 	ScanKeyInit(&keys[1], 2, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(id->locator.relNumber));
@@ -121,8 +127,8 @@ storage_keys(const ChStorageId *id, ScanKeyData *keys)
 }
 
 /* Inserts a catalog row and its index entry under the given command id */
-static void
-insert_with_cid(Relation catalog, HeapTuple tuple, CommandId cid)
+void
+ch_catalog_insert(Relation catalog, HeapTuple tuple, CommandId cid)
 {
 	Relation	index;
 	IndexInfo  *ii;
@@ -140,7 +146,8 @@ insert_with_cid(Relation catalog, HeapTuple tuple, CommandId cid)
 	ExecStoreHeapTuple(tuple, slot, false);
 	GetPerTupleExprContext(estate)->ecxt_scantuple = slot;
 	FormIndexDatum(ii, slot, estate, values, isnull);
-	(void) index_insert(index, values, isnull, &tuple->t_self, catalog, UNIQUE_CHECK_YES, false, ii);
+	(void) index_insert(index, values, isnull, &tuple->t_self, catalog,
+						index->rd_index->indisunique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO, false, ii);
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
 	index_close(index, RowExclusiveLock);
@@ -257,6 +264,32 @@ ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid)
 	insert_with_cid(catalog, tuple, cid);
 	heap_freetuple(tuple);
 	table_close(catalog, RowExclusiveLock);
+}
+
+/* Deletes a part's row (its next version replacing it: tombstones folded into it) */
+void
+ch_part_delete(const ChStorageId *id, const char *name)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[4];
+	HeapTuple	tuple;
+	int			nkeys;
+	bool		found = false;
+
+	catalog = open_catalog("parts", id, RowExclusiveLock);
+	nkeys = storage_keys(id, keys);
+	ScanKeyInit(&keys[nkeys++], Anum_parts_name, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(catalog, catalog_index(catalog), true, NULL, nkeys, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		simple_heap_delete(catalog, &tuple->t_self);
+		found = true;
+	}
+	systable_endscan(scan);
+	table_close(catalog, RowExclusiveLock);
+	if (!found)
+		elog(ERROR, "no ch.parts row for part %s", name);
 }
 
 /* Deletes every part row of a storage the transaction can see (TRUNCATE of a new table) */

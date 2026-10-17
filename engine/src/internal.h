@@ -11,11 +11,17 @@
 #include <Disks/IDisk.h>
 #include <Disks/StoragePolicy.h>
 #include <Interpreters/Context.h>
+#include <Processors/Executors/PullingPipelineExecutor.h>
+#include <QueryPipeline/Pipe.h>
+#include <QueryPipeline/QueryPipeline.h>
+#include <Storages/MergeTree/MarkRange.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Storages/MergeTree/MergedBlockOutputStream.h>
 
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -190,6 +196,36 @@ private:
     mutable std::map<String, DataPartPtr> parts;
 };
 
+/// The names of a comma-separated list; throws when there is none.
+Names columnNames(const char * columns);
+
+}
+
+struct chte_reader;
+struct chte_table;
+
+namespace chte
+{
+
+/// A reader of a part's named columns over mark_ranges (none: every granule), as chte_read_begin opens.
+std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
+                                        std::optional<MarkRanges> mark_ranges);
+
+/// Mark ranges, ascending, as runs of adjacent granules, each for a sequential source of its own; none: the
+/// whole part, one run.  MergeTreeSequentialSource takes the rows of a read from the granule after the one
+/// it read last (MergeTreeSequentialSource.cpp:205-214, 233): past a gap between ranges that is another
+/// granule's count, and a compact part's reader, which reads whole granules only, then hands more rows than
+/// asked where the granule read is the longer last one a compact part may end with
+/// (MergeTreeDataPartWriterCompact.cpp:514-521).
+std::vector<std::optional<MarkRanges>> markRuns(const std::optional<MarkRanges> & mark_ranges);
+
+/// The writer's rows as parts, one a partition, under temporary names (chte_write_finish).
+void writeParts(chte_writer & writer, ContextPtr context);
+/// A part's description for the caller, its directory as it is now.
+void fillPartInfo(const IMergeTreeDataPart & part, chte_part_info & info);
+/// Gives a finished part its final directory name.
+void commitPart(IMergeTreeDataPart & part);
+
 /// Appends value i of a vector of the caller's layout (chte_engine.h) to a ClickHouse column.
 void appendValue(IColumn & column, const chte_vector & vector, size_t i);
 /// Appends nrows values.
@@ -198,6 +234,38 @@ void appendVector(IColumn & column, uint32_t nrows, const chte_vector & vector);
 chte_vector vectorOf(const IColumn & column);
 
 }
+
+struct chte_writer
+{
+    chte_table * table = nullptr;
+    UInt64 block_number = 0;
+    DB::Block header;
+    DB::MutableColumns columns;
+    std::vector<DB::MergeTreeTemporaryPartPtr> parts;
+    bool finished = false;
+    bool committed = false;
+};
+
+struct chte_reader
+{
+    chte_table * table = nullptr;
+    /// the runs of granules to read (chte::markRuns), each by a source of its own, opened in turn
+    std::function<DB::Pipe(std::optional<DB::MarkRanges>)> open_run;
+    std::vector<std::optional<DB::MarkRanges>> runs;
+    size_t next_run = 0;
+    DB::QueryPipeline pipeline;
+    std::unique_ptr<DB::PullingPipelineExecutor> executor;
+    DB::Columns columns;
+    std::vector<uint8_t> present;
+    /// chte_read_rows: the offsets of the rows wanted, ascending; the blocks' last column is
+    /// their _part_offset, by which the other rows are left out, and is not handed on
+    std::vector<UInt64> wanted;
+    size_t wanted_pos = 0;
+    bool by_offset = false;
+
+    /// The next block of the runs, the next run's source opened when one is done: false at the end
+    bool pull(DB::Block & block);
+};
 
 struct chte_table
 {

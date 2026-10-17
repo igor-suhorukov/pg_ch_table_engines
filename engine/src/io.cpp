@@ -8,7 +8,9 @@
 #include <Columns/ColumnLowCardinality.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
+#include <Common/assert_cast.h>
 #include <Common/SimpleIncrement.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -129,7 +131,7 @@ chte_vector vectorOf(const IColumn & column)
 
 }
 
-namespace
+namespace chte
 {
 
 void fillPartInfo(const IMergeTreeDataPart & part, chte_part_info & info)
@@ -143,6 +145,7 @@ void fillPartInfo(const IMergeTreeDataPart & part, chte_part_info & info)
     info.rows = part.rows_count;
     info.bytes_on_disk = part.getBytesOnDisk();
     info.marks = part.index_granularity->getMarksCountWithoutFinal();
+    snprintf(info.temp_dir, sizeof(info.temp_dir), "%s", part.getDataPartStorage().getPartDirectory().c_str());
 }
 
 /// Gives a finished part its final directory name.
@@ -153,17 +156,6 @@ void commitPart(IMergeTreeDataPart & part)
 }
 
 }
-
-struct chte_writer
-{
-    chte_table * table = nullptr;
-    UInt64 block_number = 0;
-    Block header;
-    MutableColumns columns;
-    std::vector<MergeTreeTemporaryPartPtr> parts;
-    bool finished = false;
-    bool committed = false;
-};
 
 extern "C" int chte_write_begin(chte_table * table, uint64_t block_number, chte_writer ** writer, chte_error * error)
 {
@@ -191,30 +183,41 @@ extern "C" int chte_write_batch(chte_writer * writer, uint32_t nrows, const chte
     });
 }
 
+namespace chte
+{
+
+/// The writer's rows as parts, one a partition, under temporary names.
+void writeParts(chte_writer & writer, ContextPtr context)
+{
+    if (writer.finished)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "a writer's parts written twice");
+    writer.finished = true;
+    auto & table = *writer.table;
+    auto & storage = *table.storage;
+    Block block = writer.header.cloneWithColumns(std::move(writer.columns));
+    auto blocks = MergeTreeDataWriter::splitBlockIntoParts(std::move(block), /* max_parts= */ 0, table.metadata, context);
+    for (auto & part_block : blocks)
+    {
+        checkInterrupted();
+        /// writeTempPart numbers the part with insert_increment.get() (MergeTreeDataWriter.cpp:695):
+        /// every part of this write gets the caller's block number.
+        storage.insert_increment.set(writer.block_number - 1);
+        auto temp = storage.writer.writeTempPart(part_block, table.metadata, context);
+        if (!temp->part)
+            continue;
+        temp->finalize();
+        temp->part->getDataPartStorage().commitTransaction();
+        writer.parts.push_back(std::move(temp));
+    }
+}
+
+}
+
 extern "C" int chte_write_finish(chte_writer * writer, size_t * nparts, chte_error * error)
 {
     return guarded(error, [&]
     {
-        if (writer->finished)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_write_finish called twice");
-        writer->finished = true;
-        auto & table = *writer->table;
-        auto & storage = *table.storage;
-        Block block = writer->header.cloneWithColumns(std::move(writer->columns));
-        auto blocks = MergeTreeDataWriter::splitBlockIntoParts(std::move(block), /* max_parts= */ 0, table.metadata, table.context);
-        for (auto & part_block : blocks)
-        {
-            checkInterrupted();
-            /// writeTempPart numbers the part with insert_increment.get() (MergeTreeDataWriter.cpp:695):
-            /// every part of this write gets the caller's block number.
-            storage.insert_increment.set(writer->block_number - 1);
-            auto temp = storage.writer.writeTempPart(part_block, table.metadata, table.context);
-            if (!temp->part)
-                continue;
-            temp->finalize();
-            temp->part->getDataPartStorage().commitTransaction();
-            writer->parts.push_back(std::move(temp));
-        }
+        writeParts(*writer, writer->table->context);
         *nparts = writer->parts.size();
     });
 }
@@ -264,19 +267,85 @@ extern "C" void chte_write_close(chte_writer * writer)
     delete writer;
 }
 
-struct chte_reader
-{
-    chte_table * table = nullptr;
-    QueryPipeline pipeline;
-    std::unique_ptr<PullingPipelineExecutor> executor;
-    Columns columns;
-    std::vector<uint8_t> present;
-};
-
 struct chte_batch
 {
     Columns columns;
 };
+
+namespace chte
+{
+
+Names columnNames(const char * columns)
+{
+    Names names;
+    String list = columns ? columns : "";
+    boost::split(names, list, [](char c) { return c == ','; });
+    for (auto & name : names)
+        boost::trim(name);
+    std::erase_if(names, [](const String & name) { return name.empty(); });
+    if (names.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "no columns to read");
+    return names;
+}
+
+/// A reader of a part's named columns over mark_ranges (none: every granule); _part_offset
+/// is each row's place in the part.
+std::vector<std::optional<MarkRanges>> markRuns(const std::optional<MarkRanges> & mark_ranges)
+{
+    std::vector<std::optional<MarkRanges>> runs;
+    if (!mark_ranges)
+    {
+        runs.emplace_back(std::nullopt);
+        return runs;
+    }
+    for (const auto & range : *mark_ranges)
+    {
+        if (runs.empty() || runs.back()->back().end != range.begin)
+            runs.emplace_back(MarkRanges{});
+        runs.back()->push_back(range);
+    }
+    return runs;
+}
+
+std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
+                                        std::optional<MarkRanges> mark_ranges)
+{
+    auto & storage = *table.storage;
+    auto snapshot = storage.getStorageSnapshot(table.metadata, table.context);
+    auto mutations = storage.getMutationsSnapshot({});
+    auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table.context);
+
+    auto r = std::make_unique<chte_reader>();
+    r->table = &table;
+    for (const auto & name : names)
+        r->present.push_back(!table.metadata->getColumns().hasPhysical(name) || part->getColumnPosition(name).has_value());
+    r->open_run = [&storage, snapshot, part, alter_conversions, names](std::optional<MarkRanges> run)
+    {
+        return createMergeTreeSequentialSource(
+            MergeTreeSequentialSourceType::Merge, storage, snapshot, RangesInDataPart(part), alter_conversions,
+            /* merged_part_offsets= */ nullptr, names, std::move(run),
+            std::make_shared<std::atomic<size_t>>(0), /* apply_deleted_mask= */ false,
+            /* read_with_direct_io= */ false, /* prefetch= */ false);
+    };
+    r->runs = markRuns(mark_ranges);
+    return r;
+}
+
+}
+
+bool chte_reader::pull(Block & block)
+{
+    for (;;)
+    {
+        if (executor && executor->pull(block))
+            return true;
+        if (next_run >= runs.size())
+            return false;
+        executor.reset();
+        pipeline = QueryPipeline(open_run(std::move(runs[next_run++])));
+        executor = std::make_unique<PullingPipelineExecutor>(pipeline);
+    }
+}
 
 extern "C" int chte_read_begin(chte_table * table, const char * part_name, const char * columns, const chte_mark_range * ranges,
                                size_t nranges, chte_reader ** reader, chte_error * error)
@@ -284,19 +353,8 @@ extern "C" int chte_read_begin(chte_table * table, const char * part_name, const
     return guarded(error, [&]
     {
         auto & storage = *table->storage;
-        Names names;
-        String list = columns ? columns : "";
-        boost::split(names, list, [](char c) { return c == ','; });
-        for (auto & name : names)
-            boost::trim(name);
-        std::erase_if(names, [](const String & name) { return name.empty(); });
-        if (names.empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_read_begin: no columns");
-
+        Names names = columnNames(columns);
         MergeTreeData::DataPartPtr part = storage.getPart(part_name);
-        auto snapshot = storage.getStorageSnapshot(table->metadata, table->context);
-        auto mutations = storage.getMutationsSnapshot({});
-        auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table->context);
 
         std::optional<MarkRanges> mark_ranges;
         if (nranges > 0)
@@ -313,19 +371,7 @@ extern "C" int chte_read_begin(chte_table * table, const char * part_name, const
             }
         }
 
-        Pipe pipe = createMergeTreeSequentialSource(
-            MergeTreeSequentialSourceType::Merge, storage, snapshot, RangesInDataPart(part), alter_conversions,
-            /* merged_part_offsets= */ nullptr, names, std::move(mark_ranges),
-            std::make_shared<std::atomic<size_t>>(0), /* apply_deleted_mask= */ false,
-            /* read_with_direct_io= */ false, /* prefetch= */ false);
-
-        auto r = std::make_unique<chte_reader>();
-        r->table = table;
-        for (const auto & name : names)
-            r->present.push_back(!table->metadata->getColumns().hasPhysical(name) || part->getColumnPosition(name).has_value());
-        r->pipeline = QueryPipeline(std::move(pipe));
-        r->executor = std::make_unique<PullingPipelineExecutor>(r->pipeline);
-        *reader = r.release();
+        *reader = openReader(*table, part, names, std::move(mark_ranges)).release();
     });
 }
 
@@ -336,15 +382,41 @@ extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error
         *nrows = 0;
         reader->columns.clear();
         Block block;
-        while (reader->executor->pull(block))
+        while (reader->pull(block))
         {
             checkInterrupted();
             if (block.rows() == 0)
                 continue;
+            Columns columns;
             for (const auto & column : block)
-                reader->columns.push_back(column.column->convertToFullColumnIfConst()->convertToFullColumnIfSparse()
-                                              ->convertToFullColumnIfLowCardinality());
-            *nrows = static_cast<uint32_t>(block.rows());
+                columns.push_back(column.column->convertToFullIfWrapped()->convertToFullColumnIfLowCardinality());
+            size_t rows = block.rows();
+            if (reader->by_offset)
+            {
+                /// the rows at the wanted offsets alone: both ascend, so one pass over each
+                const auto & offsets = typeid_cast<const ColumnUInt64 &>(*columns.back()).getData();
+                IColumn::Filter keep(rows, 0);
+                size_t kept = 0;
+                for (size_t i = 0; i < rows; ++i)
+                {
+                    while (reader->wanted_pos < reader->wanted.size() && reader->wanted[reader->wanted_pos] < offsets[i])
+                        ++reader->wanted_pos;
+                    if (reader->wanted_pos < reader->wanted.size() && reader->wanted[reader->wanted_pos] == offsets[i])
+                    {
+                        keep[i] = 1;
+                        ++kept;
+                    }
+                }
+                columns.pop_back();
+                if (kept == 0)
+                    continue;
+                if (kept < rows)
+                    for (auto & column : columns)
+                        column = column->filter(keep, static_cast<ssize_t>(kept));
+                rows = kept;
+            }
+            reader->columns = std::move(columns);
+            *nrows = static_cast<uint32_t>(rows);
             return;
         }
     });

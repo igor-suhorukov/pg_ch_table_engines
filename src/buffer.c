@@ -230,6 +230,30 @@ ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 }
 
 /*
+ * An update's new row (dml.c): its row id taken first, which the old row's
+ * tombstone names, then the row buffered under it.  Nothing enters the
+ * buffer between the two, so its row ids still ascend.
+ */
+uint64
+ch_buffer_reserve_rowid(Relation rel, CommandId cid)
+{
+	return take_rowid(buffer_for(rel, cid));
+}
+
+void
+ch_buffer_insert_rowid(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid)
+{
+	ChBuffer   *b = buffer_for(rel, cid);
+
+	if (ch_builder_rows(b->builder) == 0)
+		b->first_rowid = rowid;
+	ch_builder_add(b->builder, slot, rowid);
+	ItemPointerSet(&slot->tts_tid, CH_ROWID_TO_BLOCK(rowid), CH_ROWID_TO_OFFSET(rowid));
+	slot->tts_tableOid = RelationGetRelid(rel);
+	check_limits(b);
+}
+
+/*
  * A batch of rows by column, from vexec's sink (vexec.c): the buffer of
  * (rel, cid), the batch's row ids taken in rowids[], its builder for the
  * caller to append the rows to; ch_buffer_batch_done() after.

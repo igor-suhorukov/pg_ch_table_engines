@@ -1,0 +1,20 @@
+The isolation leg's differences from heap that were reviewed and are kept
+(ch_table_engines.md, "CH2's results"), each of one of three kinds:
+
+  every lock mode exclusive (§2.10): FOR KEY SHARE and FOR SHARE, which heap
+  shares, block and are blocked; NO KEY UPDATE conflicts with KEY SHARE --
+    pg-delete-abort-savept-2, pg-lock-committed-update, pg-lock-update-delete,
+    pg-nowait-2, pg-skip-locked-2, pg-tuplelock-conflict, pg-tuplelock-update,
+    pg-tuplelock-upgrade-no-deadlock
+
+  SERIALIZABLE's predicate locks at the relation's grain (§2.6): more
+  serialization failures than heap's finer ones, never fewer --
+    pg-predicate-gin, pg-predicate-gist, pg-predicate-hash,
+    pg-prepared-transactions, pg-receipt-report, pg-two-ids
+
+  the TIDs, which are row ids, and EXPLAIN's text (ChScan where a Seq Scan
+  stood) --
+    pg-eval-plan-qual
+
+A difference matches its kept file when the lines either side adds or
+removes are the same; headers and line numbers are passed over.

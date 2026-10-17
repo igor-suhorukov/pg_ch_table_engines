@@ -9,8 +9,10 @@ test: visibility
 test: ddl
 test: scans
 test: chscan
+test: dml
+test: indexes
 test: functions
 test: store
 nopreload: nopreload
 # again with the files store as the default (§2.9): the tests whose answers do not name a store
-files: setup types insert visibility ddl scans chscan functions
+files: setup types insert visibility ddl scans chscan dml indexes functions

@@ -566,6 +566,7 @@ src_next(void *arg, VexecSourceBatch *out_batch)
 	SrcOut	   *out;
 	uint32		n;
 	uint32		pos;
+	uint32		returned;
 
 	for (;;)
 	{
@@ -581,6 +582,7 @@ src_next(void *arg, VexecSourceBatch *out_batch)
 
 	pos = st->pos;
 	n = Min(st->max_rows, st->batch.nrows - pos);
+	returned = n;
 	st->pos += n;
 	out = next_out(st);
 	for (int i = 0; i < st->ncols; i++)
@@ -595,13 +597,28 @@ src_next(void *arg, VexecSourceBatch *out_batch)
 	}
 	out_batch->nrows = (int) n;
 	out_batch->visible = NULL;
+	/* deleted rows (§2.10): the batch's slice of the scan's visible bits */
+	if (st->batch.visible)
+	{
+		uint64	   *bits = MemoryContextAllocZero(out->cxt, sizeof(uint64) * ((n + 63) / 64));
+		uint32		live = 0;
+
+		for (uint32 k = 0; k < n; k++)
+			if (st->batch.visible[(pos + k) / 64] & (UINT64CONST(1) << ((pos + k) % 64)))
+			{
+				bits[k / 64] |= UINT64CONST(1) << (k % 64);
+				live++;
+			}
+		out_batch->visible = bits;
+		returned = live;
+	}
 	out_batch->tids = st->tids ? out->tids : NULL;
 	out_batch->columns = out->columns;
 	out_batch->owner = out;
 
 	/* as getnextslot counts each row it returns */
 	if (pgstat_should_count_relation(st->rel))
-		st->rel->pgstat_info->counts.tuples_returned += n;
+		st->rel->pgstat_info->counts.tuples_returned += returned;
 	return true;
 }
 
@@ -756,6 +773,13 @@ src_aggregate(void *arg, int nreqs, const VexecSourceAgg *reqs, VexecSourceAggAn
 		return false;			/* inside a batch: its rows come first */
 	st->have_batch = false;
 	if (!ch_scan_claim_unit(st->scan, &unit))
+		return false;
+	/*
+	 * A unit some of whose rows may be deleted: neither its rows, which every
+	 * answer reports -- count(*) asks for nothing else -- nor its statistics
+	 * are its rows'.  next() reads it.
+	 */
+	if (unit.deletions)
 		return false;
 	MemoryContextReset(st->answer_cxt);
 	old = MemoryContextSwitchTo(st->answer_cxt);

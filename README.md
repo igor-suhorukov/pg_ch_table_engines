@@ -32,8 +32,25 @@ manager, or `files`, ClickHouse's directories of parts), `order_by`,
 `primary_key`, `index_granularity`, `compression` (`lz4`, `lz4hc[(N)]`,
 `zstd[(N)]`, `none`), `settings` (further MergeTree settings), and the engines'
 own: `ver`, `is_deleted`, `sign`, `sum_columns`.  `ch.parts(rel)`,
-`ch.definition(rel)`, `ch.table_size(rel)`, `ch.engine_info()` and
-`ch.remove_orphans(rel)` describe and keep the tables.
+`ch.definition(rel)`, `ch.table_size(rel)`, `ch.engine_info()`,
+`ch.fold(rel)` and `ch.remove_orphans(rel)` describe and keep the tables.
+
+Writes.  INSERT, COPY, UPDATE, DELETE, MERGE and row locks (`SELECT ... FOR
+UPDATE` and its kin) behave as on heap under every isolation level: a
+deletion, an update or a lock is a row of the catalog `ch.tombstones`, which
+PostgreSQL's MVCC makes visible, and an update writes the row's new version as
+an insert does.  Writers of a row wait for each other as heap's do, and READ
+COMMITTED re-checks a row's newest version.  Every lock mode is exclusive for
+now.  `ch.fold(rel)` writes each part holding rows every snapshot sees deleted
+again without them; VACUUM removes their index entries and cleans every index
+up, as on heap.
+
+Indexes.  btree, hash, GiST, GIN and SP-GiST: their entries are the rows'
+TIDs, and a row is found by its TID through the part's `_pg_rowid`
+projection; index, bitmap and index-only scans work.  Not yet: unique
+indexes and exclusion constraints, and so primary keys and ON CONFLICT's
+arbiters; CREATE INDEX CONCURRENTLY.  BRIN is refused: the parts keep min/max
+statistics of their own.
 
 Reads.  The planner offers **ChScan** beside the sequential scan
 (`ch.enable_chscan`): it reads only the columns a query needs, in parallel
@@ -56,6 +73,7 @@ test/run.sh sources    # ClickHouse at the pinned release, with the submodules i
 test/run.sh engine     # the builder image and libchte_engine.so
 test/run.sh images     # the dev images
 test/run.sh all        # core, spike, suite, tap
+test/run.sh isolation  # concurrent DML and row locks, against heap's answers
 test/run.sh pgregress  # PostgreSQL's own suite with default_table_access_method = mergetree
 test/run.sh hits       # 10M ClickBench rows into heap and both stores, compared, and reads timed
 ```

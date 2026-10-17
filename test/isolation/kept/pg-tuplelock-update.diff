@@ -1,0 +1,34 @@
+--- /work/isolation/pg-tuplelock-update.heap	2026-10-17 01:59:36.920426398 +0000
++++ /work/isolation/pg-tuplelock-update.mergetree	2026-10-17 02:00:37.182479371 +0000
+@@ -23,24 +23,25 @@
+ (1 row)
+ 
+ step s1_advunlock1: SELECT pg_advisory_unlock(142857); <waiting ...>
++step s3_update: <... completed>
++ERROR:  canceling statement due to lock timeout
++step s4_update: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s2_update: <... completed>
++ERROR:  canceling statement due to lock timeout
+ step s1_advunlock1: <... completed>
+ pg_advisory_unlock
+ ------------------
+ t                 
+ (1 row)
+ 
+-step s1_advunlock2: SELECT pg_advisory_unlock(285714); <waiting ...>
+-step s3_update: <... completed>
+-step s1_advunlock2: <... completed>
++step s1_advunlock2: SELECT pg_advisory_unlock(285714);
+ pg_advisory_unlock
+ ------------------
+ t                 
+ (1 row)
+ 
+-step s1_advunlock3: SELECT pg_advisory_unlock(571428); <waiting ...>
+-step s4_update: <... completed>
+-step s1_advunlock3: <... completed>
++step s1_advunlock3: SELECT pg_advisory_unlock(571428);
+ pg_advisory_unlock
+ ------------------
+ t                 

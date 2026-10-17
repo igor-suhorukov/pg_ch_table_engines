@@ -19,6 +19,9 @@
 #                        and its lazy-loading tests without preloading
 #   run.sh tap           the TAP tests (t/): crash, standby, backups and
 #                        PITR, dump and restore, two sessions at once
+#   run.sh isolation     concurrent DML and row locks: each spec, the
+#                        extension's and PostgreSQL's, by isolationtester over
+#                        heap and over mergetree, the answers compared
 #   run.sh pgregress     PostgreSQL's own regression suite with
 #                        default_table_access_method = mergetree, its
 #                        differences kept for review
@@ -80,6 +83,8 @@ case "${1:-}" in
 		leg core /src/checks/core.sh ;;
 	suite)
 		leg suite /src/test/suite.sh ;;
+	isolation)
+		leg isolation /src/test/isolation.sh ;;
 	tap)
 		leg tap /src/test/tap.sh ;;
 	pgregress)

@@ -426,8 +426,6 @@ FETCH 1 FROM c;
 (1 row)
 
 DELETE FROM cs WHERE CURRENT OF c;
-ERROR:  DELETE is not supported on tables of the ClickHouse engines yet
-DETAIL:  It comes in phase CH2 of ch_table_engines.md.
 ROLLBACK;
 -- NULL constants, stable functions and parameters prune nothing
 SELECT same_answer('SELECT a FROM cs WHERE a = NULL::int');

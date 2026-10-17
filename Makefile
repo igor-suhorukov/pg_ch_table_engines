@@ -9,16 +9,20 @@ OBJS = \
 	src/catalog.o \
 	src/chscan.o \
 	src/convert.o \
+	src/dml.o \
 	src/engine.o \
 	src/filter.o \
 	src/functions.o \
+	src/index.o \
 	src/module.o \
 	src/options.o \
 	src/pages.o \
 	src/scan.o \
 	src/store.o \
 	src/table.o \
+	src/tombstones.o \
 	src/types.o \
+	src/vacuum.o \
 	src/vexec.o
 
 EXTENSION = ch_table_engines

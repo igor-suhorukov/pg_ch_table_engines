@@ -11,9 +11,11 @@
 #ifndef CHTE_H
 #define CHTE_H
 
+#include "access/skey.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "nodes/parsenodes.h"
+#include "storage/lockdefs.h"
 #include "storage/relfilelocator.h"
 #include "utils/rel.h"
 
@@ -181,8 +183,14 @@ typedef struct ChPart
 	bytea	   *manifest;		/* the pages store's: the files' pages; NULL in the files store */
 } ChPart;
 
+extern Oid	ch_catalog_relid(const char *name, bool unlogged);
+extern Relation ch_catalog_open(const char *name, const ChStorageId *id, LOCKMODE lockmode);
+extern Oid	ch_catalog_index(Relation catalog);
+extern int	ch_catalog_storage_keys(const ChStorageId *id, ScanKeyData *keys);
+extern void ch_catalog_insert(Relation catalog, HeapTuple tuple, CommandId cid);
 extern List *ch_parts_visible(const ChStorageId *id, Snapshot snapshot);
 extern void ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid);
+extern void ch_part_delete(const ChStorageId *id, const char *name);
 extern void ch_parts_delete_all(const ChStorageId *id);
 extern void ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage);
 extern void ch_table_row_delete(const ChStorageId *id);
@@ -210,6 +218,8 @@ extern void ch_builder_add_columns(ChVectorBuilder *b, const struct VexecColumn 
 
 /* buffer.c: the write buffer (§2.7) */
 extern void ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid);
+extern uint64 ch_buffer_reserve_rowid(Relation rel, CommandId cid);
+extern void ch_buffer_insert_rowid(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid);
 extern ChVectorBuilder *ch_buffer_batch_begin(Relation rel, CommandId cid, uint32 nrows, uint64 *rowids);
 extern void ch_buffer_batch_done(Relation rel);
 extern void ch_buffer_flush_relation(Relation rel);
@@ -250,10 +260,45 @@ extern Size ch_parallelscan_estimate(Relation rel);
 extern Size ch_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan);
 extern void ch_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan);
 extern bool ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot);
+extern void ch_scan_forget(void *scan);
 extern Snapshot ch_parts_snapshot(Relation rel, Snapshot snapshot, SnapshotData *buf);
 extern bool ch_scan_analyze_next_block(TableScanDesc scan, struct ReadStream *stream);
 extern bool ch_scan_analyze_next_tuple(TableScanDesc scan, double *liverows, double *deadrows,
 									   TupleTableSlot *slot);
+extern bool ch_scan_bitmap_next_tuple(TableScanDesc scan, TupleTableSlot *slot, bool *recheck,
+									  uint64 *lossy_pages, uint64 *exact_pages);
+
+/* dml.c: DELETE, UPDATE and row locks (§2.10) */
+extern TM_Result ch_tuple_delete(Relation rel, ItemPointer tid, CommandId cid, uint32 options, Snapshot snapshot,
+								 Snapshot crosscheck, bool wait, TM_FailureData *tmfd);
+extern TM_Result ch_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot, CommandId cid,
+								 uint32 options, Snapshot snapshot, Snapshot crosscheck, bool wait,
+								 TM_FailureData *tmfd, LockTupleMode *lockmode,
+								 TU_UpdateIndexes *update_indexes);
+extern TM_Result ch_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
+							   CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, uint8 flags,
+							   TM_FailureData *tmfd);
+extern void ch_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid);
+
+/* vacuum.c: what deletions leave behind (§2.10, §2.13) */
+struct VacuumParams;
+extern void ch_vacuum_indexes(Relation rel, const struct VacuumParams *params, BufferAccessStrategy strategy);
+extern int64 ch_fold_deletions(Relation rel);
+
+/* index.c: indexes (§2.10) */
+extern struct IndexFetchTableData *ch_index_fetch_begin(Relation rel, uint32 flags);
+extern void ch_index_fetch_reset(struct IndexFetchTableData *data);
+extern void ch_index_fetch_end(struct IndexFetchTableData *data);
+extern bool ch_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid, Snapshot snapshot,
+								 TupleTableSlot *slot, bool *call_again, bool *all_dead);
+extern bool ch_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapshot);
+extern TransactionId ch_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate);
+extern double ch_index_build_range_scan(Relation table_rel, Relation index_rel, struct IndexInfo *index_info,
+										bool allow_sync, bool anyvisible, bool progress,
+										BlockNumber start_blockno, BlockNumber numblocks,
+										IndexBuildCallback callback, void *callback_state, TableScanDesc scan);
+extern void ch_index_validate_scan(Relation table_rel, Relation index_rel, struct IndexInfo *index_info,
+								   Snapshot snapshot, struct ValidateIndexState *state);
 
 /* chscan.c: ChScan (§2.8) */
 extern void ch_chscan_init(void);

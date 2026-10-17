@@ -68,11 +68,9 @@ END $$;
 SELECT ins_and_count(30), ins_and_count(31);
 SELECT count(*) FROM ins WHERE b = 'fn';
 
--- what is not yet supported
-UPDATE ins SET b = 'u' WHERE a = 1;
-DELETE FROM ins WHERE a = 1;
+-- ON CONFLICT without an arbiter index inserts; a unique index (CH5) and TABLESAMPLE (CH5) are not yet supported
 INSERT INTO ins VALUES (1, 'x') ON CONFLICT DO NOTHING;
-CREATE INDEX ON ins (a);
+CREATE UNIQUE INDEX ON ins (a);
 SELECT * FROM ins TABLESAMPLE system (10);
 
 DROP TABLE ins, ins_log;

@@ -1,0 +1,83 @@
+--- /work/isolation/pg-lock-update-delete.heap	2026-10-17 01:59:06.950401061 +0000
++++ /work/isolation/pg-lock-update-delete.mergetree	2026-10-17 01:59:07.609401610 +0000
+@@ -39,13 +39,12 @@
+ t                 
+ (1 row)
+ 
++step s2c: COMMIT;
+ step s1l: <... completed>
+ key|value
+ ---+-----
+-  1|    1
+-(1 row)
++(0 rows)
+ 
+-step s2c: COMMIT;
+ 
+ starting permutation: s2b s1l s2u s2_blocker3 s2_unlock s2c
+ pg_advisory_lock
+@@ -63,13 +62,13 @@
+ t                 
+ (1 row)
+ 
++step s2c: COMMIT;
+ step s1l: <... completed>
+ key|value
+ ---+-----
+-  1|    1
++  1|    2
+ (1 row)
+ 
+-step s2c: COMMIT;
+ 
+ starting permutation: s2b s1l s2u s2_blocker1 s2_unlock s2r
+ pg_advisory_lock
+@@ -111,13 +110,13 @@
+ t                 
+ (1 row)
+ 
++step s2r: ROLLBACK;
+ step s1l: <... completed>
+ key|value
+ ---+-----
+   1|    1
+ (1 row)
+ 
+-step s2r: ROLLBACK;
+ 
+ starting permutation: s2b s1l s2u s2_blocker3 s2_unlock s2r
+ pg_advisory_lock
+@@ -135,13 +134,13 @@
+ t                 
+ (1 row)
+ 
++step s2r: ROLLBACK;
+ step s1l: <... completed>
+ key|value
+ ---+-----
+   1|    1
+ (1 row)
+ 
+-step s2r: ROLLBACK;
+ 
+ starting permutation: s2b s1l s2u s2_blocker1 s2c s2_unlock
+ pg_advisory_lock
+@@ -186,8 +185,7 @@
+ step s1l: <... completed>
+ key|value
+ ---+-----
+-  1|    1
+-(1 row)
++(0 rows)
+ 
+ 
+ starting permutation: s2b s1l s2u s2_blocker3 s2c s2_unlock
+@@ -210,7 +208,7 @@
+ step s1l: <... completed>
+ key|value
+ ---+-----
+-  1|    1
++  1|    2
+ (1 row)
+ 
+ 

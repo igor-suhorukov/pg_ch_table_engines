@@ -116,6 +116,30 @@ ch_engine_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
 
+/*
+ * Folds the deletions every snapshot sees into their parts (vacuum.c): the
+ * parts written again without their rows, the tombstones gone.  Under
+ * ShareUpdateExclusiveLock, as VACUUM's: DML goes on beside it, a second
+ * fold waits.
+ */
+PG_FUNCTION_INFO_V1(ch_fold);
+Datum
+ch_fold(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), ShareUpdateExclusiveLock);
+	int64		folded;
+
+	if (!ch_is_engine_rel(rel, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a table of the ClickHouse engines", RelationGetRelationName(rel))));
+	if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, RelationGetRelationName(rel));
+	folded = ch_fold_deletions(rel);
+	relation_close(rel, NoLock);
+	PG_RETURN_INT64(folded);
+}
+
 PG_FUNCTION_INFO_V1(ch_remove_orphans);
 Datum
 ch_remove_orphans(PG_FUNCTION_ARGS)

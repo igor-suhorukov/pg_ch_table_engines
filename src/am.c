@@ -37,6 +37,7 @@
 #include "utils/syscache.h"
 
 #include "chte.h"
+#include "tombstones.h"
 
 static TableAmRoutine routines[CH_ENGINE_COUNT];
 static bool routines_made = false;
@@ -150,31 +151,6 @@ ch_slot_callbacks(Relation rel)
 	return &ch_slot_ops;
 }
 
-static struct IndexFetchTableData *
-ch_index_fetch_begin(Relation rel, uint32 flags)
-{
-	not_yet("an index", "CH2");
-	return NULL;
-}
-
-static void
-ch_index_fetch_reset(struct IndexFetchTableData *data)
-{
-}
-
-static void
-ch_index_fetch_end(struct IndexFetchTableData *data)
-{
-}
-
-static bool
-ch_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid, Snapshot snapshot,
-					 TupleTableSlot *slot, bool *call_again, bool *all_dead)
-{
-	not_yet("an index", "CH2");
-	return false;
-}
-
 static bool
 ch_tuple_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
 {
@@ -185,30 +161,6 @@ static bool
 ch_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
 	return ItemPointerIsValid(tid) && ItemPointerGetOffsetNumberNoCheck(tid) <= CH_ROWS_PER_BLOCK;
-}
-
-static void
-ch_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
-{
-	/* rows are never updated in place, nor yet through tombstones (CH2) */
-}
-
-static bool
-ch_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapshot)
-{
-	TupleTableSlot *probe = MakeSingleTupleTableSlot(RelationGetDescr(rel), &ch_slot_ops);
-	bool		found;
-
-	found = ch_fetch_row(rel, &slot->tts_tid, snapshot, probe);
-	ExecDropSingleTupleTableSlot(probe);
-	return found;
-}
-
-static TransactionId
-ch_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
-{
-	not_yet("an index", "CH2");
-	return InvalidTransactionId;
 }
 
 static void
@@ -241,31 +193,6 @@ ch_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 		ch_buffer_insert(rel, slots[i], cid);
 	/* as heap_multi_insert() counts them */
 	pgstat_count_heap_insert(rel, nslots);
-}
-
-static TM_Result
-ch_tuple_delete(Relation rel, ItemPointer tid, CommandId cid, uint32 options, Snapshot snapshot,
-				Snapshot crosscheck, bool wait, TM_FailureData *tmfd)
-{
-	not_yet("DELETE", "CH2");
-	return TM_Ok;
-}
-
-static TM_Result
-ch_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot, CommandId cid, uint32 options,
-				Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *tmfd,
-				LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
-{
-	not_yet("UPDATE", "CH2");
-	return TM_Ok;
-}
-
-static TM_Result
-ch_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot, CommandId cid,
-			  LockTupleMode mode, LockWaitPolicy wait_policy, uint8 flags, TM_FailureData *tmfd)
-{
-	not_yet("SELECT ... FOR UPDATE/SHARE", "CH2");
-	return TM_Ok;
 }
 
 static void
@@ -321,6 +248,7 @@ ch_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 		ch_storage_id(rel, &rel->rd_locator, &oldid);
 		ch_buffer_forget_relation(RelationGetRelid(rel));
 		ch_parts_delete_all(&oldid);
+		ch_tombstones_delete_all(&oldid);
 		ch_table_row_delete(&oldid);
 		ch_store_drop_at_commit(&oldid);
 	}
@@ -347,6 +275,7 @@ ch_relation_nontransactional_truncate(Relation rel)
 	ch_buffer_forget_relation(RelationGetRelid(rel));
 	parts = ch_parts_visible(&id, NULL);
 	ch_parts_delete_all(&id);
+	ch_tombstones_delete_all(&id);
 	foreach(lc, parts)
 		ch_store_remove_now(&id, ((ChPart *) lfirst(lc))->name, true);
 }
@@ -370,6 +299,7 @@ ch_relation_dropped(Oid relid)
 		PG_TRY();
 		{
 			ch_parts_delete_all(&id);
+			ch_tombstones_delete_all(&id);
 			ch_table_row_delete(&id);
 		}
 		PG_CATCH();
@@ -424,7 +354,10 @@ ch_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 			ch_store_copy_part(rel, &oldid, &newid, p->name);
 		ch_part_insert(&newid, p, GetCurrentCommandId(true));
 	}
+	/* the rows keep their ids, and their deletions with them */
+	ch_tombstones_copy(&oldid, &newid);
 	ch_parts_delete_all(&oldid);
+	ch_tombstones_delete_all(&oldid);
 	ch_table_row_delete(&oldid);
 	ch_store_drop_at_commit(&oldid);
 	ch_table_forget(RelationGetRelid(rel));
@@ -479,6 +412,8 @@ ch_relation_vacuum(Relation rel, const VacuumParams *params, BufferAccessStrateg
 	ChStorageId id;
 	int			removed;
 
+	/* the index entries of rows every snapshot sees deleted (vacuum.c) */
+	ch_vacuum_indexes(rel, params, bstrategy);
 	if (!ConditionalLockRelation(rel, ShareLock))
 		return;
 	ch_storage_id(rel, &rel->rd_locator, &id);
@@ -563,33 +498,9 @@ ch_relation_toast_am(Relation rel)
 }
 
 /* ------------------------------------------------------------------------
- * Indexes, bitmaps, samples: later phases
+ * Samples: a later phase
  * ------------------------------------------------------------------------
  */
-
-static double
-ch_index_build_range_scan(Relation table_rel, Relation index_rel, IndexInfo *index_info, bool allow_sync,
-						  bool anyvisible, bool progress, BlockNumber start_blockno, BlockNumber numblocks,
-						  IndexBuildCallback callback, void *callback_state, TableScanDesc scan)
-{
-	not_yet("an index", "CH2");
-	return 0;
-}
-
-static void
-ch_index_validate_scan(Relation table_rel, Relation index_rel, IndexInfo *index_info, Snapshot snapshot,
-					   ValidateIndexState *state)
-{
-	not_yet("an index", "CH2");
-}
-
-static bool
-ch_scan_bitmap_next_tuple(TableScanDesc scan, TupleTableSlot *slot, bool *recheck,
-						  uint64 *lossy_pages, uint64 *exact_pages)
-{
-	not_yet("a bitmap scan", "CH2");
-	return false;
-}
 
 static bool
 ch_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)

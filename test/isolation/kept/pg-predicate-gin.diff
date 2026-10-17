@@ -1,0 +1,98 @@
+--- /work/isolation/pg-predicate-gin.heap	2026-10-17 01:59:08.685402508 +0000
++++ /work/isolation/pg-predicate-gin.mergetree	2026-10-17 01:59:09.164774901 +0000
+@@ -244,6 +244,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step wb2: insert into gin_tbl values (array[2]);
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: ro2 ra1 wo1 c1 wc2 c2
+@@ -262,6 +263,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step wc2: insert into gin_tbl values (array[800]);
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: ro2 rb1 wo1 wa2 c1 c2
+@@ -281,6 +283,7 @@
+ step wa2: insert into gin_tbl values (array[1]);
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rc1 ro2 wa2 wo1 c1 c2
+ step rc1: select count(*) from gin_tbl where p @> array[800];
+@@ -299,6 +302,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rb1 ro2 wo1 c1 wa2 c2
+ step rb1: select count(*) from gin_tbl where p @> array[2];
+@@ -316,6 +320,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step wa2: insert into gin_tbl values (array[1]);
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: ro2 rb1 wo1 c1 wc2 c2
+@@ -334,6 +339,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step wc2: insert into gin_tbl values (array[800]);
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: ro2 ra1 wo1 wb2 c1 c2
+@@ -353,6 +359,7 @@
+ step wb2: insert into gin_tbl values (array[2]);
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rc1 ro2 wb2 wo1 c1 c2
+ step rc1: select count(*) from gin_tbl where p @> array[800];
+@@ -371,6 +378,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rc1 ro2 wo1 c1 wa2 c2
+ step rc1: select count(*) from gin_tbl where p @> array[800];
+@@ -388,6 +396,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step wa2: insert into gin_tbl values (array[1]);
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: ro2 rc1 wo1 c1 wb2 c2
+@@ -406,6 +415,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step wb2: insert into gin_tbl values (array[2]);
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: ro2 ra1 wo1 wc2 c1 c2
+@@ -425,6 +435,7 @@
+ step wc2: insert into gin_tbl values (array[800]);
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rb1 ro2 wc2 wo1 c1 c2
+ step rb1: select count(*) from gin_tbl where p @> array[2];
+@@ -443,6 +454,7 @@
+ step wo1: insert into other_tbl values (1);
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: fu ra1 ro2 wo1 c1 wa2 c2
+ step fu: alter index ginidx set (fastupdate = on);

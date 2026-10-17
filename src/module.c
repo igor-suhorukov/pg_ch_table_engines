@@ -10,6 +10,10 @@
  */
 #include "postgres.h"
 
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+
 #include "access/xact.h"
 #include "executor/executor.h"
 #include "fmgr.h"
@@ -17,6 +21,7 @@
 #include "utils/guc.h"
 
 #include "chte.h"
+#include "tombstones.h"
 
 PG_MODULE_MAGIC_EXT(.name = "ch_table_engines", .version = "0.1");
 
@@ -52,8 +57,9 @@ ch_ExecutorFinish(QueryDesc *queryDesc)
 static void
 ch_xact_callback(XactEvent event, void *arg)
 {
-	/* the buffers' parts take row ids and blocks; then the counters are written */
+	/* the buffers' parts take row ids and blocks; the lock rows go; then the counters are written */
 	ch_buffer_xact_callback(event);
+	ch_tombstones_xact_callback(event);
 	ch_counters_xact_callback(event);
 	ch_store_xact_callback(event);
 	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
@@ -69,10 +75,36 @@ ch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	ch_store_subxact_callback(event, mySubid);
 }
 
+/*
+ * A test leg's aid (test/isolation.sh): where CHTE_BACKTRACE_ON_CRASH is in
+ * the server's environment, a backend that faults writes its stack to the
+ * server's log before it dies as it would have.
+ */
+static void
+crash_backtrace(int signo)
+{
+	void	   *frames[64];
+	int			n = backtrace(frames, lengthof(frames));
+	static const char head[] = "ch_table_engines: a backend faulted; its stack:\n";
+
+	(void) write(STDERR_FILENO, head, sizeof(head) - 1);
+	backtrace_symbols_fd(frames, n, STDERR_FILENO);
+	signal(signo, SIG_DFL);
+	raise(signo);
+}
+
 void
 _PG_init(void)
 {
 	ch_preloaded = process_shared_preload_libraries_in_progress;
+	if (getenv("CHTE_BACKTRACE_ON_CRASH") != NULL)
+	{
+		void	   *frame[1];
+
+		(void) backtrace(frame, 1);	/* libgcc loaded now, not in the handler */
+		signal(SIGSEGV, crash_backtrace);
+		signal(SIGBUS, crash_backtrace);
+	}
 
 	DefineCustomIntVariable("ch.insert_buffer_rows",
 							"Rows a write buffer holds before they become a part.",

@@ -38,14 +38,30 @@ CREATE TABLE ch.parts (
 ) USING heap;
 CREATE UNIQUE INDEX parts_storage_name ON ch.parts (tablespace, relfilenumber, backend, name);
 
+-- A row's deletion, an update's, or a lock on it, by the row's id (§2.10): a
+-- row of a visible part is visible when no deletion or update the snapshot sees
+-- names it; a lock holds while its transaction runs.  An update's row names its
+-- new version's row id.  Rows of a statement are inserted under its command id.
+CREATE TABLE ch.tombstones (
+	tablespace		oid NOT NULL,
+	relfilenumber	oid NOT NULL,
+	backend			integer NOT NULL,
+	rowid			bigint NOT NULL,
+	kind			"char" NOT NULL,	-- 'd' deleted, 'u' updated, 'l' locked
+	successor		bigint				-- 'u': the new version's row id
+) USING heap;
+CREATE INDEX tombstones_storage_rowid ON ch.tombstones (tablespace, relfilenumber, backend, rowid);
+
 -- The same for UNLOGGED and temporary tables, which a crash resets with them.
 CREATE UNLOGGED TABLE ch.tables_unlogged (LIKE ch.tables) USING heap;
 CREATE UNIQUE INDEX tables_unlogged_storage ON ch.tables_unlogged (tablespace, relfilenumber, backend);
 CREATE UNLOGGED TABLE ch.parts_unlogged (LIKE ch.parts) USING heap;
 CREATE UNIQUE INDEX parts_unlogged_storage_name ON ch.parts_unlogged (tablespace, relfilenumber, backend, name);
+CREATE UNLOGGED TABLE ch.tombstones_unlogged (LIKE ch.tombstones) USING heap;
+CREATE INDEX tombstones_unlogged_storage_rowid ON ch.tombstones_unlogged (tablespace, relfilenumber, backend, rowid);
 
-REVOKE ALL ON ch.tables, ch.parts, ch.tables_unlogged, ch.parts_unlogged FROM PUBLIC;
-GRANT SELECT ON ch.tables, ch.parts, ch.tables_unlogged, ch.parts_unlogged TO PUBLIC;
+REVOKE ALL ON ch.tables, ch.parts, ch.tombstones, ch.tables_unlogged, ch.parts_unlogged, ch.tombstones_unlogged FROM PUBLIC;
+GRANT SELECT ON ch.tables, ch.parts, ch.tombstones, ch.tables_unlogged, ch.parts_unlogged, ch.tombstones_unlogged TO PUBLIC;
 
 CREATE FUNCTION ch.mergetree_handler(internal) RETURNS table_am_handler
 	AS 'MODULE_PATHNAME', 'ch_mergetree_handler' LANGUAGE C STRICT;
@@ -100,6 +116,12 @@ CREATE FUNCTION ch.table_size(rel regclass) RETURNS bigint
 -- The engine library: ClickHouse's release, and the process's threads.
 CREATE FUNCTION ch.engine_info(OUT version text, OUT threads integer)
 	AS 'MODULE_PATHNAME', 'ch_engine_info' LANGUAGE C STRICT VOLATILE;
+
+-- The deletions every snapshot sees, folded into their parts (§2.10): each
+-- part holding their rows written again without them, their tombstones
+-- gone.  Returns the rows folded.
+CREATE FUNCTION ch.fold(rel regclass) RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_fold' LANGUAGE C STRICT VOLATILE;
 
 -- The files store's sweep of one table: the directories no part row names,
 -- left by a crash or by a prepared transaction's end (§2.9).  VACUUM runs it

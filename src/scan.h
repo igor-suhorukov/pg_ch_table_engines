@@ -26,6 +26,8 @@ typedef struct ChScanBatch
 	const chte_vector *vectors;
 	const bool *missing;		/* per column: the part has none, its rows the missing value */
 	chte_reader *reader;		/* NULL for a scan of no column */
+	const uint64 *visible;		/* NULL: every row; else nrows bits, 1 = not deleted */
+	uint32		nvisible;		/* the rows not deleted */
 } ChScanBatch;
 
 /* A unit, claimed and not yet read */
@@ -33,7 +35,8 @@ typedef struct ChScanUnit
 {
 	const ChPart *part;
 	bool		whole;			/* the whole part, unfiltered: its statistics are the unit's */
-	uint64		rows;			/* the rows it holds */
+	uint64		rows;			/* the rows it holds, deleted ones too */
+	bool		deletions;		/* deletions the snapshot sees may name some of them */
 } ChScanUnit;
 
 /* What a scan did, for EXPLAIN ANALYZE */

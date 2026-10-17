@@ -3,8 +3,8 @@
 #
 # 10M ClickBench rows by COPY into heap and into mergetree in both stores
 # (ch_table_engines.md §5 CH0, §6 "hits"), in a dev container: count(*),
-# per-column checksums and pg_stats compared, the loads timed; and CH1's
-# reads, timed and compared.  The data is mounted at /data
+# per-column checksums and pg_stats compared, the loads timed; CH1's reads,
+# timed and compared; and CH2's writes, timed, the checksums compared after.  The data is mounted at /data
 # (hits_10m.tsv); ClickBench's table, from its PostgreSQL entry, with its
 # primary key as the mergetree's order_by (§4).
 #
@@ -30,7 +30,7 @@ fail() { echo "hits: $*"; server_stop "$D"; exit 1; }
 "${PSQL[@]}" -d hits -c "CREATE EXTENSION ch_table_engines" || fail "CREATE EXTENSION"
 
 PK="CounterID, EventDate, UserID, EventTime, WatchID"
-# ClickBench's columns, without its PRIMARY KEY (an index, which comes in CH2)
+# ClickBench's columns, without its PRIMARY KEY (a unique index, which comes in CH5)
 cols=$(sed -n '/^(/,/^)/p' /src/test/hits-columns.sql)
 "${PSQL[@]}" -d hits -c "CREATE TABLE hits_heap $cols" || fail "heap table"
 "${PSQL[@]}" -d hits -c "CREATE TABLE hits_mt $cols USING mergetree WITH (order_by = '$PK', storage = 'files')" || fail "mergetree table"
@@ -128,6 +128,61 @@ done
 		   count(*) FILTER (WHERE abs(h.n_distinct - m.n_distinct) > greatest(0.2 * abs(h.n_distinct), 10)) AS n_distinct_differs_20pct
 	  FROM pg_stats h JOIN pg_stats m ON m.attname = h.attname AND m.tablename = 'hits_mt'
 	 WHERE h.tablename = 'hits_heap'" | tee "$WORK/pg_stats.summary"
+
+# CH2's writes (§2.10), each timed on the three tables, and every column's
+# checksum compared with heap's after them: a deletion and an update of one
+# counter's rows each, which the key finds; an index on WatchID, and a
+# thousand rows updated through it; then the mergetree tables' deletions
+# folded into their parts (ch.fold), and VACUUM, whose sweep removes the files
+# store's old part versions
+# room for them in the run's tmpfs: the loads' WAL, which max_wal_size keeps for recycling, given back
+"${PSQL[@]}" -d hits -c "ALTER SYSTEM SET max_wal_size = '4GB'" -c "SELECT pg_reload_conf()" -c "CHECKPOINT" > /dev/null ||
+	fail "a checkpoint before the writes"
+c2=$("${PSQL[@]}" -d hits -c "SELECT CounterID FROM hits_heap WHERE CounterID <> 62 GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT 1") || fail "a counter"
+# the rows each write takes
+"${PSQL[@]}" -d hits -c "SELECT 'delete', count(*) FROM hits_heap WHERE CounterID = 62
+	UNION ALL SELECT 'update', count(*) FROM hits_heap WHERE CounterID = $c2
+	UNION ALL SELECT 'update by index', count(*) FROM hits_heap WHERE WatchID IN (SELECT WatchID FROM hits_heap ORDER BY WatchID LIMIT 1000)" |
+	tee "$WORK/writes.rows"
+WRITES=(
+	"delete|DELETE FROM %t WHERE CounterID = 62"
+	"update|UPDATE %t SET ResolutionWidth = ResolutionWidth + 1, Title = Title || '!' WHERE CounterID = $c2"
+	"create index|CREATE INDEX %t_watch ON %t (WatchID)"
+	"update by index|UPDATE %t SET IsRefresh = 1 - IsRefresh WHERE WatchID IN (SELECT WatchID FROM hits_heap ORDER BY WatchID LIMIT 1000)"
+	"fold|SELECT ch.fold('%t')"
+	"vacuum|VACUUM %t"
+)
+: > "$WORK/writes.tsv"
+for w in "${WRITES[@]}"; do
+	name="${w%%|*}"
+	q="${w#*|}"
+	for t in hits_heap hits_mt hits_mtp; do
+		[ "$name" = fold ] && [ "$t" = hits_heap ] && continue
+		sql="${q//%t/$t}"
+		case "$name" in update*|delete) "${PSQL[@]}" -d hits -c "EXPLAIN (COSTS OFF) $sql" > "$WORK/plan.${name// /_}.$t" ;; esac
+		s=$(now_ms)
+		got=$("${PSQL[@]}" -d hits -c "$sql") || fail "$name on $t"
+		e=$(now_ms)
+		printf '%s\t%s\t%d\t%s\n' "$name" "$t" $((e - s)) "$(echo "$got" | tr '\n' ' ')" | tee -a "$WORK/writes.tsv"
+	done
+done
+# the parts and the tombstones left: none once every deletion is folded
+"${PSQL[@]}" -d hits -c "SELECT t.relid::regclass, count(*), sum(p.rows) FROM ch.parts p
+	JOIN ch.tables t USING (tablespace, relfilenumber, backend) GROUP BY 1 ORDER BY 1" | tee "$WORK/parts.after.txt"
+"${PSQL[@]}" -d hits -c "SELECT 'tombstones', count(*) FROM ch.tombstones" | tee -a "$WORK/parts.after.txt"
+for t in hits_heap hits_mt hits_mtp; do
+	"${PSQL[@]}" -d hits -c "SELECT count(*), $agg FROM $t" > "$WORK/checksums.after.$t" || fail "checksums of $t after the writes"
+done
+for t in hits_mt hits_mtp; do
+	if cmp -s "$WORK/checksums.after.hits_heap" "$WORK/checksums.after.$t"; then
+		echo "hits: $t after the writes: count(*) and every column's checksum agree with heap's: $(cut -d'|' -f1 "$WORK/checksums.after.hits_heap") rows"
+	else
+		echo "hits: $t after the writes: the checksums differ from heap's"
+		diff <(tr '|' '\n' < "$WORK/checksums.after.hits_heap") <(tr '|' '\n' < "$WORK/checksums.after.$t") | head -20
+		status=1
+	fi
+done
+"${PSQL[@]}" -d hits -c "SELECT 'heap', pg_table_size('hits_heap') UNION ALL SELECT 'mergetree files', ch.table_size('hits_mt') UNION ALL SELECT 'mergetree pages', pg_relation_size('hits_mtp')" | tee "$WORK/sizes.after.txt"
 
 server_stop "$D"
 if log_failures "$D"; then echo "hits: the server log has failures"; status=1; fi

@@ -29,6 +29,11 @@
  *	  which DECLARE and PL/pgSQL's cursors give (gram.y:13020) -- reads the
  *	  row ids whatever its target names.
  *
+ *	  A writer's: ModifyTable fetches an UPDATE's old row by its TID (and a
+ *	  DELETE's, for RETURNING and row triggers), and a row lock its row; a
+ *	  ChScan of such a relation reads every column, so that the fetch takes
+ *	  the row from the scan's batch (scan.c) rather than from the parts.
+ *
  * SPDX-License-Identifier: Apache-2.0
  *
  *-------------------------------------------------------------------------
@@ -57,6 +62,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "parser/parsetree.h"
 #include "port/atomics.h"
 #include "storage/itemid.h"
 #include "utils/builtins.h"
@@ -169,6 +175,37 @@ needed_attrs(RelOptInfo *rel, List **attnums, bool *need_tid, bool *whole_row)
 	return true;
 }
 
+/*
+ * Whether the executor fetches the relation's rows by TID after the scan
+ * returns them: the result relation of an UPDATE or a MERGE, which builds the
+ * new row from the old (nodeModifyTable.c); of a DELETE with RETURNING or row
+ * triggers, which take the deleted row; a relation of FOR UPDATE and the like,
+ * whose locks return the locked row.
+ */
+static bool
+fetches_old_rows(PlannerInfo *root, Index rti, Relation relation)
+{
+	Query	   *parse = root->parse;
+
+	if (get_parse_rowmark(parse, rti) != NULL)
+		return true;
+	if (!bms_is_member(rti, root->all_result_relids) && parse->resultRelation != (int) rti)
+		return false;
+	switch (parse->commandType)
+	{
+		case CMD_UPDATE:
+		case CMD_MERGE:
+			return true;
+		case CMD_DELETE:
+			return parse->returningList != NIL ||
+				(relation->trigdesc && (relation->trigdesc->trig_delete_before_row ||
+										relation->trigdesc->trig_delete_after_row ||
+										relation->trigdesc->trig_delete_old_table));
+		default:
+			return false;
+	}
+}
+
 /* The quals' cost a row, the pushed-down join clauses' too, as costsize.c's get_restriction_qual_cost() */
 static void
 restriction_qual_cost(PlannerInfo *root, RelOptInfo *rel, ParamPathInfo *param_info, QualCost *cost)
@@ -206,7 +243,7 @@ ch_planner(Query *parse, const char *query_string, int cursorOptions, ParamListI
 
 static CustomPath *
 make_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer, int workers, double rows_read,
-		  double bytes, bool rowid)
+		  double bytes, bool rowid, bool whole)
 {
 	CustomPath *cp = makeNode(CustomPath);
 	Path	   *path = &cp->path;
@@ -247,7 +284,7 @@ make_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer, int workers
 	path->total_cost = startup + cpu + disk;
 
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-	cp->custom_private = list_make1_int(rowid ? 1 : 0);
+	cp->custom_private = list_make2_int(rowid ? 1 : 0, whole ? 1 : 0);
 	cp->methods = &chscan_path_methods;
 	return cp;
 }
@@ -303,12 +340,20 @@ add_chscan_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	double		rows_read;
 	double		bytes;
 	double		raw;
+	bool		whole = false;
 
 	if (!ch_enable_chscan || rte->rtekind != RTE_RELATION || rte->inh ||
 		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW) ||
 		(rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_OTHER_MEMBER_REL) ||
 		IS_DUMMY_REL(rel) || rte->tablesample != NULL || vexec_forced(rel))
 		return;
+	/*
+	 * WHERE CURRENT OF: the TID scan is the one path the executor can serve
+	 * it by (tidpath.c, create_tidscan_paths()), the only one core adds
+	 */
+	foreach(lc, rel->baserestrictinfo)
+		if (IsA(((RestrictInfo *) lfirst(lc))->clause, CurrentOfExpr))
+			return;
 	relation = table_open(rte->relid, NoLock);
 	if (!ch_is_engine_rel(relation, NULL) || !needed_attrs(rel, &attnums, &need_tid, &whole_row))
 	{
@@ -324,7 +369,7 @@ add_chscan_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 			if (!TupleDescAttr(RelationGetDescr(relation), i)->attisdropped)
 				attnums = lappend_int(attnums, i + 1);
 	}
-	array = palloc(sizeof(AttrNumber) * Max(list_length(attnums), 1));
+	array = palloc(sizeof(AttrNumber) * Max(Max(list_length(attnums), RelationGetNumberOfAttributes(relation)), 1));
 	foreach(lc, attnums)
 		array[n++] = (AttrNumber) lfirst_int(lc);
 	/* the relation's own restrictions: a lateral one names another relation's Vars */
@@ -338,11 +383,23 @@ add_chscan_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* a cursor's scan gives its rows' TIDs, for WHERE CURRENT OF */
 	if (planning_cursor_options & CURSOR_OPT_FAST_PLAN)
 		need_tid = true;
+	/* a writer's: every column, for the fetch of its old rows by TID (above) */
+	if (fetches_old_rows(root, rel->relid, relation))
+	{
+		whole = true;
+		need_tid = true;
+		list_free(attnums);
+		attnums = NIL;
+		n = 0;
+		for (int i = 0; i < RelationGetNumberOfAttributes(relation); i++)
+			if (!TupleDescAttr(RelationGetDescr(relation), i)->attisdropped)
+				array[n++] = i + 1;
+	}
 	ch_estimate(relation, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, n, array, need_tid, quals,
 				&rows_read, &bytes, &raw);
 	table_close(relation, NoLock);
 
-	add_path(rel, &make_path(root, rel, rel->lateral_relids, 0, rows_read, bytes, need_tid)->path);
+	add_path(rel, &make_path(root, rel, rel->lateral_relids, 0, rows_read, bytes, need_tid, whole)->path);
 	if (rel->consider_parallel && rel->lateral_relids == NULL)
 	{
 		/* a heap tuple's header and line pointer a row, beside the columns' bytes */
@@ -351,7 +408,7 @@ add_chscan_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 													  max_parallel_workers_per_gather);
 
 		if (workers > 0)
-			add_partial_path(rel, &make_path(root, rel, NULL, workers, rows_read, bytes, need_tid)->path);
+			add_partial_path(rel, &make_path(root, rel, NULL, workers, rows_read, bytes, need_tid, whole)->path);
 	}
 }
 
@@ -434,6 +491,9 @@ chscan_begin(CustomScanState *node, EState *estate, int eflags)
 		else if (attno > 0)
 			s->attnums[s->natts++] = attno;
 	}
+	/* a writer's (above): every column */
+	if (list_length(cscan->custom_private) > 1 && lsecond_int(cscan->custom_private))
+		whole_row = true;
 	if (whole_row)
 	{
 		s->natts = 0;

@@ -1,0 +1,145 @@
+--- /work/isolation/pg-predicate-hash.heap	2026-10-17 01:59:11.188758700 +0000
++++ /work/isolation/pg-predicate-hash.mergetree	2026-10-17 01:59:11.743405065 +0000
+@@ -476,6 +476,7 @@
+ step c1: commit;
+ step wy4: insert into hash_tbl (id, p)
+ 			  select g, 60 from generate_series(51, 60) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: rxy3 wx3 rxy4 wy4 c1 c2
+@@ -497,6 +498,7 @@
+ 			  select g, 60 from generate_series(51, 60) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 wx3 rxy4 wy4 c2 c1
+ step rxy3: select sum(p) from hash_tbl where p=20;
+@@ -517,6 +519,7 @@
+ 			  select g, 60 from generate_series(51, 60) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wx3 c1 wy4 c2
+ step rxy3: select sum(p) from hash_tbl where p=20;
+@@ -536,6 +539,7 @@
+ step c1: commit;
+ step wy4: insert into hash_tbl (id, p)
+ 			  select g, 60 from generate_series(51, 60) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: rxy3 rxy4 wx3 wy4 c1 c2
+@@ -557,6 +561,7 @@
+ 			  select g, 60 from generate_series(51, 60) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wx3 wy4 c2 c1
+ step rxy3: select sum(p) from hash_tbl where p=20;
+@@ -577,6 +582,7 @@
+ 			  select g, 60 from generate_series(51, 60) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wy4 wx3 c1 c2
+ step rxy3: select sum(p) from hash_tbl where p=20;
+@@ -597,6 +603,7 @@
+ 			  select g, 50 from generate_series(41, 50) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wy4 wx3 c2 c1
+ step rxy3: select sum(p) from hash_tbl where p=20;
+@@ -617,6 +624,7 @@
+ 			  select g, 50 from generate_series(41, 50) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy3 rxy4 wy4 c2 wx3 c1
+ step rxy3: select sum(p) from hash_tbl where p=20;
+@@ -636,6 +644,7 @@
+ step c2: commit;
+ step wx3: insert into hash_tbl (id, p)
+ 			  select g, 50 from generate_series(41, 50) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c1: commit;
+ 
+ starting permutation: rxy4 rxy3 wx3 c1 wy4 c2
+@@ -656,6 +665,7 @@
+ step c1: commit;
+ step wy4: insert into hash_tbl (id, p)
+ 			  select g, 60 from generate_series(51, 60) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: commit;
+ 
+ starting permutation: rxy4 rxy3 wx3 wy4 c1 c2
+@@ -677,6 +687,7 @@
+ 			  select g, 60 from generate_series(51, 60) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wx3 wy4 c2 c1
+ step rxy4: select sum(p) from hash_tbl where p=30;
+@@ -697,6 +708,7 @@
+ 			  select g, 60 from generate_series(51, 60) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wy4 wx3 c1 c2
+ step rxy4: select sum(p) from hash_tbl where p=30;
+@@ -717,6 +729,7 @@
+ 			  select g, 50 from generate_series(41, 50) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wy4 wx3 c2 c1
+ step rxy4: select sum(p) from hash_tbl where p=30;
+@@ -737,6 +750,7 @@
+ 			  select g, 50 from generate_series(41, 50) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 rxy3 wy4 c2 wx3 c1
+ step rxy4: select sum(p) from hash_tbl where p=30;
+@@ -756,6 +770,7 @@
+ step c2: commit;
+ step wx3: insert into hash_tbl (id, p)
+ 			  select g, 50 from generate_series(41, 50) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c1: commit;
+ 
+ starting permutation: rxy4 wy4 rxy3 wx3 c1 c2
+@@ -777,6 +792,7 @@
+ 			  select g, 50 from generate_series(41, 50) g;
+ step c1: commit;
+ step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 wy4 rxy3 wx3 c2 c1
+ step rxy4: select sum(p) from hash_tbl where p=30;
+@@ -797,6 +813,7 @@
+ 			  select g, 50 from generate_series(41, 50) g;
+ step c2: commit;
+ step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ 
+ starting permutation: rxy4 wy4 rxy3 c2 wx3 c1
+ step rxy4: select sum(p) from hash_tbl where p=30;
+@@ -816,5 +833,6 @@
+ step c2: commit;
+ step wx3: insert into hash_tbl (id, p)
+ 			  select g, 50 from generate_series(41, 50) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c1: commit;
+ exit 0

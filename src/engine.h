@@ -46,6 +46,11 @@ typedef struct ChEngine
 	int			(*part_stats) (chte_table *, const char *, const char *, chte_column_stats *, chte_error *);
 	chte_batch *(*read_retain) (chte_reader *);
 	void		(*batch_release) (chte_batch *);
+	int			(*part_locate) (chte_table *, const char *, const uint64_t *, size_t, uint64_t *, chte_error *);
+	int			(*read_rows) (chte_table *, const char *, const char *, const uint64_t *, size_t, chte_reader **,
+							  chte_error *);
+	int			(*rewrite_part) (chte_table *, const char *, const uint64_t *, size_t, uint64_t, chte_writer **,
+								 size_t *, chte_error *);
 } ChEngine;
 
 /* GUCs */
@@ -63,7 +68,8 @@ typedef enum ChHandleKind
 	CH_HANDLE_READER,
 	CH_HANDLE_WRITER,
 	CH_HANDLE_FILTER,
-	CH_HANDLE_BATCH
+	CH_HANDLE_BATCH,
+	CH_HANDLE_SCAN				/* a running scan's place among them (scan.c) */
 } ChHandleKind;
 extern ResourceOwner ch_handle_reserve(void);
 extern void ch_handle_opened(ResourceOwner owner, ChHandleKind kind, void *ptr);

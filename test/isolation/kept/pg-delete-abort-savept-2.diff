@@ -1,0 +1,33 @@
+--- /work/isolation/pg-delete-abort-savept-2.heap	2026-10-17 01:53:01.087165594 +0000
++++ /work/isolation/pg-delete-abort-savept-2.mergetree	2026-10-17 01:53:01.229165651 +0000
+@@ -65,13 +65,14 @@
+ (1 row)
+ 
+ step s1r: ROLLBACK TO f;
+-step s2l2: SELECT * FROM foo FOR NO KEY UPDATE;
++step s2l2: SELECT * FROM foo FOR NO KEY UPDATE; <waiting ...>
++step s1c: COMMIT;
++step s2l2: <... completed>
+ key|value
+ ---+-----
+   1|    1
+ (1 row)
+ 
+-step s1c: COMMIT;
+ step s2c: COMMIT;
+ 
+ starting permutation: s1l s1svp s1d s2l2 s1r s1c s2c
+@@ -90,12 +91,12 @@
+ 
+ step s2l2: SELECT * FROM foo FOR NO KEY UPDATE; <waiting ...>
+ step s1r: ROLLBACK TO f;
++step s1c: COMMIT;
+ step s2l2: <... completed>
+ key|value
+ ---+-----
+   1|    1
+ (1 row)
+ 
+-step s1c: COMMIT;
+ step s2c: COMMIT;
+ exit 0

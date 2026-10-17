@@ -171,6 +171,9 @@ ch_engine(void)
 	LOAD(part_stats, "chte_part_stats");
 	LOAD(read_retain, "chte_read_retain");
 	LOAD(batch_release, "chte_batch_release");
+	LOAD(part_locate, "chte_part_locate");
+	LOAD(read_rows, "chte_read_rows");
+	LOAD(rewrite_part, "chte_rewrite_part");
 
 	memset(&options, 0, sizeof(options));
 	options.abi_version = CHTE_ABI_VERSION;
@@ -294,6 +297,13 @@ batch_release(Datum res)
 		engine.batch_release((chte_batch *) DatumGetPointer(res));
 }
 
+/* a scan whose end did not come: off the running scans, its memory freed with its context */
+static void
+scan_release(Datum res)
+{
+	ch_scan_forget(DatumGetPointer(res));
+}
+
 static const ResourceOwnerDesc handle_descs[] = {
 	[CH_HANDLE_READER] = {
 		.name = "ch_table_engines reader",
@@ -318,6 +328,12 @@ static const ResourceOwnerDesc handle_descs[] = {
 		.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
 		.release_priority = RELEASE_PRIO_FIRST,
 		.ReleaseResource = batch_release,
+	},
+	[CH_HANDLE_SCAN] = {
+		.name = "ch_table_engines scan",
+		.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+		.release_priority = RELEASE_PRIO_FIRST,
+		.ReleaseResource = scan_release,
 	},
 };
 

@@ -39,6 +39,8 @@ x-run: &run
     CHTE_WORK: /work
     MAKE_JOBS: ${MAKE_JOBS:-8}
     CHTE_TESTS: ${CHTE_TESTS:-}
+    CHTE_SPECS: ${CHTE_SPECS:-}
+    CHTE_TAP_TESTS: ${CHTE_TAP_TESTS:-}
     CHTE_SETTINGS: ${CHTE_SETTINGS:-}
     CHTE_ENGINE: /engine/libchte_engine.so
 
