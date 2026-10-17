@@ -9,7 +9,8 @@
  *
  * The rows keep their row ids, a column of theirs, and their order; the writer makes the new
  * part's _pg_rowid projection and statistics as for an insert, with the engines' merges on
- * insert (optimize_on_insert) off, so that the rows are the part's, less the dead.
+ * insert (optimize_on_insert) off, so that the rows are the part's, less the dead.  The new part
+ * is named as a mutation of the old one, all_<min>_<max>_<level>_<block_number>.
  */
 #include "internal.h"
 
@@ -79,6 +80,14 @@ extern "C" int chte_rewrite_part(chte_table * table, const char * part_name, con
         auto context = Context::createCopy(table->context);
         context->setSetting("optimize_on_insert", Field(false));
         writeParts(*w, context);
+        /// named as ClickHouse names a mutated part: the source's blocks and level, block_number its
+        /// version, so that it keeps the source's place among the parts the merge selector orders
+        for (auto & temp : w->parts)
+        {
+            temp->part->info = MergeTreePartInfo(part->info.getPartitionId(), part->info.min_block, part->info.max_block,
+                                                 part->info.level, static_cast<Int64>(block_number));
+            temp->part->setName(temp->part->info.getPartNameV1());
+        }
         *nparts = w->parts.size();
         *writer = w.release();
     });

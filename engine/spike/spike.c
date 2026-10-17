@@ -34,6 +34,8 @@ API(chte_read_next);
 API(chte_read_vector);
 API(chte_read_end);
 API(chte_merge);
+API(chte_merge_select);
+API(chte_insert_delay);
 API(chte_drop_part);
 API(chte_filter_create);
 API(chte_filter_free);
@@ -134,6 +136,20 @@ write_part(chte_table *t, uint64_t block, uint64_t first, uint32_t n, uint32_t s
 	free(nv);
 	free(nulls);
 	free(rowid);
+}
+
+/* Merges parts into one, committed as an insert's part is, versioned past every block the spike writes. */
+static uint64_t version = 1000;
+
+static void
+merge_parts(chte_table *t, const char *const *names, size_t n, chte_part_info *merged)
+{
+	chte_writer *w;
+
+	CHECK(p_chte_merge(t, names, n, ++version, &w, &err));
+	CHECK(p_chte_write_part(w, 0, merged, &err));
+	CHECK(p_chte_write_commit(w, &err));
+	p_chte_write_close(w);
 }
 
 /* Reads a part of the test table back and checks every row. */
@@ -389,7 +405,7 @@ replacing(const char *data)
 	}
 	names[0] = p1.name;
 	names[1] = p2.name;
-	CHECK(p_chte_merge(t, names, 2, &merged, &err));
+	merge_parts(t, names, 2, &merged);
 	printf("replacing: merged %s + %s -> %s (%" PRIu64 " rows)\n", p1.name, p2.name, merged.name, merged.rows);
 	EXPECT(merged.rows == 4, "ReplacingMergeTree kept %" PRIu64 " rows", merged.rows);
 	CHECK(p_chte_read_begin(t, merged.name, "k, ver, x", NULL, 0, &r, &err));
@@ -462,6 +478,8 @@ main(int argc, char **argv)
 	LOAD(chte_read_vector);
 	LOAD(chte_read_end);
 	LOAD(chte_merge);
+	LOAD(chte_merge_select);
+	LOAD(chte_insert_delay);
 	LOAD(chte_drop_part);
 	LOAD(chte_filter_create);
 	LOAD(chte_filter_free);
@@ -512,8 +530,29 @@ main(int argc, char **argv)
 
 	names[0] = p1.name;
 	names[1] = p2.name;
+	{
+		/* what to merge, as ClickHouse's selector chooses: aggressively, as OPTIMIZE asks, both */
+		chte_merge_candidate c[2] = {
+			{p1.name, p1.bytes_on_disk, p1.rows, 0}, {p2.name, p2.bytes_on_disk, p2.rows, 0}
+		};
+		size_t		first;
+		size_t		count;
+		uint64_t	delay;
+
+		CHECK(p_chte_merge_select(t, c, 2, 1, &first, &count, &err));
+		printf("merge selector, aggressive: parts %zu .. %zu\n", first, first + count);
+		EXPECT(first == 0 && count == 2, "the selector chose %zu parts from %zu", count, first);
+		/* inserts wait from parts_to_delay_insert (1000) parts on, and fail at parts_to_throw_insert (3000) */
+		CHECK(p_chte_insert_delay(t, 2, 1000000, &delay, &err));
+		EXPECT(delay == 0, "a delay of %" PRIu64 " ms at 2 parts", delay);
+		CHECK(p_chte_insert_delay(t, 2000, 1000000, &delay, &err));
+		printf("insert delay at 2000 parts: %" PRIu64 " ms\n", delay);
+		EXPECT(delay > 0, "no delay at 2000 parts");
+		EXPECT(p_chte_insert_delay(t, 3000, 1000000, &delay, &err) != 0, "no error at 3000 parts");
+		expect_threads("after the selector");
+	}
 	t0 = now();
-	CHECK(p_chte_merge(t, names, 2, &merged, &err));
+	merge_parts(t, names, 2, &merged);
 	printf("merged %s + %s -> %s: %" PRIu64 " rows, %" PRIu64 " bytes in %.3f s\n",
 		   p1.name, p2.name, merged.name, merged.rows, merged.bytes_on_disk, now() - t0);
 	EXPECT(merged.rows == 2 * n, "merged rows %" PRIu64, merged.rows);

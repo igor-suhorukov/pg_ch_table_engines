@@ -34,7 +34,8 @@ CREATE TABLE ch.parts (
 	max_rowid		bigint NOT NULL,
 	level			integer NOT NULL,
 	marks			integer NOT NULL,	-- its granules
-	manifest		bytea				-- the pages store's: each file's pages; NULL in the files store
+	manifest		bytea,				-- the pages store's: each file's pages; NULL in the files store
+	created			timestamptz NOT NULL	-- when it was written: its age for the merge selector
 ) USING heap;
 CREATE UNIQUE INDEX parts_storage_name ON ch.parts (tablespace, relfilenumber, backend, name);
 
@@ -57,6 +58,11 @@ CREATE UNLOGGED TABLE ch.tables_unlogged (LIKE ch.tables) USING heap;
 CREATE UNIQUE INDEX tables_unlogged_storage ON ch.tables_unlogged (tablespace, relfilenumber, backend);
 CREATE UNLOGGED TABLE ch.parts_unlogged (LIKE ch.parts) USING heap;
 CREATE UNIQUE INDEX parts_unlogged_storage_name ON ch.parts_unlogged (tablespace, relfilenumber, backend, name);
+-- A part's storage is freed once VACUUM has pruned its row (§2.11): a merge
+-- leaves a few dead rows, which autovacuum takes at once, as it would not
+-- under the default thresholds.
+ALTER TABLE ch.parts SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
+ALTER TABLE ch.parts_unlogged SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
 CREATE UNLOGGED TABLE ch.tombstones_unlogged (LIKE ch.tombstones) USING heap;
 CREATE INDEX tombstones_unlogged_storage_rowid ON ch.tombstones_unlogged (tablespace, relfilenumber, backend, rowid);
 
@@ -122,6 +128,12 @@ CREATE FUNCTION ch.engine_info(OUT version text, OUT threads integer)
 -- gone.  Returns the rows folded.
 CREATE FUNCTION ch.fold(rel regclass) RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_fold' LANGUAGE C STRICT VOLATILE;
+
+-- The table's parts merged in this session (§2.11), as OPTIMIZE TABLE merges
+-- them: those ClickHouse's merge selector chooses, or with final every part
+-- into one, their deleted rows folded out.  Returns how many parts merged.
+CREATE FUNCTION ch.optimize(rel regclass, final boolean DEFAULT false) RETURNS integer
+	AS 'MODULE_PATHNAME', 'ch_optimize' LANGUAGE C STRICT VOLATILE;
 
 -- The files store's sweep of one table: the directories no part row names,
 -- left by a crash or by a prepared transaction's end (§2.9).  VACUUM runs it

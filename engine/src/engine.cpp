@@ -5,6 +5,8 @@
  */
 #include "internal.h"
 
+#include <sys/resource.h>
+
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Common/Exception.h>
 #include <Disks/DiskLocal.h>
@@ -129,6 +131,19 @@ extern "C" int chte_init(const chte_init_options * options, chte_error * error)
 
         main_thread = pthread_self();
         callbacks = options->callbacks;
+
+        /// The open files' soft limit raised to the hard one, as ClickHouse's server raises it
+        /// (Server.cpp, max_open_files): a merge of wide parts of the files store opens every column's
+        /// data and marks of every part at once.  PostgreSQL's own budget of descriptors, set at the
+        /// postmaster's start (fd.c, max_safe_fds), stays as it is.
+        {
+            rlimit rlim{};
+            if (getrlimit(RLIMIT_NOFILE, &rlim) == 0 && rlim.rlim_cur < rlim.rlim_max)
+            {
+                rlim.rlim_cur = rlim.rlim_max;
+                (void) setrlimit(RLIMIT_NOFILE, &rlim);
+            }
+        }
         MainThreadStatus::getInstance();
 
         Poco::AutoPtr<CallbackChannel> channel(new CallbackChannel);
@@ -159,6 +174,10 @@ extern "C" int chte_init(const chte_init_options * options, chte_error * error)
         engine->policy = std::make_shared<StoragePolicy>(
             "chte", Volumes{std::make_shared<SingleDiskVolume>("chte", engine->parts_disk)}, 0.0);
 
+        /// a vertical merge keeps its rows' sources in a temporary file (MergeTask.cpp, RowsSourcesTemporaryFile),
+        /// in a directory the process alone uses: setting it up clears the temporary files in it
+        if (options->tmp_path && *options->tmp_path)
+            engine->global->setTemporaryStoragePath(options->tmp_path, /* max_size= */ 0);
         engine->global->setMarkCache("SLRU", 64 << 20, 0.5);
         engine->global->setIndexMarkCache("SLRU", 16 << 20, 0.5);
         engine->global->setPrimaryIndexCache("SLRU", 16 << 20, 0.5);

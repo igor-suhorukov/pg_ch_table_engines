@@ -730,6 +730,32 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 	bool		outermost = (utility_depth == 0);
 	List	   *after_alter_strip = NIL;
 
+	/*
+	 * A command that needs a database to itself waits for its other backends
+	 * to exit (dbcommands.c, CountOtherDBBackends()): the database's merge
+	 * worker is told to first (worker.c).
+	 */
+	if (IsA(parsetree, DropdbStmt))
+		ch_merge_workers_stop(get_database_oid(((DropdbStmt *) parsetree)->dbname, true));
+	else if (IsA(parsetree, RenameStmt) && ((RenameStmt *) parsetree)->renameType == OBJECT_DATABASE)
+		ch_merge_workers_stop(get_database_oid(((RenameStmt *) parsetree)->subname, true));
+	else if (IsA(parsetree, AlterDatabaseStmt))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((AlterDatabaseStmt *) parsetree)->options)
+			if (strcmp(((DefElem *) lfirst(lc))->defname, "tablespace") == 0)
+				ch_merge_workers_stop(get_database_oid(((AlterDatabaseStmt *) parsetree)->dbname, true));
+	}
+	else if (IsA(parsetree, CreatedbStmt))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((CreatedbStmt *) parsetree)->options)
+			if (strcmp(((DefElem *) lfirst(lc))->defname, "template") == 0)
+				ch_merge_workers_stop(get_database_oid(defGetString(lfirst(lc)), true));
+	}
+
 	if (IsA(parsetree, CreateStmt))
 	{
 		CreateStmt *stmt = (CreateStmt *) parsetree;

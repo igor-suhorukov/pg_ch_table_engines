@@ -1414,9 +1414,14 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 	*bytes = 0;
 	if (raw)
 		*raw = 0;
+	/* pinned from the start: the catalog's read may accept an invalidation of the table */
+	ch_table_pin(t);
 	parts = ch_parts_visible(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
 	if (parts == NIL)
+	{
+		ch_table_unpin(t);
 		return;
+	}
 	eng = ch_engine();
 	initStringInfo(&names);
 	for (int i = 0; i < n; i++)
@@ -1425,7 +1430,6 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 	if (rowid)
 		appendStringInfo(&names, "%s" CH_ROWID_COLUMN, names.len > 0 ? ", " : "");
 
-	ch_table_pin(t);
 	if (quals != NIL)
 	{
 		owner = ch_handle_reserve();

@@ -460,12 +460,15 @@ extern "C" void chte_batch_release(chte_batch * batch)
     delete batch;
 }
 
-extern "C" int chte_merge(chte_table * table, const char * const * part_names, size_t nparts, chte_part_info * result, chte_error * error)
+extern "C" int chte_merge(chte_table * table, const char * const * part_names, size_t nparts, uint64_t version,
+                          chte_writer ** writer, chte_error * error)
 {
     return guarded(error, [&]
     {
         if (nparts < 1)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_merge: no parts");
+        if (version == 0)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "block numbers start at 1");
         auto & storage = *table->storage;
         MergeTreeData::DataPartsVector parts;
         for (size_t i = 0; i < nparts; ++i)
@@ -487,10 +490,19 @@ extern "C" int chte_merge(chte_table * table, const char * const * part_names, s
         while (task->execute())
             checkInterrupted();
 
+        /// the merged part under its temporary name, for the caller to store and commit as an insert's; named
+        /// for the inputs' blocks and level as ClickHouse names it, and apart from any other by its version
         auto part = task->getFuture().get();
         part->getDataPartStorage().commitTransaction();
-        commitPart(*part);
-        fillPartInfo(*part, *result);
+        part->info.mutation = static_cast<Int64>(version);
+        part->setName(part->info.getPartNameV1());
+        auto w = std::make_unique<chte_writer>();
+        w->table = table;
+        auto temp = std::make_unique<MergeTreeTemporaryPart>();
+        temp->part = std::move(part);
+        w->parts.push_back(std::move(temp));
+        w->finished = true;
+        *writer = w.release();
     });
 }
 

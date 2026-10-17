@@ -610,9 +610,10 @@ ch_store_register_rmgr(void)
 /*
  * The sweep (§2.9, "Lifecycle"): a storage's directories no catalog row
  * names -- a crashed writer's part, a temporary part, what COMMIT or
- * ROLLBACK PREPARED left -- removed.  The caller holds a lock that no writer
- * of the relation holds with it (ShareLock), so none is in flight; a part
- * whose row some snapshot may still see stays.  Returns how many went.
+ * ROLLBACK PREPARED left, a merged or folded part's predecessor -- removed.
+ * The caller holds a lock that no writer of the relation holds with it
+ * (ShareLock), so none is in flight; a part whose row is still in ch.parts,
+ * dead or not, stays.  Returns how many went.
  */
 int
 ch_store_sweep(Relation rel, const ChStorageId *id)
@@ -622,15 +623,19 @@ ch_store_sweep(Relation rel, const ChStorageId *id)
 	struct dirent *de;
 	List	   *names = NIL;
 	int			removed = 0;
-	SnapshotData nonvacuumable;
 	ListCell   *lc;
 	List	   *parts;
 	struct stat st;
 
 	if (stat(dir, &st) != 0)
 		return 0;
-	InitNonVacuumableSnapshot(nonvacuumable, GlobalVisTestFor(rel));
-	parts = ch_parts_visible(id, &nonvacuumable);
+	/*
+	 * Every part row still in ch.parts, whatever its visibility: a directory
+	 * goes once VACUUM of ch.parts has pruned its row, which no snapshot then
+	 * sees -- a standby's included, the prune's record resolving the recovery
+	 * conflicts of those that might, before this removal's record replays.
+	 */
+	parts = ch_parts_visible(id, SnapshotAny);
 
 	d = AllocateDir(dir);
 	while ((de = ReadDir(d, dir)) != NULL)

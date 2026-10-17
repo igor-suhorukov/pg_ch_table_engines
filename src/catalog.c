@@ -41,6 +41,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/timestamp.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -60,7 +61,7 @@
 #define Anum_tables_library 9
 
 /* ch.parts's columns */
-#define Natts_parts 11
+#define Natts_parts 12
 #define Anum_parts_tablespace 1
 #define Anum_parts_relfilenumber 2
 #define Anum_parts_backend 3
@@ -72,6 +73,7 @@
 #define Anum_parts_level 9
 #define Anum_parts_marks 10
 #define Anum_parts_manifest 11
+#define Anum_parts_created 12
 
 static bool
 twin(const ChStorageId *id)
@@ -228,12 +230,45 @@ ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
 		p->marks = DatumGetInt32(values[Anum_parts_marks - 1]);
 		p->manifest = nulls[Anum_parts_manifest - 1] ? NULL :
 			DatumGetByteaPCopy(values[Anum_parts_manifest - 1]);
+		p->created = DatumGetTimestampTz(values[Anum_parts_created - 1]);
 		parts = lappend(parts, p);
 	}
 	systable_endscan(scan);
 	table_close(catalog, AccessShareLock);
 	list_sort(parts, part_order);
 	return parts;
+}
+
+/*
+ * The manifests of every part row of a storage still in ch.parts, whatever
+ * its visibility -- a writer's in progress, an aborted one's, one a merge
+ * deleted -- until VACUUM of ch.parts prunes it (SnapshotAny): the pages
+ * store's pages they name are not free (pages.c).
+ */
+List *
+ch_parts_manifests(const ChStorageId *id)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+	List	   *manifests = NIL;
+	int			nkeys;
+
+	catalog = open_catalog("parts", id, AccessShareLock);
+	nkeys = storage_keys(id, keys);
+	scan = systable_beginscan(catalog, catalog_index(catalog), true, SnapshotAny, nkeys, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		manifest = heap_getattr(tuple, Anum_parts_manifest, RelationGetDescr(catalog), &isnull);
+
+		if (!isnull)
+			manifests = lappend(manifests, DatumGetByteaPCopy(manifest));
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return manifests;
 }
 
 void
@@ -260,6 +295,7 @@ ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid)
 		values[Anum_parts_manifest - 1] = PointerGetDatum(part->manifest);
 	else
 		nulls[Anum_parts_manifest - 1] = true;
+	values[Anum_parts_created - 1] = TimestampTzGetDatum(part->created ? part->created : GetCurrentTimestamp());
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	insert_with_cid(catalog, tuple, cid);
 	heap_freetuple(tuple);

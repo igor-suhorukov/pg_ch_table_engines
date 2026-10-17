@@ -33,7 +33,8 @@ manager, or `files`, ClickHouse's directories of parts), `order_by`,
 `zstd[(N)]`, `none`), `settings` (further MergeTree settings), and the engines'
 own: `ver`, `is_deleted`, `sign`, `sum_columns`.  `ch.parts(rel)`,
 `ch.definition(rel)`, `ch.table_size(rel)`, `ch.engine_info()`,
-`ch.fold(rel)` and `ch.remove_orphans(rel)` describe and keep the tables.
+`ch.fold(rel)`, `ch.optimize(rel, final)` and `ch.remove_orphans(rel)` describe
+and keep the tables.
 
 Writes.  INSERT, COPY, UPDATE, DELETE, MERGE and row locks (`SELECT ... FOR
 UPDATE` and its kin) behave as on heap under every isolation level: a
@@ -44,6 +45,18 @@ COMMITTED re-checks a row's newest version.  Every lock mode is exclusive for
 now.  `ch.fold(rel)` writes each part holding rows every snapshot sees deleted
 again without them; VACUUM removes their index entries and cleans every index
 up, as on heap.
+
+Merges.  Merge workers -- a launcher, and a worker for each database, up to
+`ch.max_merge_workers` (2), every `ch.merge_naptime` (10 s), never on a
+standby -- merge a MergeTree table's parts as ClickHouse's merge selector
+chooses them, by ClickHouse's MergeTask; `ch.optimize(rel, final)` merges in a
+session, with `final` every part into one.  The rows keep their TIDs, so
+indexes and deletions go on naming them, and the rows every snapshot sees
+deleted are folded out first.  An insert waits once its table has 1,000 parts
+and fails at 3,000, as ClickHouse's do.  A merged part's inputs give up their
+storage once VACUUM of `ch.parts` has pruned their rows, which autovacuum does
+at once: the pages store's next parts take the pages, the files store's
+directories go.  The other engines' tables do not merge yet.
 
 Indexes.  btree, hash, GiST, GIN and SP-GiST: their entries are the rows'
 TIDs, and a row is found by its TID through the part's `_pg_rowid`
@@ -76,6 +89,8 @@ test/run.sh all        # core, spike, suite, tap
 test/run.sh isolation  # concurrent DML and row locks, against heap's answers
 test/run.sh pgregress  # PostgreSQL's own suite with default_table_access_method = mergetree
 test/run.sh hits       # 10M ClickBench rows into heap and both stores, compared, and reads timed
+test/run.sh merges     # the same rows in small batches beside the merge workers: parts, WAL, checksums
+CHTE_SETTINGS="debug_discard_caches = 1" test/run.sh suite  # every cache discarded at each chance
 ```
 
 ## Licence

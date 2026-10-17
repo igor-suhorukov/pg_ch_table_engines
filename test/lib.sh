@@ -23,6 +23,9 @@ server_init() {
 		echo "fsync = off"
 		echo "max_prepared_transactions = 10"
 		echo "allow_in_place_tablespaces = on"
+		# no background merges: a leg's answers and plans do not depend on when one
+		# runs; a leg that wants them gives the setting again, the last one counting
+		echo "ch.max_merge_workers = 0"
 		local s
 		for s in "$@"; do echo "$s"; done
 	} >> "$dir/data/postgresql.conf"

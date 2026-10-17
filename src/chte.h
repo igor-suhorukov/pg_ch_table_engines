@@ -14,6 +14,7 @@
 #include "access/skey.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "datatype/timestamp.h"
 #include "nodes/parsenodes.h"
 #include "storage/lockdefs.h"
 #include "storage/relfilelocator.h"
@@ -156,6 +157,11 @@ typedef struct ChTable
 
 extern void ch_storage_id(Relation rel, const RelFileLocator *locator, ChStorageId *id);
 extern char *ch_storage_path(const ChStorageId *id, bool relative);
+/*
+ * A relation's cached table goes at the next invalidation of the relation,
+ * which any lock taken or catalog read may accept: a caller that holds it
+ * across one pins it (ch_table_pin(); every pin goes at the transaction's end).
+ */
 extern ChTable *ch_table(Relation rel);
 extern ChTable *ch_table_for_storage(Relation rel, const ChStorageId *id);
 extern char *ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind);
@@ -181,6 +187,7 @@ typedef struct ChPart
 	int32		level;
 	int32		marks;			/* granules */
 	bytea	   *manifest;		/* the pages store's: the files' pages; NULL in the files store */
+	TimestampTz created;		/* when it was written; 0 at an insert: now */
 } ChPart;
 
 extern Oid	ch_catalog_relid(const char *name, bool unlogged);
@@ -190,6 +197,7 @@ extern int	ch_catalog_storage_keys(const ChStorageId *id, ScanKeyData *keys);
 extern void ch_catalog_insert(Relation catalog, HeapTuple tuple, CommandId cid);
 extern List *ch_parts_visible(const ChStorageId *id, Snapshot snapshot);
 extern void ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid);
+extern List *ch_parts_manifests(const ChStorageId *id);
 extern void ch_part_delete(const ChStorageId *id, const char *name);
 extern void ch_parts_delete_all(const ChStorageId *id);
 extern void ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage);
@@ -246,7 +254,7 @@ extern int	ch_store_sweep(Relation rel, const ChStorageId *id);
 /* pages.c: the pages store */
 extern void ch_pages_ops(ChTable *t, chte_pages_ops *ops);
 extern void ch_pages_attach(ChTable *t, const ChPart *part);
-extern bytea *ch_pages_store_part(Relation rel, ChTable *t, const char *part_dir);
+extern bytea *ch_pages_store_part(Relation rel, ChTable *t, const char *part_dir, ChPart *part, CommandId cid);
 extern void ch_pages_raise_pending(void);
 
 /* scan.c */
@@ -284,6 +292,22 @@ extern void ch_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid);
 struct VacuumParams;
 extern void ch_vacuum_indexes(Relation rel, const struct VacuumParams *params, BufferAccessStrategy strategy);
 extern int64 ch_fold_deletions(Relation rel);
+
+/* merge.c (§2.11) */
+typedef enum ChMergeMode
+{
+	CH_MERGE_BACKGROUND,		/* a merge worker's: what the selector chooses now, if anything */
+	CH_MERGE_OPTIMIZE,			/* ch.optimize(): the selector asked aggressively */
+	CH_MERGE_FINAL				/* ch.optimize(rel, true): every part into one */
+} ChMergeMode;
+
+extern int	ch_merge_parts(Relation rel, ChMergeMode mode);
+
+/* worker.c */
+extern int	ch_max_merge_workers;
+extern int	ch_merge_naptime;
+extern void ch_merge_launcher_register(void);
+extern void ch_merge_workers_stop(Oid dboid);
 
 /* index.c: indexes (§2.10) */
 extern struct IndexFetchTableData *ch_index_fetch_begin(Relation rel, uint32 flags);

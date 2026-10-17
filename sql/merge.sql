@@ -1,0 +1,205 @@
+-- Merges (ch_table_engines.md §2.11, CH3): ch.optimize() merges a table's
+-- parts in the session, as ClickHouse's merge selector chooses them, or with
+-- final every part into one, by ClickHouse's MergeTask.  The rows keep their
+-- row ids, so TIDs, indexes and tombstones go on naming them; the rows every
+-- snapshot sees deleted are folded out of the inputs first.  The merge
+-- workers run in the TAP tests: this suite's servers start none.
+SET client_min_messages = warning;
+SELECT 'base/' || oid AS dbdir FROM pg_database WHERE datname = current_database() \gset
+
+CREATE TABLE m_heap (a int, b text, c int);
+CREATE TABLE m_mt (a int, b text, c int) USING mergetree WITH (order_by = 'a');
+-- ten parts, a statement's rows each
+DO $$
+BEGIN
+  FOR i IN 0..9 LOOP
+    EXECUTE format('INSERT INTO m_heap SELECT g, md5(g::text), g %% 7 FROM generate_series(%s, %s) g',
+                   i * 1000 + 1, i * 1000 + 1000);
+    EXECUTE format('INSERT INTO m_mt SELECT g, md5(g::text), g %% 7 FROM generate_series(%s, %s) g',
+                   i * 1000 + 1, i * 1000 + 1000);
+  END LOOP;
+END
+$$;
+CREATE INDEX m_mt_c ON m_mt (c);
+CREATE FUNCTION same_rows() RETURNS boolean LANGUAGE sql AS $$
+  SELECT NOT EXISTS (SELECT * FROM m_heap EXCEPT ALL SELECT * FROM m_mt)
+     AND NOT EXISTS (SELECT * FROM m_mt EXCEPT ALL SELECT * FROM m_heap)
+$$;
+SELECT count(*) AS parts FROM ch.parts('m_mt');
+CREATE TEMP TABLE m_tids AS SELECT a, ctid AS tid FROM m_mt;
+
+-- what the selector chooses, merged: the same rows under the same TIDs
+SELECT ch.optimize('m_mt') > 1 AS merged;
+SELECT count(*) < 10 AS fewer_parts FROM ch.parts('m_mt');
+SELECT same_rows();
+SELECT count(*) AS moved FROM m_mt JOIN m_tids USING (a) WHERE m_mt.ctid <> m_tids.tid;
+SELECT max(level) > 0 AS merged_level FROM ch.parts('m_mt');
+-- the index's entries find them, and a fetch by TID
+SET enable_seqscan = off;
+SET ch.enable_chscan = off;
+SELECT count(*), sum(a) FROM m_mt WHERE c = 3;
+RESET enable_seqscan;
+RESET ch.enable_chscan;
+SELECT count(*), sum(a) FROM m_heap WHERE c = 3;
+SELECT a, b FROM m_mt WHERE ctid = (SELECT tid FROM m_tids WHERE a = 4321);
+
+-- deletions and updates, then every part into one: the dead rows folded out of
+-- the inputs, their tombstones gone, the new versions merged in
+DELETE FROM m_heap WHERE a % 5 = 0;
+DELETE FROM m_mt WHERE a % 5 = 0;
+UPDATE m_heap SET b = 'u', c = c + 100 WHERE a % 11 = 0;
+UPDATE m_mt SET b = 'u', c = c + 100 WHERE a % 11 = 0;
+SELECT ch.optimize('m_mt', true) > 1 AS merged;
+SELECT count(*) AS parts, sum(rows) = (SELECT count(*) FROM m_heap) AS live_rows_only FROM ch.parts('m_mt');
+SELECT count(*) AS tombstones FROM ch.tombstones WHERE relfilenumber = pg_relation_filenode('m_mt');
+SELECT same_rows();
+SET enable_seqscan = off;
+SET ch.enable_chscan = off;
+SELECT count(*), sum(a) FROM m_mt WHERE c = 103;
+RESET enable_seqscan;
+RESET ch.enable_chscan;
+SELECT count(*), sum(a) FROM m_heap WHERE c = 103;
+-- one part, no row of it dead: nothing to merge
+SELECT ch.optimize('m_mt', true) AS merged;
+SELECT ch.optimize('m_mt') AS merged;
+
+-- deletions and updates go on over the merged part, and fold into it
+DELETE FROM m_heap WHERE a BETWEEN 100 AND 200;
+DELETE FROM m_mt WHERE a BETWEEN 100 AND 200;
+UPDATE m_heap SET b = 'v' WHERE a % 13 = 0;
+UPDATE m_mt SET b = 'v' WHERE a % 13 = 0;
+BEGIN;
+SELECT a FROM m_mt WHERE a = 7 FOR UPDATE;
+COMMIT;
+SELECT same_rows();
+SELECT ch.optimize('m_mt', true) > 1 AS merged;
+SELECT same_rows();
+SELECT count(*) AS tombstones FROM ch.tombstones WHERE relfilenumber = pg_relation_filenode('m_mt');
+-- ClickHouse's MergeTask ran on the calling thread: the process's threads as after the library loaded
+SELECT threads FROM ch.engine_info();
+
+-- a vertical merge, whose rows' sources are in a temporary file of the
+-- process's, as ClickHouse chooses one for wide parts of many rows and
+-- columns: here for any wide part, and every part wide
+CREATE TABLE m_vertical (a int, b text, c int, d float8, e text) USING mergetree
+  WITH (order_by = 'a', settings = 'min_bytes_for_wide_part = 0, vertical_merge_algorithm_min_rows_to_activate = 1, vertical_merge_algorithm_min_columns_to_activate = 1');
+INSERT INTO m_vertical SELECT g, md5(g::text), g % 9, g / 7.0, repeat('x', g % 13) FROM generate_series(1, 30000) g;
+INSERT INTO m_vertical SELECT g, md5(g::text), g % 9, g / 7.0, repeat('x', g % 13) FROM generate_series(30001, 60000) g;
+DELETE FROM m_vertical WHERE a % 3 = 0;
+SELECT ch.optimize('m_vertical', true) AS merged;
+SELECT count(*), sum(a), sum(c), sum(d)::numeric(20, 4), md5(string_agg(b || e, ',' ORDER BY a)) FROM m_vertical;
+SELECT count(*), sum(a), sum(g % 9), sum(g / 7.0)::numeric(20, 4), md5(string_agg(md5(g::text) || repeat('x', g % 13), ',' ORDER BY g))
+  FROM generate_series(1, 60000) g, LATERAL (SELECT g AS a) x WHERE g % 3 <> 0;
+SELECT count(*) AS left_behind FROM pg_ls_dir('base/pgsql_tmp') d
+  WHERE d = 'pgsql_tmpchte_' || pg_backend_pid() AND EXISTS (SELECT 1 FROM pg_ls_dir('base/pgsql_tmp/' || d) f);
+DROP TABLE m_vertical;
+
+-- the files store: the inputs' directories go with the sweep once VACUUM of
+-- ch.parts has pruned their rows, which no snapshot then sees
+CREATE TABLE m_files (a int) USING mergetree WITH (storage = 'files');
+INSERT INTO m_files SELECT generate_series(1, 100);
+INSERT INTO m_files SELECT generate_series(101, 200);
+INSERT INTO m_files SELECT generate_series(201, 300);
+SELECT ch.optimize('m_files', true) AS merged;
+SELECT count(*) AS directories FROM pg_ls_dir(:'dbdir' || '/ch_' || pg_relation_filenode('m_files')) d
+  WHERE d LIKE 'all\_%';
+VACUUM ch.parts;
+VACUUM m_files;
+SELECT count(*) AS directories FROM pg_ls_dir(:'dbdir' || '/ch_' || pg_relation_filenode('m_files')) d
+  WHERE d LIKE 'all\_%';
+SELECT count(*), sum(a) FROM m_files;
+
+-- a merge of wide parts of the files store keeps every column's data file of
+-- every part open (their marks it reads and closes) while it reads the parts
+-- a granule at a time: 12 parts of 101 columns and 5 granules are past the
+-- open files' soft limit of 1,024 a backend inherits, which the engine
+-- library raises to the hard one
+DO $$
+BEGIN
+  EXECUTE 'CREATE TABLE m_wide (k int, ' || (SELECT string_agg(format('c%s int', i), ', ') FROM generate_series(1, 100) i)
+    || ') USING mergetree WITH (order_by = ''k'', storage = ''files'', settings = ''min_bytes_for_wide_part = 0, index_granularity = 2'')';
+  FOR p IN 1..12 LOOP
+    EXECUTE format('INSERT INTO m_wide SELECT g, %s FROM generate_series(%s, %s) g',
+                   (SELECT string_agg('g', ', ') FROM generate_series(1, 100)), p * 10, p * 10 + 9);
+  END LOOP;
+END
+$$;
+SELECT ch.optimize('m_wide', true) AS merged;
+SELECT count(*), sum(k), sum(c100) FROM m_wide;
+DROP TABLE m_wide;
+
+-- the pages store: the inputs' pages free once VACUUM of ch.parts has pruned
+-- their rows, and the next parts' files take them before new pages
+CREATE TABLE m_pages (a int, b text) USING mergetree WITH (storage = 'pages', order_by = 'a');
+DO $$
+BEGIN
+  FOR i IN 0..3 LOOP
+    EXECUTE format('INSERT INTO m_pages SELECT g, repeat(md5(g::text), 4) FROM generate_series(%s, %s) g',
+                   i * 20000 + 1, i * 20000 + 20000);
+  END LOOP;
+END
+$$;
+SELECT pg_relation_size('m_pages') AS inserted \gset
+SELECT ch.optimize('m_pages', true) AS merged;
+SELECT pg_relation_size('m_pages') AS merged \gset
+VACUUM ch.parts;
+DO $$
+BEGIN
+  FOR i IN 4..7 LOOP
+    EXECUTE format('INSERT INTO m_pages SELECT g, repeat(md5(g::text), 4) FROM generate_series(%s, %s) g',
+                   i * 20000 + 1, i * 20000 + 20000);
+  END LOOP;
+END
+$$;
+SELECT pg_relation_size('m_pages') < :merged + :inserted / 2 AS pages_taken_again;
+SELECT count(*), sum(a), count(DISTINCT b) FROM m_pages;
+SELECT ch.optimize('m_pages', true) AS merged;
+SELECT count(*), sum(a), count(DISTINCT b) FROM m_pages;
+
+-- back-pressure: a part's insert waits from parts_to_delay_insert parts on,
+-- and fails at parts_to_throw_insert, as ClickHouse's inserts do
+CREATE TABLE m_bp (a int) USING mergetree
+  WITH (settings = 'parts_to_delay_insert = 3, parts_to_throw_insert = 5, max_delay_to_insert = 1');
+INSERT INTO m_bp VALUES (1);
+INSERT INTO m_bp VALUES (2);
+INSERT INTO m_bp VALUES (3);
+INSERT INTO m_bp VALUES (4);
+INSERT INTO m_bp VALUES (5);
+DO $$
+BEGIN
+  INSERT INTO m_bp VALUES (6);
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING '%', substring(SQLERRM FROM 'Too many parts \(\d+');
+END
+$$;
+SELECT ch.optimize('m_bp', true) AS merged;
+INSERT INTO m_bp VALUES (6);
+SELECT count(*), sum(a) FROM m_bp;
+
+-- UNLOGGED and temporary tables merge as the others do
+CREATE UNLOGGED TABLE m_unlogged (a int) USING mergetree;
+INSERT INTO m_unlogged VALUES (1), (2);
+INSERT INTO m_unlogged VALUES (3);
+SELECT ch.optimize('m_unlogged', true) AS merged;
+SELECT count(*) AS parts FROM ch.parts('m_unlogged');
+SELECT array_agg(a ORDER BY a) FROM m_unlogged;
+CREATE TEMP TABLE m_temp (a int) USING mergetree;
+INSERT INTO m_temp VALUES (1), (2);
+INSERT INTO m_temp VALUES (3);
+SELECT ch.optimize('m_temp', true) AS merged;
+SELECT count(*) AS parts FROM ch.parts('m_temp');
+SELECT array_agg(a ORDER BY a) FROM m_temp;
+
+-- the other engines' merges come with CH4, and their back-pressure with them:
+-- until then their inserts go on past parts_to_throw_insert
+CREATE TABLE m_replacing (k int NOT NULL, v int) USING replacingmergetree
+  WITH (order_by = 'k', settings = 'parts_to_delay_insert = 1, parts_to_throw_insert = 2');
+INSERT INTO m_replacing VALUES (1, 1);
+INSERT INTO m_replacing VALUES (1, 2);
+INSERT INTO m_replacing VALUES (2, 3);
+SELECT count(*) AS parts FROM ch.parts('m_replacing');
+SELECT ch.optimize('m_replacing');
+SELECT ch.optimize('m_heap');
+
+DROP TABLE m_heap, m_mt, m_files, m_pages, m_bp, m_unlogged, m_temp, m_replacing;
+DROP FUNCTION same_rows();

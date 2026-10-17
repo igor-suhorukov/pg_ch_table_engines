@@ -74,10 +74,12 @@ ch_index_fetch_end(struct IndexFetchTableData *data)
 static bool
 dead_to_all(Relation rel, uint64 rowid, TransactionId *xid)
 {
-	ChTable    *t = ch_table(rel);
+	ChStorageId storage;
 	ChRowState	st;
 
-	ch_row_state(&t->storage, rowid, &st);
+	/* the storage from the relation: a cached table goes at an invalidation, which the catalog's lock may accept */
+	ch_storage_id(rel, &rel->rd_locator, &storage);
+	ch_row_state(&storage, rowid, &st);
 	if (st.status != CH_ROW_MODIFIED)
 		return false;
 	if (xid)
@@ -213,7 +215,7 @@ ch_index_build_range_scan(Relation table_rel, Relation index_rel, IndexInfo *ind
 						  bool anyvisible, bool progress, BlockNumber start_blockno, BlockNumber numblocks,
 						  IndexBuildCallback callback, void *callback_state, TableScanDesc scan)
 {
-	ChTable    *t = ch_table(table_rel);
+	ChStorageId storage;
 	EState	   *estate;
 	ExprContext *econtext;
 	ExprState  *predicate;
@@ -265,7 +267,9 @@ ch_index_build_range_scan(Relation table_rel, Relation index_rel, IndexInfo *ind
 		lo_rowid = (uint64) start_blockno * CH_ROWS_PER_BLOCK;
 		hi_rowid = ((uint64) start_blockno + numblocks) * CH_ROWS_PER_BLOCK - 1;
 	}
-	tombs = ch_tombstones_all(&t->storage, 0, PG_INT64_MAX, &ntombs);
+	/* the storage from the relation: a cached table goes at an invalidation, which the scan's locks may accept */
+	ch_storage_id(table_rel, &table_rel->rd_locator, &storage);
+	tombs = ch_tombstones_all(&storage, 0, PG_INT64_MAX, &ntombs);
 
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{

@@ -28,5 +28,7 @@ fi
 ninja -C /build/tree -j "$jobs" -k "${CHTE_ENGINE_KEEP_GOING:-1}" $targets
 if [[ " $targets " == *" chte_engine "* ]]; then
     mkdir -p /build/lib
-    cp /build/tree/chte_engine/libchte_engine.so /build/lib/
+    # beside the old one, then renamed over it: a server of a running leg maps the old one
+    cp /build/tree/chte_engine/libchte_engine.so /build/lib/libchte_engine.so.new
+    mv -f /build/lib/libchte_engine.so.new /build/lib/libchte_engine.so
 fi

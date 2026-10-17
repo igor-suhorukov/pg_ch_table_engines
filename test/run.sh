@@ -28,6 +28,9 @@
 #   run.sh hits          10M ClickBench rows by COPY into heap and mergetree
 #                        in both stores, their answers compared, and six
 #                        reads timed
+#   run.sh merges        the 10M rows into mergetree in small batches, the
+#                        merge workers merging beside: parts over time, write
+#                        amplification, the answers compared
 #   run.sh all           core, spike, suite, tap
 #
 # Settings, from the environment:
@@ -35,7 +38,9 @@
 #   CHTE_CPUS    each container's CPUs: 0, as many as there are; 1 beside a
 #                timed run
 #   CHTE_TESTS   the suite's tests, all by default
-#   PG_SRC       the checkout of PostgreSQL the images take PostgreSQL's TAP
+#   CHTE_SETTINGS a setting for the suite's servers: debug_discard_caches = 1
+#                discards every cache wherever an invalidation may be taken
+#   PG_SRC      the checkout of PostgreSQL the images take PostgreSQL's TAP
 #                modules from: ~/.cache/pg_accel/postgres
 set -u -o pipefail
 
@@ -93,6 +98,10 @@ case "${1:-}" in
 		[ -f "$HOME/.cache/pg_accel/clickbench/hits_10m.tsv" ] ||
 			die "no hits_10m.tsv: pg_accel's test/clickbench/run.sh fetch, then its subsets"
 		CHTE_DATA="$HOME/.cache/pg_accel/clickbench" leg hits /src/test/hits.sh ;;
+	merges)
+		[ -f "$HOME/.cache/pg_accel/clickbench/hits_10m.tsv" ] ||
+			die "no hits_10m.tsv: pg_accel's test/clickbench/run.sh fetch, then its subsets"
+		CHTE_DATA="$HOME/.cache/pg_accel/clickbench" leg merges /src/test/merges.sh ;;
 	all)
 		"$0" core && "$0" spike && "$0" suite && "$0" tap ;;
 	*)

@@ -19,6 +19,7 @@ for my $case (['files', 'minimal'], ['files', 'replica'], ['pages', 'minimal'], 
 	$node->init(allows_streaming => $wal eq 'replica' ? 1 : 0);
 	$node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = 'ch_table_engines'
+ch.max_merge_workers = 0
 fsync = on
 });
 	$node->start;

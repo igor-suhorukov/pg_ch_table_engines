@@ -474,6 +474,7 @@ chscan_begin(CustomScanState *node, EState *estate, int eflags)
 	int			i = -1;
 	bool		whole_row = false;
 	TupleDesc	desc;
+	ChTable    *t;
 
 	s->rel = node->ss.ss_currentRelation;
 	desc = RelationGetDescr(s->rel);
@@ -504,7 +505,11 @@ chscan_begin(CustomScanState *node, EState *estate, int eflags)
 	/* a cursor's (above) */
 	if (cscan->custom_private != NIL && linitial_int(cscan->custom_private))
 		s->need_tid = true;
-	s->pruning = ch_filter_quals(ch_table(s->rel), cscan->scan.plan.qual);
+	/* pinned: the quals' translation looks operators up, which may accept an invalidation of the table */
+	t = ch_table(s->rel);
+	ch_table_pin(t);
+	s->pruning = ch_filter_quals(t, cscan->scan.plan.qual);
+	ch_table_unpin(t);
 }
 
 /* The table's scan, at the first row asked for: a share of a parallel one where the DSM holds one */

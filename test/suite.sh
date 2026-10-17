@@ -10,6 +10,9 @@
 #   CHTE_WORK    the run's directory: results/, the servers' logs
 #   CHTE_PRELOAD the preloaded servers' shared_preload_libraries:
 #                ch_table_engines; pg_accel's chte leg adds vexec
+#   CHTE_SETTINGS a setting for every server of the suite, such as
+#                debug_discard_caches = 1: every cache discarded wherever an
+#                invalidation may be taken, on a server with assertions
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
@@ -21,11 +24,12 @@ PG_REGRESS="$(dirname "$("$BINDIR/pg_config" --pgxs)")/../test/regress/pg_regres
 status=0
 
 run_suite() {
-	local name="$1" preload="$2"; shift 2
+	local name="$1" preload="$2" setting="$3"; shift 3
 	local dir="/tmp/srv-$name" out="$WORK/$name"
 	rm -rf "$dir" "$out"
 	mkdir -p "$out"
-	server_init "$dir" ${preload:+"shared_preload_libraries = '$preload'"} ${CHTE_EXTRA_SETTING:+"$CHTE_EXTRA_SETTING"} || return 1
+	server_init "$dir" ${preload:+"shared_preload_libraries = '$preload'"} ${setting:+"$setting"} \
+		${CHTE_SETTINGS:+"$CHTE_SETTINGS"} || return 1
 	server_start "$dir" || { cat "$dir/log"; return 1; }
 	"$PG_REGRESS" --inputdir="$BUILD" --outputdir="$out" --bindir="$BINDIR" \
 		--host="$dir/sock" --port=5432 --user=postgres --dbname=chte_regression \
@@ -44,15 +48,15 @@ run_suite() {
 
 tests=${CHTE_TESTS:-$(sed -n 's/^test: //p' "$BUILD/test/schedule" | tr '\n' ' ')}
 echo "== suite, preloaded: $tests"
-run_suite preloaded "${CHTE_PRELOAD:-ch_table_engines}" $tests || status=1
+run_suite preloaded "${CHTE_PRELOAD:-ch_table_engines}" "" $tests || status=1
 nopreload=$(sed -n 's/^nopreload: //p' "$BUILD/test/schedule" | tr '\n' ' ')
 if [ -z "${CHTE_TESTS:-}" ] && [ -n "$nopreload" ]; then
 	echo "== suite, not preloaded: $nopreload"
-	run_suite lazy "" $nopreload || status=1
+	run_suite lazy "" "" $nopreload || status=1
 fi
 files=$(sed -n 's/^files: //p' "$BUILD/test/schedule" | tr '\n' ' ')
 if [ -z "${CHTE_TESTS:-}" ] && [ -n "$files" ]; then
 	echo "== suite, the files store by default: $files"
-	CHTE_EXTRA_SETTING="ch.default_storage = 'files'" run_suite files "${CHTE_PRELOAD:-ch_table_engines}" $files || status=1
+	run_suite files "${CHTE_PRELOAD:-ch_table_engines}" "ch.default_storage = 'files'" $files || status=1
 fi
 exit $status

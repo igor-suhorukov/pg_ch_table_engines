@@ -10,7 +10,8 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('concurrency');
 $node->init;
-$node->append_conf('postgresql.conf', qq{shared_preload_libraries = 'ch_table_engines'});
+$node->append_conf('postgresql.conf', qq{shared_preload_libraries = 'ch_table_engines'
+ch.max_merge_workers = 0});
 $node->start;
 $node->safe_psql('postgres', q{
 	CREATE EXTENSION ch_table_engines;

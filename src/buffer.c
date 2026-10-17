@@ -76,6 +76,43 @@ drop_buffer(ChBuffer *b)
 	pfree(b);
 }
 
+/*
+ * Back-pressure (§2.7 rule 5): with merges behind, a part's insert waits, as
+ * ClickHouse's inserts wait from parts_to_delay_insert active parts on, and
+ * fails at parts_to_throw_insert (the shim's chte_insert_delay, the table's
+ * settings).  Not for a temporary table, which no merge worker reaches, nor
+ * for the engines whose merges come in CH4: nothing would ever merge them.
+ * The parts are counted as they stand now (SnapshotSelf), not as the
+ * transaction's snapshot sees them: an MVCC snapshot's scan of ch.parts would
+ * take predicate locks and conflicts out, and so serialization failures,
+ * that no read of the table's rows asked for.
+ */
+static void
+wait_for_merges(Relation rel, ChBuffer *b)
+{
+	const ChEngine *eng = ch_engine();
+	List	   *parts;
+	ListCell   *lc;
+	uint64		bytes = 0;
+	uint64		delay;
+
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP || b->table->kind != CH_ENGINE_MERGETREE)
+		return;
+	parts = ch_parts_visible(&b->storage, SnapshotSelf);
+	foreach(lc, parts)
+		bytes += (uint64) Max(((ChPart *) lfirst(lc))->bytes, 0);
+	CH_CALL("inserting a part", eng->insert_delay(b->table->handle, list_length(parts), bytes, &delay, CH_ERR));
+	list_free_deep(parts);
+	while (delay > 0)
+	{
+		uint64		step = Min(delay, 100);
+
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep((long) step * 1000L);
+		delay -= step;
+	}
+}
+
 /* The buffered rows become parts; the buffer stays, empty */
 static void
 flush(ChBuffer *b)
@@ -96,6 +133,7 @@ flush(ChBuffer *b)
 	eng = ch_engine();
 	rel = relation_open(b->relid, NoLock);
 	table = b->table;
+	wait_for_merges(rel, b);
 	ch_counters_allocate(&b->storage, 0, 1, &ignored, &block);
 
 	owner = ch_handle_reserve();
@@ -113,13 +151,6 @@ flush(ChBuffer *b)
 
 			CH_CALL("writing a part", eng->write_part(writer, i, &info, CH_ERR));
 			tmp_dir = psprintf("tmp_insert_%s", info.name);
-			part.manifest = NULL;
-			if (table->options.storage == CH_STORAGE_PAGES)
-				/* the pages store copies the part into pages; its directory goes with the writer */
-				part.manifest = ch_pages_store_part(rel, table, tmp_dir);
-			else
-				/* the files store logs the part's files before they get the part's name */
-				ch_store_part_written(rel, &b->storage, tmp_dir, info.name);
 			part.name = info.name;
 			part.rows = info.rows;
 			part.bytes = info.bytes_on_disk;
@@ -127,9 +158,20 @@ flush(ChBuffer *b)
 			part.max_rowid = ch_builder_rowid(b->builder, nrows - 1);
 			part.level = info.level;
 			part.marks = (int32) info.marks;
-			ch_part_insert(&b->storage, &part, b->cid);
-			if (part.manifest)
+			part.manifest = NULL;
+			part.created = 0;
+			if (table->options.storage == CH_STORAGE_PAGES)
+			{
+				/* the pages store copies the part into pages, and inserts its row; its directory goes with the writer */
+				ch_pages_store_part(rel, table, tmp_dir, &part, b->cid);
 				ch_pages_attach(table, &part);
+			}
+			else
+			{
+				/* the files store logs the part's files before they get the part's name */
+				ch_store_part_written(rel, &b->storage, tmp_dir, info.name);
+				ch_part_insert(&b->storage, &part, b->cid);
+			}
 		}
 		/* a part of the pages store is in pages now: its directory goes, uncommitted */
 		if (table->options.storage != CH_STORAGE_PAGES)

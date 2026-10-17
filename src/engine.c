@@ -16,6 +16,8 @@
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
+#include "common/file_utils.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -117,11 +119,19 @@ engine_on_exit(int code, Datum arg)
 					 errmsg("engine library \"%s\" has no symbol %s", path, symbol))); \
 	} while (0)
 
+/* The process's temporary directory, as it exits */
+static void
+remove_tmp_dir(int code, Datum arg)
+{
+	(void) rmtree(DatumGetPointer(arg), true);
+}
+
 const ChEngine *
 ch_engine(void)
 {
 	char		path[MAXPGPATH];
 	char		work[MAXPGPATH];
+	static char tmp[MAXPGPATH];
 	void	   *handle;
 	chte_init_options options;
 	chte_error	err;
@@ -161,6 +171,8 @@ ch_engine(void)
 	LOAD(read_end, "chte_read_end");
 	LOAD(read_present, "chte_read_present");
 	LOAD(merge, "chte_merge");
+	LOAD(merge_select, "chte_merge_select");
+	LOAD(insert_delay, "chte_insert_delay");
 	LOAD(drop_part, "chte_drop_part");
 	LOAD(pages_attach, "chte_pages_attach");
 	LOAD(pages_detach, "chte_pages_detach");
@@ -181,6 +193,20 @@ ch_engine(void)
 	options.data_path = path;
 	snprintf(work, sizeof(work), "%s/pg_chte/", DataDir);
 	options.work_path = work;
+	/*
+	 * The process's own temporary directory, removed as it exits; one a crash
+	 * leaves goes at the next start, its name PostgreSQL's temporary files'
+	 * (fd.c, RemovePgTempFiles()).
+	 */
+	snprintf(tmp, sizeof(tmp), "%s/base/%s", DataDir, PG_TEMP_FILES_DIR);
+	(void) MakePGDirectory(tmp);
+	snprintf(tmp, sizeof(tmp), "%s/base/%s/%schte_%d/", DataDir, PG_TEMP_FILES_DIR, PG_TEMP_FILE_PREFIX, MyProcPid);
+	if (MakePGDirectory(tmp) < 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create directory \"%s\": %m", tmp)));
+	on_proc_exit(remove_tmp_dir, PointerGetDatum(tmp));
+	options.tmp_path = tmp;
 	options.log_level = ch_engine_log_level;
 	options.settings = ch_engine_settings;
 	options.callbacks.interrupted = engine_interrupted;

@@ -825,8 +825,9 @@ typedef struct SinkState
 static bool
 sink_supports(Relation rel, AttrNumber attnum, VexecSinkLayout *layout)
 {
-	ChTable    *t = ch_table(rel);
-	const ChColumn *col = &t->columns[attnum - 1];
+	/* a copy: the syscache's lookup may accept an invalidation, at which the cached table goes */
+	ChColumn	column = ch_table(rel)->columns[attnum - 1];
+	const ChColumn *col = &column;
 	Oid			basetype = getBaseType(col->typid);
 
 	memset(layout, 0, sizeof(VexecSinkLayout));

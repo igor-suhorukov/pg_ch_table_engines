@@ -59,6 +59,18 @@ unguard_row(Relation rel, ItemPointer tid)
 	UnlockPage(rel, ItemPointerGetBlockNumber(tid), ExclusiveLock);
 }
 
+/*
+ * The relation's storage, which its tombstones are keyed by, from the
+ * relation itself: a table of the library's cache (table.c) goes at an
+ * invalidation of it, which a lock taken below -- a catalog's, a page's --
+ * may accept.
+ */
+static void
+row_storage(Relation rel, ChStorageId *id)
+{
+	ch_storage_id(rel, &rel->rd_locator, id);
+}
+
 static void
 set_tid(ItemPointer tid, uint64 rowid)
 {
@@ -148,7 +160,7 @@ static TM_Result
 modify_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot crosscheck, bool wait,
 		   TM_FailureData *tmfd, char kind, uint64 successor)
 {
-	ChTable    *t = ch_table(rel);
+	ChStorageId storage;
 	uint64		rowid = CH_TID_TO_ROWID(tid);
 	ChRowState	st;
 	TM_Result	result;
@@ -161,10 +173,11 @@ modify_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot crosscheck, bo
 				 errmsg("cannot %s tuples during a parallel operation",
 						kind == CH_TOMB_UPDATED ? "update" : "delete")));
 
+	row_storage(rel, &storage);
 	for (;;)
 	{
 		guard_row(rel, tid);
-		ch_row_state(&t->storage, rowid, &st);
+		ch_row_state(&storage, rowid, &st);
 		if (st.status == CH_ROW_BEING_MODIFIED && wait)
 		{
 			/* our place among the row's waiters, held until done (heap_acquire_tuplock()) */
@@ -218,7 +231,7 @@ modify_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot crosscheck, bo
 	{
 		/* SERIALIZABLE: a write of the relation, at the relation's grain (§2.6) */
 		CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
-		ch_tombstone_insert(&t->storage, rowid, kind, successor, cid);
+		ch_tombstone_insert(&storage, rowid, kind, successor, cid);
 	}
 	else
 		fill_failure(tmfd, &st, tid);
@@ -279,12 +292,13 @@ TM_Result
 ch_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot, CommandId cid,
 			  LockTupleMode mode, LockWaitPolicy wait_policy, uint8 flags, TM_FailureData *tmfd)
 {
-	ChTable    *t = ch_table(rel);
+	ChStorageId storage;
 	ChRowState	st;
 	bool		own_version = false;	/* the row a version the running transaction wrote */
 	CommandId	own_cid = InvalidCommandId; /* by that command */
 
 	tmfd->traversed = false;
+	row_storage(rel, &storage);
 	for (;;)
 	{
 		uint64		rowid = CH_TID_TO_ROWID(tid);
@@ -294,7 +308,7 @@ ch_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *
 		for (;;)
 		{
 			guard_row(rel, tid);
-			ch_row_state(&t->storage, rowid, &st);
+			ch_row_state(&storage, rowid, &st);
 			if (st.status == CH_ROW_BEING_MODIFIED)
 			{
 				unguard_row(rel, tid);
@@ -316,7 +330,7 @@ ch_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *
 		/* a version this transaction's command at or after cid wrote is not the caller's to lock */
 		lock = st.status == CH_ROW_LIVE && !(own_version && own_cid >= cid);
 		if (lock && !st.locked_by_us)
-			ch_tombstone_insert(&t->storage, rowid, CH_TOMB_LOCKED, 0, cid);
+			ch_tombstone_insert(&storage, rowid, CH_TOMB_LOCKED, 0, cid);
 		unguard_row(rel, tid);
 		if (have_tuple_lock)
 			UnlockTuple(rel, tid, CH_TUPLE_LOCK);
@@ -374,14 +388,15 @@ void
 ch_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
 {
 	Relation	rel = scan->rs_rd;
-	ChTable    *t = ch_table(rel);
+	ChStorageId storage;
 	Snapshot	snapshot = scan->rs_snapshot;
 
+	row_storage(rel, &storage);
 	for (;;)
 	{
 		uint64		successor;
 
-		if (!ch_tombstone_visible(&t->storage, snapshot, CH_TID_TO_ROWID(tid), &successor) || successor == 0)
+		if (!ch_tombstone_visible(&storage, snapshot, CH_TID_TO_ROWID(tid), &successor) || successor == 0)
 			return;
 		set_tid(tid, successor);
 	}

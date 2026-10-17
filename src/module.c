@@ -97,7 +97,7 @@ void
 _PG_init(void)
 {
 	ch_preloaded = process_shared_preload_libraries_in_progress;
-	if (getenv("CHTE_BACKTRACE_ON_CRASH") != NULL)
+	if (getenv("CHTE_BACKTRACE_ON_CRASH") != NULL && getenv("CHTE_BACKTRACE_ON_CRASH")[0] != '\0')
 	{
 		void	   *frame[1];
 
@@ -148,6 +148,20 @@ _PG_init(void)
 							   "",
 							   PGC_SUSET, 0,
 							   NULL, NULL, NULL);
+	DefineCustomIntVariable("ch.max_merge_workers",
+							"Merge workers at most, one for a database, beside their launcher.",
+							"0 at the server's start: no launcher, which a reload does not start.",
+							&ch_max_merge_workers,
+							2, 0, 64,
+							PGC_SIGHUP, 0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("ch.merge_naptime",
+							"How long a merge worker sleeps between its passes over its database's tables.",
+							NULL,
+							&ch_merge_naptime,
+							10, 1, 3600,
+							PGC_SIGHUP, GUC_UNIT_S,
+							NULL, NULL, NULL);
 	DefineCustomBoolVariable("ch.enable_chscan",
 							 "Whether the planner offers ChScan: a scan that reads only the columns it needs, "
 							 "and only the granules its quals keep.",
@@ -171,6 +185,8 @@ _PG_init(void)
 	if (ch_preloaded)
 	{
 		ch_store_register_rmgr();
+		/* the merge workers' launcher (worker.c), never on a standby */
+		ch_merge_launcher_register();
 		/* without vexec, unused entries of its registries */
 		ch_vexec_register();
 	}

@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-#define CHTE_ABI_VERSION 3
+#define CHTE_ABI_VERSION 4
 
 /* The library is built -fvisibility=hidden; these are the only symbols it exports. */
 #if defined(__GNUC__)
@@ -57,6 +57,8 @@ typedef struct chte_init_options
 	uint32_t	abi_version;	/* CHTE_ABI_VERSION */
 	const char *data_path;		/* root of the parts' directories, ends with '/' */
 	const char *work_path;		/* ClickHouse's own directory, ends with '/'; NULL: data_path */
+	const char *tmp_path;		/* the process's own directory of temporary files -- a vertical
+								 * merge's rows' sources -- which it clears; ends with '/' */
 	const char *log_level;		/* "error", "warning", "information", "debug", "trace" */
 	const char *settings;		/* ClickHouse settings "name = value, ...", or NULL */
 	chte_callbacks callbacks;
@@ -278,17 +280,50 @@ CHTE_API int			chte_read_rows(chte_table *table, const char *part_name, const ch
 /*
  * A part written again without the rows whose _pg_rowid are dead[0 .. n),
  * ascending -- deletions every snapshot sees, folded into it -- as a new part
- * numbered block_number, through the writer an insert uses: *nparts is how
- * many parts it made (none where every row was dead), which chte_write_part
- * describes, chte_write_commit names and chte_write_close removes uncommitted.
+ * named as a mutation of it, block_number its version (all_<min>_<max>_<level>_<block_number>),
+ * through the writer an insert uses: *nparts is how many parts it made (none
+ * where every row was dead), which chte_write_part describes, chte_write_commit
+ * names and chte_write_close removes uncommitted.
  */
 CHTE_API int			chte_rewrite_part(chte_table *table, const char *part_name, const uint64_t *dead,
 							  size_t n, uint64_t block_number, chte_writer **writer, size_t *nparts,
 							  chte_error *error);
 
-/* Merges parts with the table's merging mode into one part, committed under its final name. */
+/*
+ * Merges parts, as ClickHouse's MergeTask merges them with the table's merging mode, into one
+ * part under a temporary name, as a writer that chte_write_finish has finished:
+ * chte_write_part describes it, chte_write_commit gives it its final name, chte_write_close
+ * removes it uncommitted.  The part is named for the inputs' blocks and level as ClickHouse
+ * names a merged part, version (a block number of the table's) its mutation version, so that
+ * no other part ever has its name.
+ */
 CHTE_API int			chte_merge(chte_table *table, const char *const *part_names, size_t nparts,
-					   chte_part_info *result, chte_error *error);
+					   uint64_t version, chte_writer **writer, chte_error *error);
+
+/* A part the merge selector may choose, as the caller lists them: in block order. */
+typedef struct chte_merge_candidate
+{
+	const char *name;
+	uint64_t	bytes;
+	uint64_t	rows;
+	uint64_t	age_seconds;
+} chte_merge_candidate;
+
+/*
+ * The parts to merge next, as ClickHouse's merge selector chooses them for the table's
+ * settings: parts[*first] and the *count - 1 after it, *count 0 where none should merge yet.
+ * aggressive asks for a merge of whatever may merge, as OPTIMIZE does.
+ */
+CHTE_API int			chte_merge_select(chte_table *table, const chte_merge_candidate *parts, size_t n,
+							  int aggressive, size_t *first, size_t *count, chte_error *error);
+
+/*
+ * How long an insert of a part waits, with the table holding parts of bytes in all: none
+ * below parts_to_delay_insert, up to max_delay_to_insert seconds; an error (TOO_MANY_PARTS)
+ * at parts_to_throw_insert, as MergeTreeData::delayInsertOrThrowIfNeeded() decides.
+ */
+CHTE_API int			chte_insert_delay(chte_table *table, size_t parts, uint64_t bytes, uint64_t *delay_ms,
+							  chte_error *error);
 
 /* The files of a part in pages, before it is read or merged; again replaces them. */
 CHTE_API int			chte_pages_attach(chte_table *table, const char *part_name, const chte_page_file *files,

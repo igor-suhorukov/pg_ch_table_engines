@@ -40,6 +40,19 @@ typedef struct ChTableEntry
 static HTAB *tables = NULL;
 
 /*
+ * The relation a table is being built for (open_table()), whose catalog reads
+ * may take invalidations: the build is outside the cache's entry, which an
+ * invalidation may take away meanwhile, and its memory -- the current context
+ * -- is left alone.  One of the relation itself marks the build to be done
+ * again.  A reset of every cache does not: it names no change of the
+ * relation, whose definition the caller's lock holds, and with
+ * debug_discard_caches every catalog read is one, so that the build would
+ * never end (relcache.c's RelationBuildDesc() leaves those out likewise).
+ */
+static Oid	building_relid = InvalidOid;
+static bool building_invalidated = false;
+
+/*
  * Tables an invalidation took out of the cache while a scan or a write buffer
  * still had them pinned: freed as the last pin goes, or at the transaction's
  * end, which no scan or buffer outlives.
@@ -136,6 +149,8 @@ relcache_callback(Datum arg, Oid relid)
 	HASH_SEQ_STATUS status;
 	ChTableEntry *entry;
 
+	if (OidIsValid(building_relid) && relid == building_relid)
+		building_invalidated = true;
 	if (tables == NULL)
 		return;
 	if (OidIsValid(relid))
@@ -536,21 +551,40 @@ ch_table_for_storage(Relation rel, const ChStorageId *id)
 		entry_release(entry);
 	if (!found || entry->table == NULL)
 	{
+		ChTable    *t = NULL;
+		MemoryContext cxt;
+
 		entry->table = NULL;
-		entry->cxt = AllocSetContextCreate(CacheMemoryContext, "ch table", ALLOCSET_SMALL_SIZES);
-		PG_TRY();
+		entry->cxt = NULL;
+		/* built outside the entry, which an invalidation may take away meanwhile; again if one came */
+		Assert(!OidIsValid(building_relid));
+		do
 		{
-			entry->table = open_table(rel, id, RelationGetDescr(rel), entry->cxt);
-			entry->table->own_cxt = entry->cxt;
-		}
-		PG_CATCH();
-		{
-			MemoryContextDelete(entry->cxt);
-			entry->cxt = NULL;
-			hash_search(tables, &relid, HASH_REMOVE, NULL);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
+			cxt = AllocSetContextCreate(CacheMemoryContext, "ch table", ALLOCSET_SMALL_SIZES);
+			building_relid = relid;
+			building_invalidated = false;
+			PG_TRY();
+			{
+				t = open_table(rel, id, RelationGetDescr(rel), cxt);
+				t->own_cxt = cxt;
+			}
+			PG_CATCH();
+			{
+				building_relid = InvalidOid;
+				MemoryContextDelete(cxt);
+				hash_search(tables, &relid, HASH_REMOVE, NULL);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			building_relid = InvalidOid;
+			if (building_invalidated)
+				table_free(t);
+		} while (building_invalidated);
+		entry = hash_search(tables, &relid, HASH_ENTER, &found);
+		if (found && entry->table)
+			entry_release(entry);
+		entry->table = t;
+		entry->cxt = cxt;
 	}
 	return entry->table;
 }

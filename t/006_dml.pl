@@ -11,7 +11,8 @@ use Test::More;
 
 my $primary = PostgreSQL::Test::Cluster->new('dml_primary');
 $primary->init(allows_streaming => 1);
-$primary->append_conf('postgresql.conf', qq{shared_preload_libraries = 'ch_table_engines'});
+$primary->append_conf('postgresql.conf', qq{shared_preload_libraries = 'ch_table_engines'
+ch.max_merge_workers = 0});
 $primary->start;
 $primary->safe_psql('postgres', 'CREATE EXTENSION ch_table_engines');
 $primary->backup('base');
@@ -58,9 +59,11 @@ for my $q (sort keys %answer)
 }
 is($standby->safe_psql('postgres', q{SELECT count(*) FROM ch.tombstones}), '0', 'the folded tombstones are gone on the standby');
 
-# the files store's old part version, which no snapshot sees: VACUUM's sweep removes it on both servers
+# the files store's old part version, which no snapshot sees: once VACUUM of
+# ch.parts has pruned its row, VACUUM's sweep removes it on both servers
 my $db = $primary->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
 my $node = $primary->safe_psql('postgres', q{SELECT relfilenode FROM pg_class WHERE relname = 'd_files'});
+$primary->safe_psql('postgres', q{VACUUM ch.parts});
 $primary->safe_psql('postgres', q{VACUUM d_files});
 $primary->wait_for_catchup($standby);
 for my $server ($primary, $standby)

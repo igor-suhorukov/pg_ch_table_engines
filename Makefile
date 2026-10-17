@@ -14,6 +14,7 @@ OBJS = \
 	src/filter.o \
 	src/functions.o \
 	src/index.o \
+	src/merge.o \
 	src/module.o \
 	src/options.o \
 	src/pages.o \
@@ -23,7 +24,8 @@ OBJS = \
 	src/tombstones.o \
 	src/types.o \
 	src/vacuum.o \
-	src/vexec.o
+	src/vexec.o \
+	src/worker.o
 
 EXTENSION = ch_table_engines
 DATA = sql/ch_table_engines--0.1.sql

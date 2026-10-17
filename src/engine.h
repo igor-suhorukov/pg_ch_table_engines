@@ -33,7 +33,10 @@ typedef struct ChEngine
 	int			(*read_vector) (chte_reader *, uint32_t, chte_vector *, chte_error *);
 	void		(*read_end) (chte_reader *);
 	int			(*read_present) (chte_reader *, uint32_t);
-	int			(*merge) (chte_table *, const char *const *, size_t, chte_part_info *, chte_error *);
+	int			(*merge) (chte_table *, const char *const *, size_t, uint64_t, chte_writer **, chte_error *);
+	int			(*merge_select) (chte_table *, const chte_merge_candidate *, size_t, int, size_t *, size_t *,
+								 chte_error *);
+	int			(*insert_delay) (chte_table *, size_t, uint64_t, uint64_t *, chte_error *);
 	int			(*drop_part) (chte_table *, const char *, chte_error *);
 	int			(*pages_attach) (chte_table *, const char *, const chte_page_file *, size_t, chte_error *);
 	void		(*pages_detach) (chte_table *, const char *);
