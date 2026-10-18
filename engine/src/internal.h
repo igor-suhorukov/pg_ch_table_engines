@@ -263,6 +263,17 @@ struct chte_reader
     size_t wanted_pos = 0;
     bool by_offset = false;
 
+    /// chte_read_keep_dictionaries: the columns left LowCardinality, and per column the last
+    /// dictionary handed and its id, held so that no other dictionary is made at its address
+    /// while the reader compares with it
+    std::vector<uint8_t> keep_dictionary;
+    struct Dictionary
+    {
+        DB::ColumnPtr column;
+        uint64_t id = 0;
+    };
+    std::vector<Dictionary> dictionaries;
+
     /// The next block of the runs, the next run's source opened when one is done: false at the end
     bool pull(DB::Block & block);
 };

@@ -56,6 +56,8 @@ typedef struct ChOptions
 	char	   *is_deleted;
 	char	   *sign;
 	char	   *sum_columns;
+	/* columns kept as ClickHouse's LowCardinality: a dictionary a part's granules share */
+	char	   *low_cardinality;
 } ChOptions;
 
 /*
@@ -128,11 +130,13 @@ typedef struct ChColumn
 	int			width;			/* bytes of a value in the library's column */
 	int			precision;		/* CH_COL_NUMERIC */
 	int			scale;
-	char		chtype[64];		/* ClickHouse's type, without Nullable */
+	bool		low_cardinality;	/* LowCardinality(chtype), option low_cardinality */
+	char		chtype[64];		/* ClickHouse's type, without Nullable and LowCardinality */
 } ChColumn;
 
 extern void ch_column_for_attribute(Form_pg_attribute att, ChColumn *col);
 extern void ch_column_for_table(Relation rel, const ChOptions *opts, Form_pg_attribute att, ChColumn *col);
+extern void ch_low_cardinality_check(Relation rel, const char *list);
 
 /* table.c: a relation's table in the engine library */
 typedef struct ChTable
@@ -219,6 +223,9 @@ extern chte_vector *ch_builder_vectors(ChVectorBuilder *b);
 extern uint64 ch_builder_rowid(ChVectorBuilder *b, uint32 row);
 extern bool ch_builder_fetch(ChVectorBuilder *b, uint32 row, TupleTableSlot *slot);
 extern void ch_builder_reset(ChVectorBuilder *b);
+extern uint64 ch_dictionary_index(const chte_dictionary *d, uint32 row);
+extern void ch_dictionary_to_datum(const ChColumn *col, const chte_dictionary *d, uint32 row,
+								   Datum *value, bool *isnull);
 extern void ch_vector_to_datum(const ChColumn *col, const chte_vector *v, uint32 row,
 							   Datum *value, bool *isnull, char **arena);
 struct VexecColumn;

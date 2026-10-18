@@ -54,6 +54,9 @@ typedef struct ChEngine
 							  chte_error *);
 	int			(*rewrite_part) (chte_table *, const char *, const uint64_t *, size_t, uint64_t, chte_writer **,
 								 size_t *, chte_error *);
+	/* optional (VC5): NULL where the library lacks them */
+	int			(*read_keep_dictionaries) (chte_reader *, const uint8_t *, size_t, chte_error *);
+	int			(*read_dictionary) (chte_reader *, uint32_t, chte_dictionary *, chte_error *);
 } ChEngine;
 
 /* GUCs */

@@ -27,6 +27,8 @@
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
 
+#include <atomic>
+
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
@@ -388,8 +390,14 @@ extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error
             if (block.rows() == 0)
                 continue;
             Columns columns;
-            for (const auto & column : block)
-                columns.push_back(column.column->convertToFullIfWrapped()->convertToFullColumnIfLowCardinality());
+            for (size_t c = 0; c < block.columns(); ++c)
+            {
+                ColumnPtr column = block.getByPosition(c).column->convertToFullIfWrapped();
+                /// a column chte_read_keep_dictionaries keeps stays LowCardinality, for chte_read_dictionary
+                if (c >= reader->keep_dictionary.size() || !reader->keep_dictionary[c])
+                    column = column->convertToFullColumnIfLowCardinality();
+                columns.push_back(std::move(column));
+            }
             size_t rows = block.rows();
             if (reader->by_offset)
             {
@@ -429,6 +437,53 @@ extern "C" int chte_read_vector(chte_reader * reader, uint32_t i, chte_vector * 
         if (i >= reader->columns.size())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "no column {}", i);
         *vector = vectorOf(*reader->columns[i]);
+    });
+}
+
+extern "C" int chte_read_keep_dictionaries(chte_reader * reader, const uint8_t * keep, size_t ncolumns, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        reader->keep_dictionary.assign(keep, keep + ncolumns);
+        reader->dictionaries.assign(ncolumns, {});
+    });
+}
+
+namespace
+{
+
+/// Dictionaries' ids, never given twice in a process
+std::atomic<uint64_t> last_dictionary_id{0};
+
+}
+
+extern "C" int chte_read_dictionary(chte_reader * reader, uint32_t i, chte_dictionary * dictionary, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (i >= reader->columns.size())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "no column {}", i);
+        *dictionary = {};
+        const auto * low_cardinality = typeid_cast<const ColumnLowCardinality *>(reader->columns[i].get());
+        if (!low_cardinality)
+            return;
+        if (i >= reader->dictionaries.size())
+            reader->dictionaries.resize(i + 1);
+        auto & seen = reader->dictionaries[i];
+        if (seen.column.get() != low_cardinality->getDictionaryPtr().get())
+        {
+            seen.column = low_cardinality->getDictionaryPtr();
+            seen.id = ++last_dictionary_id;
+        }
+        const auto & unique = low_cardinality->getDictionary();
+        dictionary->encoded = 1;
+        dictionary->values = vectorOf(*unique.getNestedNotNullableColumn());
+        dictionary->nvalues = unique.size();
+        dictionary->indexes = low_cardinality->getIndexes().getRawData().data();
+        dictionary->index_width = static_cast<uint32_t>(low_cardinality->getSizeOfIndexType());
+        dictionary->has_null = unique.nestedColumnIsNullable() ? 1 : 0;
+        dictionary->null_index = dictionary->has_null ? unique.getNullValueIndex() : 0;
+        dictionary->id = seen.id;
     });
 }
 

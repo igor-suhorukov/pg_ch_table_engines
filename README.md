@@ -30,8 +30,13 @@ CREATE TABLE hits (...) USING mergetree
 Options: `storage` (`pages`, the relation's own main fork through the buffer
 manager, or `files`, ClickHouse's directories of parts), `order_by`,
 `primary_key`, `index_granularity`, `compression` (`lz4`, `lz4hc[(N)]`,
-`zstd[(N)]`, `none`), `settings` (further MergeTree settings), and the engines'
-own: `ver`, `is_deleted`, `sign`, `sum_columns`.  `ch.parts(rel)`,
+`zstd[(N)]`, `none`), `low_cardinality` (columns of variable-length types kept
+as ClickHouse's `LowCardinality`: a dictionary of their values that a part's
+granules share, for columns of few distinct values), `settings` (further
+MergeTree settings), and the engines' own: `ver`, `is_deleted`, `sign`,
+`sum_columns`.  The options that shape the table's parts -- its store, keys,
+granularity, `low_cardinality` and the engines' own -- change only while it
+is empty.  `ch.parts(rel)`,
 `ch.definition(rel)`, `ch.table_size(rel)`, `ch.engine_info()`,
 `ch.fold(rel)`, `ch.optimize(rel, final)` and `ch.remove_orphans(rel)` describe
 and keep the tables.
@@ -74,7 +79,9 @@ out are not read; `EXPLAIN` shows its columns and the quals it prunes by,
 [vexec](https://github.com/igor-suhorukov/pg_accel) preloaded, the tables have
 a batch source -- vexec's scans read ClickHouse's columns as they lie, prune
 as ChScan does, answer `count(*)` and the integers' `min` and `max` from the
-parts' statistics, and pass parts a sort's bound rules out over -- and a
+parts' statistics, pass parts a sort's bound rules out over, and hand a
+`low_cardinality` column as its dictionary, which vexec evaluates its filters
+and expressions over once and groups by (`vexec.batch_dictionary`) -- and a
 batch sink, through which vexec's INSERT writes columns into a table.
 
 ## Building and testing

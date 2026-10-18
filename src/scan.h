@@ -25,6 +25,8 @@ typedef struct ChScanBatch
 	const int  *attnos;			/* per column: the attribute's index, -1 the row id */
 	const chte_vector *vectors;
 	const bool *missing;		/* per column: the part has none, its rows the missing value */
+	const chte_dictionary *dicts;	/* per column, where ch_scan_set_dictionaries() asked:
+									 * encoded, its dictionary in place of its vector; or NULL */
 	chte_reader *reader;		/* NULL for a scan of no column */
 	const uint64 *visible;		/* NULL: every row; else nrows bits, 1 = not deleted */
 	uint32		nvisible;		/* the rows not deleted */
@@ -59,6 +61,7 @@ extern void ch_scan_set_columns(TableScanDesc scan, int n, const AttrNumber *att
 /* Before the first batch: quals to prune by (filter.c); false when none could be */
 extern bool ch_scan_set_filter(TableScanDesc scan, List *quals);
 
+extern bool ch_scan_set_dictionaries(TableScanDesc scan, const bool *keep);
 extern bool ch_scan_next_batch(TableScanDesc scan, ChScanBatch *batch);
 
 /*

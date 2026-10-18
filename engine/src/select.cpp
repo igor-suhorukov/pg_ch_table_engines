@@ -29,6 +29,7 @@
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Storages/Statistics/Statistics.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 
 #include <boost/algorithm/string/split.hpp>
@@ -166,11 +167,11 @@ private:
         return node;
     }
 
-    /// value i of a leaf, a constant of its column's type without Nullable
+    /// value i of a leaf, a constant of its column's type without Nullable and LowCardinality
     const ActionsDAG::Node & constant(const chte_filter_node & node, uint32_t i)
     {
         const auto & columns = filter.table->metadata->getColumns();
-        DataTypePtr type = removeNullable(columns.getPhysical(node.column).type);
+        DataTypePtr type = removeLowCardinalityAndNullable(columns.getPhysical(node.column).type);
         auto column = type->createColumn();
         appendValue(*column, node.values, i);
         auto value = ColumnConst::create(std::move(column), 1);
@@ -400,7 +401,7 @@ extern "C" int chte_part_stats(chte_table * table, const char * part_name, const
             stats->has_null_count = 1;	/* none can be NULL */
         if (estimate.estimated_min && estimate.estimated_max)
         {
-            DataTypePtr type = removeNullable(table->metadata->getColumns().getPhysical(column).type);
+            DataTypePtr type = removeLowCardinalityAndNullable(table->metadata->getColumns().getPhysical(column).type);
             auto min = type->createColumn();
             auto max = type->createColumn();
             min->insert(*estimate.estimated_min);

@@ -438,6 +438,41 @@ ch_builder_fetch(ChVectorBuilder *b, uint32 row, TupleTableSlot *slot)
 	return true;
 }
 
+/* A LowCardinality column's index at a row of its batch (chte_engine.h) */
+uint64
+ch_dictionary_index(const chte_dictionary *d, uint32 row)
+{
+	switch (d->index_width)
+	{
+		case 1:
+			return ((const uint8 *) d->indexes)[row];
+		case 2:
+			return ((const uint16 *) d->indexes)[row];
+		case 4:
+			return ((const uint32 *) d->indexes)[row];
+		default:
+			return ((const uint64 *) d->indexes)[row];
+	}
+}
+
+/* One value of a LowCardinality column, as ch_vector_to_datum() gives it */
+void
+ch_dictionary_to_datum(const ChColumn *col, const chte_dictionary *d, uint32 row, Datum *value, bool *isnull)
+{
+	uint64		index = ch_dictionary_index(d, row);
+
+	if (index >= d->nvalues)
+		elog(ERROR, "a LowCardinality column's index " UINT64_FORMAT " is past its dictionary's " UINT64_FORMAT " values",
+			 index, (uint64) d->nvalues);
+	if (d->has_null && index == d->null_index)
+	{
+		*isnull = true;
+		*value = (Datum) 0;
+		return;
+	}
+	ch_vector_to_datum(col, &d->values, (uint32) index, value, isnull, NULL);
+}
+
 /*
  * One value of a column the engine library read, as a datum.  By-reference
  * values are built in the current memory context.
