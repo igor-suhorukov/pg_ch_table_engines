@@ -1,8 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * engine.c
- *	  Loading libchte_engine.so in a backend or worker on first use, never in
- *	  the postmaster, and raising its errors as PostgreSQL's
+ *	  Loading libchte_engine.so: mapped in the postmaster as it preloads the
+ *	  extension (VC12), initialized in a backend or worker on first use,
+ *	  never in the postmaster; and raising its errors as PostgreSQL's
  *	  (ch_table_engines.md §2.2, "How it is loaded", "Its errors").
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -29,9 +30,15 @@
 char	   *ch_engine_library = NULL;
 char	   *ch_engine_log_level = NULL;
 char	   *ch_engine_settings = NULL;
+bool		ch_engine_preload = true;
+int			ch_engine_functions = CH_FUNCTIONS_USED;
 
 static ChEngine engine;
 static bool loaded = false;
+
+/* the postmaster's mapping of the library, which its children inherit */
+static void *mapped_handle = NULL;
+static char mapped_path[MAXPGPATH];
 
 /* ClickHouse's error codes this file tells apart (src/Common/ErrorCodes.cpp at the tag) */
 #define CH_CANNOT_PARSE_TEXT			6
@@ -126,6 +133,46 @@ remove_tmp_dir(int code, Datum arg)
 	(void) rmtree(DatumGetPointer(arg), true);
 }
 
+/* The library's file, as ch.engine_library names it */
+static void
+engine_path(char *path)
+{
+	if (ch_engine_library == NULL || ch_engine_library[0] == '\0' ||
+		strcmp(ch_engine_library, "$libdir/libchte_engine.so") == 0)
+		snprintf(path, MAXPGPATH, "%s/libchte_engine.so", pkglib_path);
+	else
+		strlcpy(path, ch_engine_library, MAXPGPATH);
+}
+
+/*
+ * In the postmaster, as it preloads the extension (VC12): the library mapped
+ * and relocated once, its static initializers run -- which start no thread
+ * and leave nothing a child could not inherit (§2.2) -- so that every
+ * process forked from it finds it so, where each mapped it again before, 4
+ * to 11 ms a parallel worker.  Nothing of it is called: ClickHouse's context,
+ * executors and their threads are each process's own, made as it first needs
+ * them (ch_engine()).  A library that cannot be loaded here is left to the
+ * processes, which raise their error as they first need it.
+ */
+void
+ch_engine_map(void)
+{
+	char		path[MAXPGPATH];
+
+	Assert(!IsUnderPostmaster);
+	engine_path(path);
+	mapped_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (mapped_handle == NULL)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_UNDEFINED_FILE),
+				 errmsg("could not map the engine library \"%s\" in the postmaster: %s", path, dlerror()),
+				 errdetail("Each process loads it as it first needs it.")));
+		return;
+	}
+	strlcpy(mapped_path, path, sizeof(mapped_path));
+}
+
 const ChEngine *
 ch_engine(void)
 {
@@ -140,15 +187,14 @@ ch_engine(void)
 		return &engine;
 
 	if (!IsUnderPostmaster && !IsBootstrapProcessingMode() && IsPostmasterEnvironment)
-		elog(ERROR, "the engine library is never loaded in the postmaster");
+		elog(ERROR, "the engine library is never initialized in the postmaster");
 
-	if (ch_engine_library == NULL || ch_engine_library[0] == '\0' ||
-		strcmp(ch_engine_library, "$libdir/libchte_engine.so") == 0)
-		snprintf(path, sizeof(path), "%s/libchte_engine.so", pkglib_path);
+	engine_path(path);
+	/* the postmaster's mapping, where the setting still names its file */
+	if (mapped_handle != NULL && strcmp(path, mapped_path) == 0)
+		handle = mapped_handle;
 	else
-		strlcpy(path, ch_engine_library, sizeof(path));
-
-	handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+		handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (handle == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FILE),
@@ -194,6 +240,9 @@ ch_engine(void)
 		engine.read_keep_dictionaries = NULL;
 		engine.read_dictionary = NULL;
 	}
+	/* optional: a library built before VC12 registers every function in chte_init */
+	*(void **) &engine.register_all_functions = dlsym(handle, "chte_register_all_functions");
+	*(void **) &engine.function_count = dlsym(handle, "chte_function_count");
 
 	memset(&options, 0, sizeof(options));
 	options.abi_version = CHTE_ABI_VERSION;
@@ -226,6 +275,9 @@ ch_engine(void)
 	loaded = true;
 	/* before exit() runs static destructors, which would wait for the executors' threads */
 	on_proc_exit(engine_on_exit, (Datum) 0);
+	if (ch_engine_functions == CH_FUNCTIONS_ALL && engine.register_all_functions != NULL &&
+		engine.register_all_functions(&err) != 0)
+		ch_engine_raise(&err, "registering ClickHouse's functions");
 	return &engine;
 }
 

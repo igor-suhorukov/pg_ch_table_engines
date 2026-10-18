@@ -84,6 +84,14 @@ parts' statistics, pass parts a sort's bound rules out over, and hand a
 and expressions over once and groups by (`vexec.batch_dictionary`) -- and a
 batch sink, through which vexec's INSERT writes columns into a table.
 
+Loading.  Preloaded, the postmaster maps the engine library and calls
+nothing of it (`ch.engine_preload`), so that every process forked from it --
+each parallel worker of a query among them -- finds it mapped and relocated;
+ClickHouse's engine starts in each process as it first needs a table,
+registering only the functions the filters use (`ch.engine_functions`), the
+others at the first write, merge or rewrite, or a table whose definition
+names them.  `ch.engine_info()` counts a process's threads and functions.
+
 ## Building and testing
 
 Everything builds and runs in containers (`test/run.sh`, `docker/`):

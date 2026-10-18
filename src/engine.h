@@ -2,7 +2,8 @@
  *
  * engine.h
  *	  The engine library, libchte_engine.so (ch_table_engines.md §2.2):
- *	  loaded on first use, and its errors raised as PostgreSQL's.
+ *	  mapped in the postmaster, initialized on first use, and its errors
+ *	  raised as PostgreSQL's.
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -57,15 +58,30 @@ typedef struct ChEngine
 	/* optional (VC5): NULL where the library lacks them */
 	int			(*read_keep_dictionaries) (chte_reader *, const uint8_t *, size_t, chte_error *);
 	int			(*read_dictionary) (chte_reader *, uint32_t, chte_dictionary *, chte_error *);
+	/* optional (VC12) */
+	int			(*register_all_functions) (chte_error *);
+	int			(*function_count) (void);
 } ChEngine;
 
 /* GUCs */
 extern char *ch_engine_library;
 extern char *ch_engine_log_level;
 extern char *ch_engine_settings;
+extern bool ch_engine_preload;
+extern int	ch_engine_functions;
+
+/* ch.engine_functions */
+typedef enum ChEngineFunctions
+{
+	CH_FUNCTIONS_USED,
+	CH_FUNCTIONS_ALL
+} ChEngineFunctions;
 
 /* The library, loaded and initialized on the first call. */
 extern const ChEngine *ch_engine(void);
+
+/* The postmaster's: the library mapped, nothing of it called (VC12) */
+extern void ch_engine_map(void);
 
 /* The library's objects, owned by the resource owner they are made under */
 #include "utils/resowner.h"

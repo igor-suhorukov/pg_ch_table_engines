@@ -8,8 +8,8 @@
 #include <Common/Exception.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/StoragePolicy.h>
-#include <Interpreters/FunctionNameNormalizer.h>
 #include <Interpreters/InterpreterCreateQuery.h>
+#include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -32,6 +32,8 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_AGGREGATE_FUNCTION;
+    extern const int UNKNOWN_FUNCTION;
     extern const int UNKNOWN_STORAGE;
 }
 
@@ -172,7 +174,8 @@ MergeTreeData::MutableDataPartPtr PgMergeTree::loadPart(const String & part_name
         .withPartInfo(info)
         .withPartFormatFromDisk()
         .build();
-    part->loadColumnsChecksumsIndexes(/* require_columns_checksums= */ true, /* check_consistency= */ true);
+    /// a read finds a missing or short file as it reads it, as a checksum's mismatch
+    part->loadColumnsChecksumsIndexes(/* require_columns_checksums= */ true, /* check_consistency= */ false);
     part->setState(DataPartState::Active);
     return part;
 }
@@ -187,106 +190,203 @@ MergeTreeData::DataPartPtr PgMergeTree::getPart(const String & part_name) const
     return part;
 }
 
+MergeTreeData::DataPartPtr PgMergeTree::checkedPart(const String & part_name) const
+{
+    DataPartPtr part = getPart(part_name);
+    part->checkConsistencyWithProjections(/* require_part_metadata= */ true);
+    return part;
+}
+
 void PgMergeTree::forgetPart(const String & part_name) const
 {
     parts.erase(part_name);
+    estimates.erase(part_name);
+}
+
+Estimates PgMergeTree::partEstimates(const DataPartPtr & part, const Names & columns) const
+{
+    auto & known = estimates[part->name];
+    Names missing;
+    for (const auto & name : columns)
+        if (!known.contains(name))
+            missing.push_back(name);
+    if (!missing.empty())
+    {
+        auto statistics = part->loadStatistics(missing);
+        for (const auto & name : missing)
+        {
+            auto it = statistics.find(name);
+            known[name] = it == statistics.end() ? std::nullopt : std::optional<Estimate>(it->second->getEstimate());
+        }
+    }
+    Estimates result;
+    for (const auto & name : columns)
+        if (const auto & estimate = known[name])
+            result.emplace(name, *estimate);
+    return result;
 }
 
 }
 
 using namespace chte;
 
+namespace
+{
+
+void collectFunctionNames(const IAST * ast, Names & names)
+{
+    if (!ast)
+        return;
+    if (const auto * function = ast->as<ASTFunction>())
+        names.push_back(function->name);
+    for (const auto & child : ast->children)
+        collectFunctionNames(child.get(), names);
+}
+
+/// The functions a definition's expressions name: its columns' defaults, statistics and TTLs, its
+/// indexes, projections and constraints, its keys and TTL -- not its types, codecs or engine.
+Names definitionFunctions(const ASTCreateQuery & create)
+{
+    Names names;
+    for (const auto & child : create.columns_list->columns->children)
+        if (const auto * column = child->as<ASTColumnDeclaration>())
+        {
+            collectFunctionNames(column->getDefaultExpression().get(), names);
+            collectFunctionNames(column->getStatisticsDesc().get(), names);
+            collectFunctionNames(column->getTTL().get(), names);
+        }
+    collectFunctionNames(create.columns_list->indices, names);
+    collectFunctionNames(create.columns_list->projections, names);
+    collectFunctionNames(create.columns_list->constraints, names);
+    const auto & storage = *create.storage;
+    for (const IAST * clause : {storage.partition_by, storage.primary_key, storage.order_by, storage.sample_by, storage.ttl_table})
+        collectFunctionNames(clause, names);
+    return names;
+}
+
+/// Statistics other than the least and greatest values and NULLs: uniq's read and build through
+/// aggregate functions (StatisticsUniq.cpp:18).
+bool statisticsNeedFunctions(const ColumnsDescription & columns)
+{
+    for (const auto & column : columns)
+        for (const auto & [type, desc] : column.statistics.types_to_desc)
+            if (type != StatisticsType::Basic && type != StatisticsType::MinMax)
+                return true;
+    return false;
+}
+
+chte_table * openTable(const chte_table_def * def)
+{
+    auto & e = engine();
+    if (!def || !def->create_query || !def->relative_path)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_table_open: create_query and relative_path are required");
+
+    auto context = Context::createCopy(e.global);
+    ParserCreateQuery parser;
+    String query = def->create_query;
+    ASTPtr ast = parseQuery(parser, query, "table definition", DBMS_DEFAULT_MAX_QUERY_SIZE,
+                            DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    auto & create = ast->as<ASTCreateQuery &>();
+    if (!create.columns_list || !create.columns_list->columns)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "table definition has no columns");
+    if (!create.storage || !create.storage->engine)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "table definition has no ENGINE");
+    auto & storage_def = *create.storage;
+    if (!functionsRegistered(definitionFunctions(create)))
+        registerAllFunctions();
+
+    std::optional<String> key_column;
+    auto merging = mergingParams(*storage_def.engine, key_column);
+
+    StorageInMemoryMetadata metadata;
+    ColumnsDescription columns = InterpreterCreateQuery::getColumnsDescription(
+        *create.columns_list->columns, context, LoadingStrictnessLevel::ATTACH);
+    metadata.setColumns(columns);
+
+    /// Keys as registerStorageMergeTree.cpp:693-760 at the tag builds them.
+    ASTPtr partition_by = storage_def.partition_by ? storage_def.partition_by->ptr() : nullptr;
+    metadata.partition_key = KeyDescription::getKeyFromAST(partition_by, metadata.columns, MergeTreeData::createVirtuals(nullptr), context);
+    metadata.virtuals = MergeTreeData::createVirtuals(&metadata.partition_key);
+
+    if (!storage_def.order_by && storage_def.primary_key)
+        storage_def.set(storage_def.order_by, storage_def.primary_key->clone());
+    if (!storage_def.order_by)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "table definition has no ORDER BY");
+
+    NamesAndTypesList additional_columns;
+    if (key_column)
+        additional_columns.emplace_back(*key_column, metadata.columns.getPhysical(*key_column).type);
+    metadata.sorting_key = KeyDescription::getKeyFromAST(storage_def.order_by->ptr(), metadata.columns, metadata.virtuals,
+                                                         context, additional_columns);
+    if (storage_def.primary_key)
+        metadata.primary_key = KeyDescription::getPrimaryKeyFromAST(storage_def.primary_key->ptr(), metadata.sorting_key,
+                                                                    metadata.columns, metadata.virtuals, context);
+    else
+    {
+        metadata.primary_key = KeyDescription::getKeyFromAST(storage_def.order_by->ptr(), metadata.columns, metadata.virtuals, context);
+        metadata.primary_key.definition_ast = nullptr;
+    }
+
+    /// No minmax_count projection, which registerStorageMergeTree.cpp:755 adds: only ClickHouse's query
+    /// plans read it (optimizeUseAggregateProjection.cpp:604), and making it analyzes a query of count(),
+    /// min() and max() at every open, the aggregate functions registered for it (VC12).
+
+    if (storage_def.sample_by)
+        metadata.sampling_key = KeyDescription::getKeyFromAST(storage_def.sample_by->ptr(), metadata.columns, metadata.virtuals, context);
+
+    if (create.columns_list->indices)
+        for (const auto & index : create.columns_list->indices->children)
+            metadata.secondary_indices.push_back(IndexDescription::getIndexFromAST(
+                index, columns, /* is_implicitly_created= */ false, metadata.escape_index_filenames, context));
+
+    if (create.columns_list->projections)
+        for (const auto & projection : create.columns_list->projections->children)
+            metadata.projections.add(ProjectionDescription::getProjectionFromAST(
+                projection, columns, &metadata.partition_key, context, LoadingStrictnessLevel::ATTACH));
+
+    auto settings = std::make_unique<MergeTreeSettings>(context->getMergeTreeSettings());
+    settings->loadFromQuery(storage_def, context, /* is_loading_from_existing_metadata= */ true);
+    if (storage_def.settings)
+        metadata.settings_changes = storage_def.settings->ptr();
+
+    /// Statistics of every column, as registerStorageMergeTree.cpp:1022-1027 adds them: the
+    /// parts' least and greatest values and NULLs, built as a part is written or merged.
+    String statistics_types = (*settings)[MergeTreeSetting::auto_statistics_types];
+    if (!statistics_types.empty())
+        addImplicitStatistics(metadata.columns, statistics_types);
+    if (statisticsNeedFunctions(metadata.columns))
+        registerAllFunctions();
+
+    StorageID id("chte", def->name && *def->name ? def->name : "table");
+    std::shared_ptr<PagesDisk> pages_disk;
+    if (def->pages)
+        pages_disk = std::make_shared<PagesDisk>("chte_pages", e.parts_disk->getPath(), *def->pages);
+    auto storage = std::make_shared<PgMergeTree>(id, def->relative_path, metadata, context, merging, std::move(settings),
+                                                 std::move(pages_disk));
+    StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
+    StorageMetadataPtr snapshot = handle;
+    return new chte_table{storage, snapshot, context, {}};
+}
+
+}
+
 extern "C" int chte_table_open(const chte_table_def * def, chte_table ** table, chte_error * error)
 {
     return guarded(error, [&]
     {
-        auto & e = engine();
-        if (!def || !def->create_query || !def->relative_path)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_table_open: create_query and relative_path are required");
-
-        auto context = Context::createCopy(e.global);
-        ParserCreateQuery parser;
-        String query = def->create_query;
-        ASTPtr ast = parseQuery(parser, query, "table definition", DBMS_DEFAULT_MAX_QUERY_SIZE,
-                                DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
-        auto & create = ast->as<ASTCreateQuery &>();
-        if (!create.columns_list || !create.columns_list->columns)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "table definition has no columns");
-        if (!create.storage || !create.storage->engine)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "table definition has no ENGINE");
-        auto & storage_def = *create.storage;
-
-        std::optional<String> key_column;
-        auto merging = mergingParams(*storage_def.engine, key_column);
-
-        StorageInMemoryMetadata metadata;
-        ColumnsDescription columns = InterpreterCreateQuery::getColumnsDescription(
-            *create.columns_list->columns, context, LoadingStrictnessLevel::ATTACH);
-        metadata.setColumns(columns);
-
-        /// Keys as registerStorageMergeTree.cpp:693-760 at the tag builds them.
-        ASTPtr partition_by = storage_def.partition_by ? storage_def.partition_by->ptr() : nullptr;
-        metadata.partition_key = KeyDescription::getKeyFromAST(partition_by, metadata.columns, MergeTreeData::createVirtuals(nullptr), context);
-        metadata.virtuals = MergeTreeData::createVirtuals(&metadata.partition_key);
-
-        if (!storage_def.order_by && storage_def.primary_key)
-            storage_def.set(storage_def.order_by, storage_def.primary_key->clone());
-        if (!storage_def.order_by)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "table definition has no ORDER BY");
-
-        NamesAndTypesList additional_columns;
-        if (key_column)
-            additional_columns.emplace_back(*key_column, metadata.columns.getPhysical(*key_column).type);
-        metadata.sorting_key = KeyDescription::getKeyFromAST(storage_def.order_by->ptr(), metadata.columns, metadata.virtuals,
-                                                             context, additional_columns);
-        if (storage_def.primary_key)
-            metadata.primary_key = KeyDescription::getPrimaryKeyFromAST(storage_def.primary_key->ptr(), metadata.sorting_key,
-                                                                        metadata.columns, metadata.virtuals, context);
-        else
+        try
         {
-            metadata.primary_key = KeyDescription::getKeyFromAST(storage_def.order_by->ptr(), metadata.columns, metadata.virtuals, context);
-            metadata.primary_key.definition_ast = nullptr;
+            *table = openTable(def);
         }
-
-        auto minmax_columns = metadata.getColumnsRequiredForPartitionKey();
-        auto partition_key = metadata.partition_key.expression_list_ast->clone();
-        FunctionNameNormalizer::visit(partition_key.get());
-        metadata.minmax_count_projection.emplace(ProjectionDescription::getMinMaxCountProjection(
-            columns, partition_key, minmax_columns, metadata.primary_key, &metadata.partition_key, context));
-
-        if (storage_def.sample_by)
-            metadata.sampling_key = KeyDescription::getKeyFromAST(storage_def.sample_by->ptr(), metadata.columns, metadata.virtuals, context);
-
-        if (create.columns_list->indices)
-            for (const auto & index : create.columns_list->indices->children)
-                metadata.secondary_indices.push_back(IndexDescription::getIndexFromAST(
-                    index, columns, /* is_implicitly_created= */ false, metadata.escape_index_filenames, context));
-
-        if (create.columns_list->projections)
-            for (const auto & projection : create.columns_list->projections->children)
-                metadata.projections.add(ProjectionDescription::getProjectionFromAST(
-                    projection, columns, &metadata.partition_key, context, LoadingStrictnessLevel::ATTACH));
-
-        auto settings = std::make_unique<MergeTreeSettings>(context->getMergeTreeSettings());
-        settings->loadFromQuery(storage_def, context, /* is_loading_from_existing_metadata= */ true);
-        if (storage_def.settings)
-            metadata.settings_changes = storage_def.settings->ptr();
-
-        /// Statistics of every column, as registerStorageMergeTree.cpp:1022-1027 adds them: the
-        /// parts' least and greatest values and NULLs, built as a part is written or merged.
-        String statistics_types = (*settings)[MergeTreeSetting::auto_statistics_types];
-        if (!statistics_types.empty())
-            addImplicitStatistics(metadata.columns, statistics_types);
-
-        StorageID id("chte", def->name && *def->name ? def->name : "table");
-        std::shared_ptr<PagesDisk> pages_disk;
-        if (def->pages)
-            pages_disk = std::make_shared<PagesDisk>("chte_pages", e.parts_disk->getPath(), *def->pages);
-        auto storage = std::make_shared<PgMergeTree>(id, def->relative_path, metadata, context, merging, std::move(settings),
-                                                     std::move(pages_disk));
-        StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
-        StorageMetadataPtr snapshot = handle;
-        *table = new chte_table{storage, snapshot, context, {}};
+        catch (const Exception & e)
+        {
+            /// a function ClickHouse's analysis of the definition looks up that its names did not show: again, with all
+            if (allFunctionsRegistered()
+                || (e.code() != ErrorCodes::UNKNOWN_FUNCTION && e.code() != ErrorCodes::UNKNOWN_AGGREGATE_FUNCTION))
+                throw;
+            registerAllFunctions();
+            *table = openTable(def);
+        }
     });
 }
 

@@ -205,9 +205,15 @@ part_order(const ListCell *a, const ListCell *b)
  * (ANALYZE) and SnapshotAny take the parts no one can see anymore out
  * (scan.c).  Never SnapshotAny itself: a dead row's manifest may have lost
  * its TOAST chunks (manifest_kept()).
+ *
+ * keep_toasted: an MVCC snapshot's manifests are left in TOAST, their
+ * pointers copied, until a part is attached (ch_part_manifest()), so that
+ * each participant of a scan reads only the manifests of the parts it
+ * claims units of (VC12).  The snapshot, registered for the scan, keeps the
+ * chunks of every row it sees.
  */
-List *
-ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
+static List *
+parts_visible(const ChStorageId *id, Snapshot snapshot, bool keep_toasted)
 {
 	Relation	catalog;
 	SysScanDesc scan;
@@ -234,8 +240,17 @@ ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
 		p->max_rowid = DatumGetInt64(values[Anum_parts_max_rowid - 1]);
 		p->level = DatumGetInt32(values[Anum_parts_level - 1]);
 		p->marks = DatumGetInt32(values[Anum_parts_marks - 1]);
-		p->manifest = nulls[Anum_parts_manifest - 1] ? NULL :
-			DatumGetByteaPCopy(values[Anum_parts_manifest - 1]);
+		if (nulls[Anum_parts_manifest - 1])
+			p->manifest = NULL;
+		else if (keep_toasted && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(values[Anum_parts_manifest - 1])))
+		{
+			struct varlena *pointer = (struct varlena *) DatumGetPointer(values[Anum_parts_manifest - 1]);
+
+			p->manifest = palloc(VARSIZE_EXTERNAL(pointer));
+			memcpy(p->manifest, pointer, VARSIZE_EXTERNAL(pointer));
+		}
+		else
+			p->manifest = DatumGetByteaPCopy(values[Anum_parts_manifest - 1]);
 		p->created = DatumGetTimestampTz(values[Anum_parts_created - 1]);
 		parts = lappend(parts, p);
 	}
@@ -243,6 +258,28 @@ ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
 	table_close(catalog, AccessShareLock);
 	list_sort(parts, part_order);
 	return parts;
+}
+
+List *
+ch_parts_visible(const ChStorageId *id, Snapshot snapshot)
+{
+	return parts_visible(id, snapshot, false);
+}
+
+/* The same, for a scan: its manifests read as its parts are attached */
+List *
+ch_parts_to_scan(const ChStorageId *id, Snapshot snapshot)
+{
+	return parts_visible(id, snapshot, snapshot != NULL && IsMVCCSnapshot(snapshot));
+}
+
+/* A part's manifest, fetched from TOAST where its list left it there; the part's own else */
+bytea *
+ch_part_manifest(const ChPart *part)
+{
+	if (part->manifest == NULL || !VARATT_IS_EXTERNAL_ONDISK(part->manifest))
+		return part->manifest;
+	return (bytea *) detoast_attr((struct varlena *) part->manifest);
 }
 
 /*

@@ -38,6 +38,12 @@ static const struct config_enum_entry storage_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry functions_options[] = {
+	{"used", CH_FUNCTIONS_USED, false},
+	{"all", CH_FUNCTIONS_ALL, false},
+	{NULL, 0, false}
+};
+
 
 /*
  * The rows the query wrote become parts as it finishes (§2.7 rule 3).  Its
@@ -148,6 +154,24 @@ _PG_init(void)
 							   "",
 							   PGC_SUSET, 0,
 							   NULL, NULL, NULL);
+	/* the postmaster's alone: a library loaded later may not define it */
+	if (process_shared_preload_libraries_in_progress)
+		DefineCustomBoolVariable("ch.engine_preload",
+								 "Whether the postmaster maps the engine library as it preloads the extension.",
+								 "Every process forked from it then finds the library mapped and relocated; "
+								 "ClickHouse's engine still starts in each process as it first needs it.",
+								 &ch_engine_preload,
+								 true,
+								 PGC_POSTMASTER, 0,
+								 NULL, NULL, NULL);
+	DefineCustomEnumVariable("ch.engine_functions",
+							 "Which of ClickHouse's functions a process registers as it first loads the engine library.",
+							 "used: those the filters use, the others as a table's definition, a write, a merge "
+							 "or a rewrite first needs them; all: every one at once.",
+							 &ch_engine_functions,
+							 CH_FUNCTIONS_USED, functions_options,
+							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("ch.max_merge_workers",
 							"Merge workers at most, one for a database, beside their launcher.",
 							"0 at the server's start: no launcher, which a reload does not start.",
@@ -184,6 +208,9 @@ _PG_init(void)
 
 	if (ch_preloaded)
 	{
+		/* the postmaster's, which its children inherit (VC12) */
+		if (ch_engine_preload && !IsUnderPostmaster && IsPostmasterEnvironment)
+			ch_engine_map();
 		ch_store_register_rmgr();
 		/* the merge workers' launcher (worker.c), never on a standby */
 		ch_merge_launcher_register();

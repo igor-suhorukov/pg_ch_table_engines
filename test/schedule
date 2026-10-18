@@ -15,6 +15,7 @@ test: indexes
 test: merge
 test: discard
 test: functions
+test: engine
 test: store
 nopreload: nopreload
 # again with the files store as the default (§2.9): the tests whose answers do not name a store

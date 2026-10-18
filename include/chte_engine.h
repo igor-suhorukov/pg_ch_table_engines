@@ -2,7 +2,8 @@
  * chte_engine.h — the C API of libchte_engine.so, the core of ClickHouse v26.8.8.8-lts
  * compiled into one shared library (ch_table_engines.md §2.2).
  *
- * The extension dlopen()s the library on first use in a backend (never in the postmaster)
+ * The extension dlopen()s the library on first use in a backend, or in the postmaster as
+ * it preloads -- mapped there only, its static initializers run, chte_init never called --
  * and talks to it only through these functions: no C++ type, exception or thread crosses
  * this boundary.  Every call runs on the calling thread.  A call that fails returns
  * nonzero and fills *error; the caller turns that into ereport(ERROR) after the call has
@@ -76,6 +77,17 @@ CHTE_API void		chte_shutdown(void);
 
 /* Number of threads of the process, for the tests that check no thread is started. */
 CHTE_API int			chte_thread_count(void);
+
+/*
+ * ClickHouse's functions in the process (VC12).  chte_init registers those the filters
+ * use; a table whose definition names others, a write, a merge and a rewrite register the
+ * rest, and the aggregate functions, as they first need them -- or the caller, at once.
+ * chte_function_count counts those registered, aggregate functions included, for the
+ * tests.  Both are optional: a library built before them registers every function in
+ * chte_init.
+ */
+CHTE_API int			chte_register_all_functions(chte_error *error);
+CHTE_API int			chte_function_count(void);
 
 /*
  * A table is a CREATE TABLE statement in ClickHouse's syntax — columns with codecs,

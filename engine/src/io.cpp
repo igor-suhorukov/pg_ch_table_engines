@@ -165,6 +165,8 @@ extern "C" int chte_write_begin(chte_table * table, uint64_t block_number, chte_
     {
         if (block_number == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "block numbers start at 1");
+        /// a part's writing -- its sort, statistics and projections -- looks up functions of its own
+        registerAllFunctions();
         auto w = std::make_unique<chte_writer>();
         w->table = table;
         w->block_number = block_number;
@@ -524,10 +526,13 @@ extern "C" int chte_merge(chte_table * table, const char * const * part_names, s
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_merge: no parts");
         if (version == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "block numbers start at 1");
+        /// a merge's algorithms -- a summing engine's sums, an aggregating one's states -- and its
+        /// projections look up functions and aggregate functions by name
+        registerAllFunctions();
         auto & storage = *table->storage;
         MergeTreeData::DataPartsVector parts;
         for (size_t i = 0; i < nparts; ++i)
-            parts.push_back(storage.getPart(part_names[i]));
+            parts.push_back(storage.checkedPart(part_names[i]));
         std::sort(parts.begin(), parts.end(), [](const auto & a, const auto & b) { return a->info < b->info; });
 
         auto future = std::make_shared<FutureMergedMutatedPart>();

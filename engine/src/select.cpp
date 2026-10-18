@@ -216,7 +216,7 @@ bool statisticsCanMatch(chte_filter & filter, const MergeTreeData::DataPartPtr &
 {
     if (!filter.stats_condition)
         return true;
-    auto estimates = part->getEstimates();
+    auto estimates = filter.table->storage->partEstimates(part, filter.stats_columns.getNames());
     std::vector<std::vector<Range>> boxes;
     DataTypes types;
     size_t combinations = 1;
@@ -384,7 +384,7 @@ extern "C" int chte_part_stats(chte_table * table, const char * part_name, const
         auto part = table->storage->getPart(part_name);
         *stats = {};
         table->scratch.clear();
-        auto estimates = part->getEstimates();
+        auto estimates = table->storage->partEstimates(part, {column ? column : ""});
         auto it = estimates.find(column ? column : "");
         /// only "basic" statistics count, whose least and greatest values are exact
         if (it == estimates.end() || !it->second.types.contains(StatisticsType::Basic))

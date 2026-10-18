@@ -177,6 +177,7 @@ ch_pages_attach(ChTable *t, const ChPart *part)
 {
 	size_t		n;
 	chte_page_file *files;
+	bytea	   *manifest;
 	bool		found;
 
 	if (t->attached == NULL)
@@ -195,9 +196,12 @@ ch_pages_attach(ChTable *t, const ChPart *part)
 		return;
 	if (part->manifest == NULL)
 		elog(ERROR, "part %s of a table of the pages store has no manifest", part->name);
-	files = manifest_files(part->manifest, &n);
+	manifest = ch_part_manifest(part);
+	files = manifest_files(manifest, &n);
 	CH_CALL("attaching a part", ch_engine()->pages_attach(t->handle, part->name, files, n, CH_ERR));
 	pfree(files);
+	if (manifest != part->manifest)
+		pfree(manifest);
 	(void) hash_search(t->attached, part->name, HASH_ENTER, NULL);
 }
 
