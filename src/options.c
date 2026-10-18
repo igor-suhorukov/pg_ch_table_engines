@@ -36,6 +36,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
@@ -737,6 +738,8 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 	ChEngineKind kind;
 	bool		outermost = (utility_depth == 0);
 	List	   *after_alter_strip = NIL;
+	List	   *grow_relids = NIL;	/* VC11: the tables an ALTER may add columns to */
+	List	   *grow_natts = NIL;	/* and their attributes before it */
 
 	/*
 	 * A command that needs a database to itself waits for its other backends
@@ -813,6 +816,40 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 
 			if (RelationIsValid(rel))
 				RelationClose(rel);
+
+			/*
+			 * VC11: the storages' plain columns that lost NOT NULL by an
+			 * earlier command are revoked before this one can give it back,
+			 * the table's, its descendants' and a partition's it attaches;
+			 * and the tables' attributes are counted, so that a column it
+			 * adds NOT NULL is made plain after it (ch_plain_grow()).
+			 */
+			ch_plain_revoke(relid);
+			foreach(lc, stmt->cmds)
+			{
+				AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+				if (cmd->subtype == AT_AttachPartition && IsA(cmd->def, PartitionCmd))
+				{
+					Oid			part = RangeVarGetRelid(((PartitionCmd *) cmd->def)->name, NoLock, true);
+
+					if (OidIsValid(part))
+						ch_plain_revoke(part);
+				}
+			}
+			foreach(lc, find_all_inheritors(relid, NoLock, NULL))
+			{
+				Relation	r = RelationIdGetRelation(lfirst_oid(lc));
+
+				if (!RelationIsValid(r))
+					continue;
+				if (ch_is_engine_rel(r, NULL))
+				{
+					grow_relids = lappend_oid(grow_relids, lfirst_oid(lc));
+					grow_natts = lappend_int(grow_natts, RelationGetNumberOfAttributes(r));
+				}
+				RelationClose(r);
+			}
 			foreach(lc, stmt->cmds)
 			{
 				AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
@@ -897,6 +934,13 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 	{
 		pending_defs = NIL;
 		pending_create = false;
+	}
+	{
+		ListCell   *lr;
+		ListCell   *ln;
+
+		forboth(lr, grow_relids, ln, grow_natts)
+			ch_plain_grow(lfirst_oid(lr), lfirst_int(ln));
 	}
 
 	/*

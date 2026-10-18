@@ -34,11 +34,13 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
@@ -53,7 +55,7 @@
 #include "chte.h"
 
 /* ch.tables's columns */
-#define Natts_tables 9
+#define Natts_tables 10
 #define Anum_tables_tablespace 1
 #define Anum_tables_relfilenumber 2
 #define Anum_tables_backend 3
@@ -63,6 +65,7 @@
 #define Anum_tables_next_rowid 7
 #define Anum_tables_next_block 8
 #define Anum_tables_library 9
+#define Anum_tables_plain 10
 
 /* ch.parts's columns */
 #define Natts_parts 12
@@ -504,8 +507,37 @@ ch_parts_delete_all(const ChStorageId *id)
 	table_close(catalog, RowExclusiveLock);
 }
 
+/* A set of attribute numbers as ch.tables keeps it: int2[], in order */
+static Datum
+attnums_datum(const Bitmapset *attnums)
+{
+	int			n = bms_num_members(attnums);
+	Datum	   *elems = palloc(sizeof(Datum) * Max(n, 1));
+	int			i = -1;
+	int			k = 0;
+
+	while ((i = bms_next_member(attnums, i)) >= 0)
+		elems[k++] = Int16GetDatum((int16) i);
+	return PointerGetDatum(construct_array_builtin(elems, n, INT2OID));
+}
+
+static Bitmapset *
+datum_attnums(Datum datum)
+{
+	ArrayType  *array = DatumGetArrayTypeP(datum);
+	Datum	   *elems;
+	int			n;
+	Bitmapset  *attnums = NULL;
+
+	deconstruct_array_builtin(array, INT2OID, &elems, NULL, &n);
+	for (int k = 0; k < n; k++)
+		attnums = bms_add_member(attnums, DatumGetInt16(elems[k]));
+	return attnums;
+}
+
 void
-ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage)
+ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage,
+					const Bitmapset *plain)
 {
 	Relation	catalog;
 	Datum		values[Natts_tables];
@@ -523,6 +555,7 @@ ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChSt
 	values[Anum_tables_next_rowid - 1] = Int64GetDatum(1);
 	values[Anum_tables_next_block - 1] = Int64GetDatum(1);
 	values[Anum_tables_library - 1] = CStringGetTextDatum("v26.8.8.8-lts");
+	values[Anum_tables_plain - 1] = attnums_datum(plain);
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	insert_with_cid(catalog, tuple, GetCurrentCommandId(true));
 	heap_freetuple(tuple);
@@ -568,6 +601,89 @@ ch_table_row_copy(Relation rel, const ChStorageId *from, const ChStorageId *to)
 	insert_with_cid(catalog, tuple, GetCurrentCommandId(true));
 	heap_freetuple(tuple);
 	table_close(catalog, RowExclusiveLock);
+}
+
+/*
+ * The columns a storage keeps as ClickHouse's plain types (VC11), found with
+ * the latest snapshot that sees the running command's own rows, as the
+ * counters are: a CREATE opens its table in the command that made the row.
+ */
+Bitmapset *
+ch_table_row_plain(const ChStorageId *id)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+	int			nkeys;
+	Bitmapset  *plain = NULL;
+
+	catalog = open_catalog("tables", id, AccessShareLock);
+	/* a catalog made before the column was: every column Nullable, as then */
+	if (RelationGetDescr(catalog)->natts < Anum_tables_plain)
+	{
+		table_close(catalog, AccessShareLock);
+		return NULL;
+	}
+	nkeys = storage_keys(id, keys);
+	scan = systable_beginscan(catalog, catalog_index(catalog), true, SnapshotSelf, nkeys, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		datum = heap_getattr(tuple, Anum_tables_plain, RelationGetDescr(catalog), &isnull);
+
+		if (!isnull)
+			plain = datum_attnums(datum);
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return plain;
+}
+
+/*
+ * A storage's plain columns replaced (VC11): an update of its row, under
+ * the lock of the command that changes the table, so that no writer of the
+ * table moves its counters meanwhile.
+ */
+void
+ch_table_row_set_plain(const ChStorageId *id, const Bitmapset *plain)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+	int			nkeys;
+
+	catalog = open_catalog("tables", id, RowExclusiveLock);
+	if (RelationGetDescr(catalog)->natts < Anum_tables_plain)
+	{
+		table_close(catalog, RowExclusiveLock);
+		return;
+	}
+	nkeys = storage_keys(id, keys);
+	scan = systable_beginscan(catalog, catalog_index(catalog), true, SnapshotSelf, nkeys, keys);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "no ch.tables row for storage %u/%u/%u",
+			 id->locator.spcOid, id->locator.dbOid, id->locator.relNumber);
+	{
+		Datum		v[Natts_tables];
+		bool		n[Natts_tables];
+		bool		repl[Natts_tables];
+		HeapTuple	newtup;
+
+		memset(repl, false, sizeof(repl));
+		memset(n, false, sizeof(n));
+		v[Anum_tables_plain - 1] = attnums_datum(plain);
+		repl[Anum_tables_plain - 1] = true;
+		newtup = heap_modify_tuple(tuple, RelationGetDescr(catalog), v, n, repl);
+		update_with_index(catalog, &tuple->t_self, newtup);
+		heap_freetuple(newtup);
+	}
+	systable_endscan(scan);
+	table_close(catalog, RowExclusiveLock);
+	CommandCounterIncrement();
 }
 
 void

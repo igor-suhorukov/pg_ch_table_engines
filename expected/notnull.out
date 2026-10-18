@@ -1,0 +1,196 @@
+-- NOT NULL columns as ClickHouse's plain types (ch_table_engines.md §2.5,
+-- VC11): plain where the storage is made with them NOT NULL, unless a key
+-- or a low_cardinality column; Nullable once a column loses NOT NULL, and
+-- not plain again in that storage, which loses the column from its set
+-- before the next ALTER TABLE; plain again in new storage (TRUNCATE, a
+-- rewrite); a column an ALTER TABLE adds NOT NULL plain.
+SET client_min_messages = warning;
+CREATE FUNCTION plain(r regclass) RETURNS int2[] LANGUAGE sql AS $$
+	SELECT t.plain FROM ch.tables t JOIN pg_class c ON c.relfilenode = t.relfilenumber WHERE c.oid = r
+$$;
+CREATE TABLE nn (k int NOT NULL, a int NOT NULL, b text NOT NULL, c int, l text NOT NULL)
+  USING mergetree WITH (order_by = 'k', low_cardinality = 'l');
+SELECT plain('nn');
+   plain   
+-----------
+ {1,2,3,5}
+(1 row)
+
+-- k, the key, and l, the low_cardinality column, stay Nullable
+SELECT ch.definition('nn');
+                                                                                                                                                                                                                                definition                                                                                                                                                                                                                                
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(LZ4), c2 Int32 CODEC(LZ4), c3 String CODEC(LZ4), c4 Nullable(Int32) CODEC(LZ4), c5 LowCardinality(Nullable(String)) CODEC(LZ4), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = MergeTree ORDER BY (c1) SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0, auto_statistics_types = 'basic'
+(1 row)
+
+INSERT INTO nn SELECT i, i, 'b' || i, nullif(i % 3, 0), 'l' || (i % 5) FROM generate_series(1, 20000) i;
+SELECT count(*), sum(a), count(b), count(c), count(DISTINCT l) FROM nn;
+ count |    sum    | count | count | count 
+-------+-----------+-------+-------+-------
+ 20000 | 200010000 | 20000 | 13334 |     5
+(1 row)
+
+-- DROP NOT NULL: Nullable, the plain parts read through ClickHouse's conversion
+ALTER TABLE nn ALTER COLUMN a DROP NOT NULL;
+SELECT ch.definition('nn') LIKE '%c2 Nullable(Int32)%' AS a_nullable;
+ a_nullable 
+------------
+ t
+(1 row)
+
+INSERT INTO nn VALUES (30000, NULL, 'x', 1, 'l1');
+SELECT count(*), count(a), sum(a) FROM nn;
+ count | count |    sum    
+-------+-------+-----------
+ 20001 | 20000 | 200010000
+(1 row)
+
+-- and NOT NULL again: the set loses a first, so a stays Nullable
+DELETE FROM nn WHERE a IS NULL;
+ALTER TABLE nn ALTER COLUMN a SET NOT NULL;
+SELECT plain('nn');
+  plain  
+---------
+ {1,3,5}
+(1 row)
+
+SELECT ch.definition('nn') LIKE '%c2 Nullable(Int32)%' AS a_nullable;
+ a_nullable 
+------------
+ t
+(1 row)
+
+SELECT count(*), count(a), sum(a) FROM nn;
+ count | count |    sum    
+-------+-------+-----------
+ 20000 | 20000 | 200010000
+(1 row)
+
+-- a merge of the plain parts and the Nullable one
+SELECT ch.optimize('nn', true) > 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT count(*), count(a), sum(a), count(b) FROM nn;
+ count | count |    sum    | count 
+-------+-------+-----------+-------
+ 20000 | 20000 | 200010000 | 20000
+(1 row)
+
+-- ADD COLUMN NOT NULL: plain, the older parts its missing value
+ALTER TABLE nn ADD COLUMN d int NOT NULL DEFAULT 7;
+SELECT plain('nn');
+   plain   
+-----------
+ {1,3,5,6}
+(1 row)
+
+INSERT INTO nn VALUES (40000, 1, 'y', 2, 'l2', 9);
+SELECT d, count(*) FROM nn GROUP BY d ORDER BY d;
+ d | count 
+---+-------
+ 7 | 20000
+ 9 |     1
+(2 rows)
+
+-- a rewrite: new storage, every NOT NULL column plain again
+VACUUM FULL nn;
+SELECT plain('nn');
+    plain    
+-------------
+ {1,2,3,5,6}
+(1 row)
+
+SELECT ch.definition('nn') LIKE '%c2 Int32%' AS a_plain;
+ a_plain 
+---------
+ t
+(1 row)
+
+SELECT count(*), count(a), sum(a), sum(d) FROM nn;
+ count | count |    sum    |  sum   
+-------+-------+-----------+--------
+ 20001 | 20001 | 200010001 | 140009
+(1 row)
+
+-- TRUNCATE: new storage
+ALTER TABLE nn ALTER COLUMN b DROP NOT NULL;
+TRUNCATE nn;
+SELECT plain('nn');
+   plain   
+-----------
+ {1,2,5,6}
+(1 row)
+
+SELECT ch.definition('nn') LIKE '%c3 Nullable(String)%' AS b_nullable;
+ b_nullable 
+------------
+ t
+(1 row)
+
+-- a NOT NULL that is not valid: Nullable in new storage too
+CREATE TABLE nv (k int NOT NULL, a int) USING mergetree WITH (order_by = 'k');
+INSERT INTO nv VALUES (1, NULL), (2, 2);
+ALTER TABLE nv ADD CONSTRAINT nv_a NOT NULL a NOT VALID;
+TRUNCATE nv;
+SELECT plain('nv');
+ plain 
+-------
+ {1}
+(1 row)
+
+-- partitions: an ALTER TABLE of the parent revokes in each
+CREATE TABLE np (k int NOT NULL, a int NOT NULL) PARTITION BY RANGE (k);
+CREATE TABLE np1 PARTITION OF np FOR VALUES FROM (0) TO (1000) USING mergetree;
+CREATE TABLE np2 PARTITION OF np FOR VALUES FROM (1000) TO (2000) USING mergetree;
+SELECT plain('np1'), plain('np2');
+ plain | plain 
+-------+-------
+ {1,2} | {1,2}
+(1 row)
+
+INSERT INTO np SELECT i, i FROM generate_series(0, 1999) i;
+ALTER TABLE np ALTER COLUMN a DROP NOT NULL;
+INSERT INTO np VALUES (5, NULL), (1005, NULL);
+DELETE FROM np WHERE a IS NULL;
+ALTER TABLE np ALTER COLUMN a SET NOT NULL;
+SELECT plain('np1'), plain('np2');
+ plain | plain 
+-------+-------
+ {1}   | {1}
+(1 row)
+
+SELECT count(*), count(a), sum(a) FROM np;
+ count | count |   sum   
+-------+-------+---------
+  2000 |  2000 | 1999000
+(1 row)
+
+-- ATTACH PARTITION: the parent's other partitions untouched, the new one's set kept
+CREATE TABLE np3 (k int NOT NULL, a int NOT NULL) USING mergetree;
+INSERT INTO np3 VALUES (2000, 1), (2500, 2);
+ALTER TABLE np ATTACH PARTITION np3 FOR VALUES FROM (2000) TO (3000);
+SELECT plain('np1'), plain('np3');
+ plain | plain 
+-------+-------
+ {1}   | {1,2}
+(1 row)
+
+-- ADD COLUMN NOT NULL through the parent: plain in every partition
+ALTER TABLE np ADD COLUMN e int NOT NULL DEFAULT 0;
+SELECT plain('np1'), plain('np2'), plain('np3');
+ plain | plain |  plain  
+-------+-------+---------
+ {1,3} | {1,3} | {1,2,3}
+(1 row)
+
+SELECT count(*), sum(a), sum(e) FROM np;
+ count |   sum   | sum 
+-------+---------+-----
+  2002 | 1999003 |   0
+(1 row)
+
+DROP TABLE nn, nv, np;
+DROP FUNCTION plain(regclass);

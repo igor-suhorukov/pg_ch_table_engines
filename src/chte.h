@@ -169,7 +169,11 @@ extern char *ch_storage_path(const ChStorageId *id, bool relative);
 extern ChTable *ch_table(Relation rel);
 extern ChTable *ch_table_for_storage(Relation rel, const ChStorageId *id);
 extern char *ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind);
-extern char *ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind);
+extern char *ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind,
+									 const Bitmapset *plain);
+extern Bitmapset *ch_plain_columns(TupleDesc desc);
+extern void ch_plain_revoke(Oid relid);
+extern void ch_plain_grow(Oid relid, int natts);
 extern ChTable *ch_table_private(Relation rel, const ChStorageId *id, TupleDesc desc);
 extern void ch_table_private_close(ChTable *t);
 extern bool ch_desc_matches(Relation rel, TupleDesc desc);
@@ -209,7 +213,10 @@ extern List *ch_parts_manifests(const ChStorageId *id);
 extern List *ch_parts_names(const ChStorageId *id);
 extern void ch_part_delete(const ChStorageId *id, const char *name);
 extern void ch_parts_delete_all(const ChStorageId *id);
-extern void ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage);
+extern void ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage,
+								const Bitmapset *plain);
+extern Bitmapset *ch_table_row_plain(const ChStorageId *id);
+extern void ch_table_row_set_plain(const ChStorageId *id, const Bitmapset *plain);
 extern void ch_table_row_delete(const ChStorageId *id);
 extern void ch_table_row_copy(Relation rel, const ChStorageId *from, const ChStorageId *to);
 extern void ch_counters_allocate(const ChStorageId *id, uint64 nrowids, uint64 nblocks,

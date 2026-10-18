@@ -99,5 +99,8 @@ extern List *ch_filter_quals(ChTable *t, List *quals);
 extern bool ch_part_minmax(ChTable *t, const ChPart *part, AttrNumber attnum, bool *has_values,
 						   Datum *min, Datum *max, int64 *nulls);
 extern bool ch_part_nulls(ChTable *t, const ChPart *part, AttrNumber attnum, int64 *nulls);
+extern bool ch_column_minmax_kept(const ChColumn *col);
+/* The parts a serial scan reads, its units, and whether the snapshot sees a deleted row */
+extern void ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted);
 
 #endif							/* CHTE_SCAN_H */

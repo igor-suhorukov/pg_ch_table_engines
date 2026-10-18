@@ -18,7 +18,10 @@ CREATE TABLE ch.tables (
 	storage			text NOT NULL,
 	next_rowid		bigint NOT NULL,
 	next_block		bigint NOT NULL,
-	library			text NOT NULL
+	library			text NOT NULL,
+	-- the columns ClickHouse keeps as their plain types, not Nullable: NOT
+	-- NULL where the storage was made, and since (§2.5, VC11)
+	plain			int2[] NOT NULL
 ) USING heap;
 CREATE UNIQUE INDEX tables_storage ON ch.tables (tablespace, relfilenumber, backend);
 
