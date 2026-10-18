@@ -24,6 +24,10 @@
  *		 -- with a NaN			DATUM						every value
  *		String					VIEW where asked, else		the views, or
  *								OFFSETS						int32 offsets
+ *		LowCardinality(String)	DICT where asked (VC5): its	the codes, and
+ *								dictionary as String's,		the dictionary's
+ *								codes widened to int32		offsets or views
+ *														once per dictionary
  *		a collapsing sign		FIXED, widened				the values
  *		a column a part lacks	CONST, its missing value	one value
  *
@@ -31,6 +35,10 @@
  *	  batch's arrays are written over by the next batch; one vexec retains
  *	  keeps them and the library's columns it points into until released,
  *	  retained before the next call of next(), as vexec's contract has it.
+ *	  A dictionary is the library's for a part's granules -- one a reader
+ *	  shares between them, until it reads another -- and is made vexec's
+ *	  once for all of them, named to vexec by the library's id
+ *	  (dictionary_id(), the contract's minor 3).
  *
  *	  aggregate() answers a unit from its part's statistics -- rows from the
  *	  catalog, NULLs, least and greatest values from ClickHouse's "basic"
@@ -95,6 +103,19 @@ typedef union ChView
 
 #define CH_VIEW_INLINE 12
 
+/*
+ * A LowCardinality column's dictionary in vexec's layout (VC5): made once for
+ * the batches whose library dictionary has its id, and kept while the
+ * column's batches have it and a retained batch does
+ */
+typedef struct SrcDict
+{
+	uint64		id;				/* the library's */
+	int			refs;			/* the column's own, and each retained batch's */
+	MemoryContext cxt;			/* the offsets or views */
+	VexecColumn values;
+} SrcDict;
+
 /* A column the source hands */
 typedef struct SrcColumn
 {
@@ -102,6 +123,8 @@ typedef struct SrcColumn
 	const ChColumn *col;
 	Oid			basetype;
 	uint8		want;			/* the layout the format asks for */
+	bool		dict;			/* handed as its dictionary where the library has one */
+	SrcDict    *cur_dict;		/* the last batch's dictionary, or NULL */
 	VexecColumn missing;		/* the column's missing value, as a constant */
 } SrcColumn;
 
@@ -110,6 +133,7 @@ typedef struct SrcOut
 {
 	MemoryContext cxt;
 	VexecColumn *columns;
+	SrcDict   **dicts;			/* per column: its dictionary, or NULL */
 	ItemPointerData *tids;
 	bool		retained;
 	chte_batch *keep;
@@ -272,6 +296,30 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 	st->ncols = n;
 	st->rowid_col = st->tids ? n : -1;
 	ch_scan_set_columns(scan, n, attnums, st->tids);
+
+	/*
+	 * VC5: a LowCardinality column as its dictionary, where vexec welcomes
+	 * dictionaries and asks for a layout of the bytes -- text's, in either
+	 * format -- and the library can
+	 */
+	if (flags & VEXEC_SRC_DICT)
+	{
+		bool	   *keep = palloc0(sizeof(bool) * Max(n, 1));
+		bool		any = false;
+
+		for (int i = 0; i < n; i++)
+		{
+			SrcColumn  *c = &st->cols[i];
+
+			keep[i] = c->col->low_cardinality && c->col->kind == CH_COL_VARLENA &&
+				(c->want == VEXEC_OFFSETS || c->want == VEXEC_VIEW || c->want == VEXEC_DATUM);
+			any |= keep[i];
+		}
+		if (any && ch_scan_set_dictionaries(scan, keep))
+			for (int i = 0; i < n; i++)
+				st->cols[i].dict = keep[i];
+		pfree(keep);
+	}
 	if (spec->quals != NIL)
 		(void) ch_scan_set_filter(scan, spec->quals);
 	if (spec->nkeys > 0)
@@ -303,6 +351,7 @@ next_out(SrcState *st)
 	else
 		MemoryContextReset(st->out->cxt);
 	st->out->columns = MemoryContextAllocZero(st->out->cxt, sizeof(VexecColumn) * Max(st->ncols, 1));
+	st->out->dicts = MemoryContextAllocZero(st->out->cxt, sizeof(SrcDict *) * Max(st->ncols, 1));
 	return st->out;
 }
 
@@ -438,6 +487,171 @@ has_nan(const ChColumn *col, const chte_vector *v, uint32 pos, uint32 n)
 }
 
 static void
+dict_unref(SrcDict *d)
+{
+	if (--d->refs == 0)
+	{
+		MemoryContextDelete(d->cxt);
+		pfree(d);
+	}
+}
+
+/*
+ * A library dictionary's values in vexec's layout: views where the format
+ * asks for them, else int32 offsets into the library's bytes.  NULL where
+ * its bytes are past int32's offsets.
+ */
+static SrcDict *
+make_dict(SrcState *st, const SrcColumn *c, const chte_dictionary *d)
+{
+	SrcDict    *sd;
+	SrcOut		tmp;
+	bool		ok PG_USED_FOR_ASSERTS_ONLY = true;
+
+	if (d->nvalues > (uint64) PG_INT32_MAX ||
+		(c->want != VEXEC_VIEW && d->values.offsets[d->nvalues] - d->values.offsets[0] > (uint64) PG_INT32_MAX))
+		return NULL;
+	sd = MemoryContextAllocZero(st->cxt, sizeof(SrcDict));
+	sd->id = d->id;
+	sd->refs = 1;
+	sd->cxt = AllocSetContextCreate(st->cxt, "ch source dictionary", ALLOCSET_DEFAULT_SIZES);
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.cxt = sd->cxt;
+	if (c->want == VEXEC_VIEW)
+		fill_views(&tmp, &sd->values, &d->values, 0, (uint32) d->nvalues);
+	else
+		ok = fill_offsets(&tmp, &sd->values, &d->values, 0, (uint32) d->nvalues);
+	Assert(ok);
+	sd->values.validity = NULL;
+	return sd;
+}
+
+/*
+ * A LowCardinality column's rows [pos, pos + n) as DICT: their indexes
+ * widened to int32 codes, a NULL row's validity bit clear and its code the
+ * dictionary's NULL entry, the type's default; the dictionary made vexec's
+ * once for its id.  False where it cannot be: the rows are then handed as
+ * Datums.
+ */
+static bool
+fill_dict(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
+{
+	SrcColumn  *c = &st->cols[i];
+	const chte_dictionary *d = &st->batch.dicts[i];
+	VexecColumn *vc = &out->columns[i];
+	int32	   *codes;
+	uint64	   *words;
+	bool		any_null = false;
+
+	if (c->cur_dict == NULL || c->cur_dict->id != d->id)
+	{
+		SrcDict    *nd = make_dict(st, c, d);
+
+		if (nd == NULL)
+			return false;
+		if (c->cur_dict)
+			dict_unref(c->cur_dict);
+		c->cur_dict = nd;
+	}
+	codes = MemoryContextAlloc(out->cxt, sizeof(int32) * Max(n, 1));
+	words = d->has_null ? MemoryContextAllocZero(out->cxt, sizeof(uint64) * ((n + 63) / 64)) : NULL;
+	/* the indexes widened, a loop for each of their widths */
+#define WIDEN(T) \
+	do { \
+		const T    *ix = (const T *) d->indexes + pos; \
+		uint64		most = 0; \
+		for (uint32 k = 0; k < n; k++) \
+		{ \
+			codes[k] = (int32) ix[k]; \
+			most = Max(most, (uint64) ix[k]); \
+		} \
+		if (most >= d->nvalues) \
+			elog(ERROR, "a LowCardinality column's index " UINT64_FORMAT " is past its dictionary's " UINT64_FORMAT " values", \
+				 most, (uint64) d->nvalues); \
+	} while (0)
+	switch (d->index_width)
+	{
+		case 1:
+			WIDEN(uint8);
+			break;
+		case 2:
+			WIDEN(uint16);
+			break;
+		case 4:
+			WIDEN(uint32);
+			break;
+		default:
+			WIDEN(uint64);
+			break;
+	}
+#undef WIDEN
+	/* a NULL row's bit cleared, a word of rows made at a time */
+	if (words != NULL)
+	{
+		int32		null_code = (int32) d->null_index;
+
+		for (uint32 w = 0; w < (n + 63) / 64; w++)
+		{
+			uint32		base = w * 64;
+			uint32		end = Min(n - base, 64);
+			uint64		all = end == 64 ? ~UINT64CONST(0) : (UINT64CONST(1) << end) - 1;
+			uint64		word = 0;
+
+			for (uint32 b = 0; b < end; b++)
+				word |= (uint64) (codes[base + b] != null_code) << b;
+			words[w] = word;
+			if (word != all)
+				any_null = true;
+		}
+	}
+	if (words && !any_null)
+	{
+		pfree(words);
+		words = NULL;
+	}
+	*vc = c->cur_dict->values;
+	vc->encoding = VEXEC_DICT;
+	vc->validity = words;
+	vc->values = NULL;
+	vc->buffers = NULL;
+	vc->buffer_sizes = NULL;
+	vc->nbuffers = 0;
+	vc->datums = NULL;
+	vc->codes = codes;
+	vc->dictionary = &c->cur_dict->values;
+	vc->ndictionary = (int) d->nvalues;
+	out->dicts[i] = c->cur_dict;
+	return true;
+}
+
+/* A LowCardinality column's rows [pos, pos + n) as Datums */
+static void
+fill_dict_datums(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
+{
+	const chte_dictionary *d = &st->batch.dicts[i];
+	VexecColumn *vc = &out->columns[i];
+	Datum	   *datums = MemoryContextAllocZero(out->cxt, sizeof(Datum) * Max(n, 1));
+	uint64	   *words = MemoryContextAllocZero(out->cxt, sizeof(uint64) * ((n + 63) / 64));
+	bool		any_null = false;
+	MemoryContext old = MemoryContextSwitchTo(out->cxt);
+
+	for (uint32 k = 0; k < n; k++)
+	{
+		bool		isnull;
+
+		ch_dictionary_to_datum(st->cols[i].col, d, pos + k, &datums[k], &isnull);
+		if (isnull)
+			any_null = true;
+		else
+			words[k / 64] |= UINT64CONST(1) << (k % 64);
+	}
+	MemoryContextSwitchTo(old);
+	set_shape(vc, VEXEC_DATUM, 0, 0, 0);
+	vc->values = datums;
+	vc->validity = any_null ? words : NULL;
+}
+
+static void
 fill_column(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 {
 	SrcColumn  *c = &st->cols[i];
@@ -448,6 +662,12 @@ fill_column(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 	if (st->batch.missing[i])
 	{
 		*vc = c->missing;
+		return;
+	}
+	if (c->dict && st->batch.dicts && st->batch.dicts[i].encoded)
+	{
+		if (!fill_dict(st, out, i, pos, n))
+			fill_dict_datums(st, out, i, pos, n);
 		return;
 	}
 	switch (col->kind)
@@ -631,6 +851,9 @@ src_retain(void *arg, void *owner)
 	if (out->retained)
 		return;
 	out->retained = true;
+	for (int i = 0; i < st->ncols; i++)
+		if (out->dicts[i])
+			out->dicts[i]->refs++;
 	if (st->have_batch && st->batch.reader)
 	{
 		out->keep_owner = ch_handle_reserve();
@@ -651,6 +874,9 @@ src_release(void *arg, void *owner)
 
 	if (!out->retained)
 		return;
+	for (int i = 0; i < st->ncols; i++)
+		if (out->dicts[i])
+			dict_unref(out->dicts[i]);
 	if (out->keep)
 	{
 		ch_handle_closing(out->keep_owner, CH_HANDLE_BATCH, out->keep);
@@ -795,6 +1021,17 @@ src_aggregate(void *arg, int nreqs, const VexecSourceAgg *reqs, VexecSourceAggAn
 	return true;
 }
 
+/* The library's id of the dictionary of a column of the last batch (minor 3) */
+static uint64
+src_dictionary_id(void *arg, int column)
+{
+	SrcState   *st = arg;
+
+	if (st->out == NULL || column < 0 || column >= st->ncols || st->out->dicts[column] == NULL)
+		return 0;
+	return st->out->dicts[column]->id;
+}
+
 static void
 src_set_keys(void *arg, int nkeys, const ScanKeyData *keys)
 {
@@ -932,6 +1169,7 @@ ch_vexec_register(void)
 		r->estimate = src_estimate;
 		r->aggregate = src_aggregate;
 		r->set_keys = src_set_keys;
+		r->dictionary_id = src_dictionary_id;
 		vexec_register_source(r);
 
 		memset(s, 0, sizeof(VexecSinkRoutine));

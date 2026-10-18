@@ -286,14 +286,44 @@ ch_is_sign_column(const ChOptions *opts, const char *name)
 	return names_column(opts->sign, name);
 }
 
+/* Whether a column list option names a column, at any place */
+static bool
+lists_column(const char *option, const char *name)
+{
+	char	   *copy;
+	List	   *names;
+	ListCell   *lc;
+
+	if (option == NULL)
+		return false;
+	copy = pstrdup(option);
+	if (!SplitIdentifierString(copy, ',', &names))
+		return false;
+	foreach(lc, names)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
 /*
  * A column as a table keeps it: a collapsing engine's sign is ClickHouse's
- * Int8 (its engines check it), from any of PostgreSQL's integers.
+ * Int8 (its engines check it), from any of PostgreSQL's integers; a column
+ * option low_cardinality names, ClickHouse's LowCardinality of its String.
  */
 void
 ch_column_for_table(Relation rel, const ChOptions *opts, Form_pg_attribute att, ChColumn *col)
 {
 	ch_column_for_attribute(att, col);
+	if (col->kind != CH_COL_DROPPED && lists_column(opts->low_cardinality, NameStr(att->attname)))
+	{
+		if (col->kind != CH_COL_VARLENA)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("column \"%s\" named in option \"low_cardinality\" is of type %s, which is not kept as a string",
+							NameStr(att->attname), format_type_be(att->atttypid)),
+					 errdetail("Only a column of a variable-length type is kept as ClickHouse's String, which LowCardinality takes.")));
+		col->low_cardinality = true;
+	}
 	if (col->kind == CH_COL_DROPPED || !ch_is_sign_column(opts, NameStr(att->attname)))
 		return;
 	if (att->atttypid == INT2OID || att->atttypid == INT4OID || att->atttypid == INT8OID)
@@ -380,10 +410,41 @@ check_user_settings(const char *settings)
 					 errmsg("setting \"%s\" cannot be given to a table of the ClickHouse engines", refused[i])));
 }
 
+/*
+ * Option low_cardinality's columns, as the option is given: each one of the
+ * relation's, kept as a string.  Not as a table opens, where a column
+ * dropped since is passed over.
+ */
+void
+ch_low_cardinality_check(Relation rel, const char *list)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	(void) translate_columns(rel, "low_cardinality", list, false);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		ChColumn	col;
+
+		if (!att->attisdropped && lists_column(list, NameStr(att->attname)))
+		{
+			ch_column_for_attribute(att, &col);
+			if (col.kind != CH_COL_VARLENA)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("column \"%s\" named in option \"low_cardinality\" is of type %s, which is not kept as a string",
+								NameStr(att->attname), format_type_be(att->atttypid)),
+						 errdetail("Only a column of a variable-length type is kept as ClickHouse's String, which LowCardinality takes.")));
+		}
+	}
+}
+
 /* The ClickHouse CREATE TABLE of a relation, as the engine library compiles it */
 char *
 ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind)
 {
+	if (opts->low_cardinality)
+		ch_low_cardinality_check(rel, opts->low_cardinality);
 	return ch_table_definition_for(rel, RelationGetDescr(rel), opts, kind);
 }
 
@@ -413,6 +474,8 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 								NameStr(att->attname), ch_engine_name(kind))));
 			appendStringInfo(&buf, "%s %s %s, ", column_name(att->attnum), col.chtype, c);
 		}
+		else if (col.low_cardinality)
+			appendStringInfo(&buf, "%s LowCardinality(Nullable(%s)) %s, ", column_name(att->attnum), col.chtype, c);
 		else
 			appendStringInfo(&buf, "%s Nullable(%s) %s, ", column_name(att->attnum), col.chtype, c);
 	}

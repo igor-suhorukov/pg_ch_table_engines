@@ -1,0 +1,289 @@
+-- LowCardinality columns (ch_table_engines.md §3, VC5): option
+-- low_cardinality names the columns a table keeps as ClickHouse's
+-- LowCardinality(Nullable(String)), a dictionary its parts' granules share.
+-- Every read answers as a heap copy's: the plain scan, ChScan, a fetch by
+-- TID, the rows of updates and deletions, after merges and a fold.
+SET client_min_messages = warning;
+-- columns kept as strings alone, and the relation's own
+CREATE TABLE lc_bad (a int, b text) USING mergetree WITH (low_cardinality = 'a');
+ERROR:  column "a" named in option "low_cardinality" is of type integer, which is not kept as a string
+DETAIL:  Only a column of a variable-length type is kept as ClickHouse's String, which LowCardinality takes.
+CREATE TABLE lc_bad (a int, b text) USING mergetree WITH (low_cardinality = 'b, nope');
+ERROR:  column "nope" named in option "low_cardinality" does not exist
+CREATE TABLE lc_bad (a int, b text) USING mergetree WITH (low_cardinality = 'b,');
+ERROR:  invalid value for option "low_cardinality": "b,"
+HINT:  Give a comma-separated list of column names.
+CREATE TABLE lc_bad (a int, b text, n numeric(10, 2)) USING mergetree WITH (low_cardinality = 'n');
+ERROR:  column "n" named in option "low_cardinality" is of type numeric, which is not kept as a string
+DETAIL:  Only a column of a variable-length type is kept as ClickHouse's String, which LowCardinality takes.
+CREATE TABLE lc (a int, b text, c varchar(10), d bytea, e jsonb, f int8, g numeric)
+  USING mergetree WITH (order_by = 'a', low_cardinality = 'b, c, d, e, g',
+                        settings = 'index_granularity = 1024');
+SELECT ch.definition('lc');
+                                                                                                                                                                                                                                                                                                                       definition                                                                                                                                                                                                                                                                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(Int32) CODEC(LZ4), c2 LowCardinality(Nullable(String)) CODEC(LZ4), c3 LowCardinality(Nullable(String)) CODEC(LZ4), c4 LowCardinality(Nullable(String)) CODEC(LZ4), c5 LowCardinality(Nullable(String)) CODEC(LZ4), c6 Nullable(Int64) CODEC(LZ4), c7 LowCardinality(Nullable(String)) CODEC(LZ4), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = MergeTree ORDER BY (c1) SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0, auto_statistics_types = 'basic', index_granularity = 1024
+(1 row)
+
+SET ch.insert_buffer_rows = 10000;
+INSERT INTO lc
+SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE 'b' || (i % 9) END, ('c' || (i % 3))::varchar(10),
+       decode(lpad(to_hex(i % 5), 2, '0'), 'hex'), jsonb_build_object('k', i % 4), i * 10,
+       CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 6) / 4.0 END
+FROM generate_series(1, 30000) i;
+RESET ch.insert_buffer_rows;
+SELECT count(*) AS parts, sum(rows) AS rows FROM ch.parts('lc');
+ parts | rows  
+-------+-------
+     3 | 30000
+(1 row)
+
+CREATE TABLE lc_heap (LIKE lc) USING heap;
+INSERT INTO lc_heap SELECT * FROM lc;
+-- a query's rows through ChScan and through the plain scan, against heap's
+CREATE FUNCTION as_heap(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  ref text;
+  got text;
+  s text;
+BEGIN
+  EXECUTE 'SELECT md5(coalesce(string_agg(r::text, '','' ORDER BY r::text), '''')) FROM ('
+    || replace(q, 'lc', 'lc_heap') || ') r' INTO ref;
+  FOREACH s IN ARRAY ARRAY['on', 'off'] LOOP
+    PERFORM set_config('ch.enable_chscan', s, true);
+    EXECUTE 'SELECT md5(coalesce(string_agg(r::text, '','' ORDER BY r::text), '''')) FROM ('
+      || q || ') r' INTO got;
+    IF got IS DISTINCT FROM ref THEN
+      RETURN format('DIFFERENT with ch.enable_chscan = %s', s);
+    END IF;
+  END LOOP;
+  RETURN 'as heap';
+END $$;
+SELECT as_heap('SELECT * FROM lc');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT as_heap('SELECT a, b FROM lc WHERE b = ''b3''');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT as_heap('SELECT count(*) FROM lc WHERE b IS NULL');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT as_heap('SELECT a, c, d FROM lc WHERE b IN (''b1'', ''b8'') AND a < 5000');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT as_heap('SELECT b, count(*), min(c), max(e::text), sum(g) FROM lc GROUP BY b');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT as_heap('SELECT a, b FROM lc ORDER BY b NULLS FIRST, a LIMIT 20');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT b, count(*) FROM lc GROUP BY b ORDER BY b;
+ b  | count 
+----+-------
+ b0 |  3030
+ b1 |  3031
+ b2 |  3031
+ b3 |  3031
+ b4 |  3030
+ b5 |  3030
+ b6 |  3030
+ b7 |  3030
+ b8 |  3030
+    |  2727
+(10 rows)
+
+-- a row by its TID, as a TID scan and an index scan fetch it
+SELECT ctid AS tid FROM lc WHERE a = 777 \gset
+SELECT a, b, c, d, e, g FROM lc WHERE ctid = :'tid';
+  a  | b  | c  |  d   |    e     | g 
+-----+----+----+------+----------+---
+ 777 | b3 | c0 | \x02 | {"k": 1} |  
+(1 row)
+
+CREATE INDEX lc_b ON lc (b);
+SET enable_seqscan = off;
+SET ch.enable_chscan = off;
+EXPLAIN (COSTS OFF) SELECT a, b FROM lc WHERE b = 'b5' AND a < 100;
+              QUERY PLAN              
+--------------------------------------
+ Bitmap Heap Scan on lc
+   Recheck Cond: (b = 'b5'::text)
+   Filter: (a < 100)
+   ->  Bitmap Index Scan on lc_b
+         Index Cond: (b = 'b5'::text)
+(5 rows)
+
+SELECT a, b, c FROM lc WHERE b = 'b5' AND a < 100 ORDER BY a;
+ a  | b  | c  
+----+----+----
+  5 | b5 | c2
+ 14 | b5 | c2
+ 23 | b5 | c2
+ 32 | b5 | c2
+ 41 | b5 | c2
+ 50 | b5 | c2
+ 59 | b5 | c2
+ 68 | b5 | c2
+ 86 | b5 | c2
+ 95 | b5 | c2
+(10 rows)
+
+RESET enable_seqscan;
+RESET ch.enable_chscan;
+-- updates and deletions, as on heap
+UPDATE lc SET b = b || 'x', c = 'u' WHERE a % 7 = 0;
+UPDATE lc_heap SET b = b || 'x', c = 'u' WHERE a % 7 = 0;
+DELETE FROM lc WHERE b = 'b2' OR a % 13 = 0;
+DELETE FROM lc_heap WHERE b = 'b2' OR a % 13 = 0;
+SELECT as_heap('SELECT * FROM lc');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT as_heap('SELECT b, count(*) FROM lc GROUP BY b');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+-- merged into one part, and the deleted rows folded out
+SELECT ch.fold('lc') > 0 AS folded;
+ folded 
+--------
+ t
+(1 row)
+
+SELECT ch.optimize('lc', true) > 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT count(*) AS parts FROM ch.parts('lc');
+ parts 
+-------
+     1
+(1 row)
+
+SELECT as_heap('SELECT * FROM lc');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+SELECT as_heap('SELECT a, b, d FROM lc WHERE b LIKE ''b1%'' OR d = ''\x03''');
+ as_heap 
+---------
+ as heap
+(1 row)
+
+-- a LowCardinality key prunes granules as a String's does
+CREATE TABLE lck (k text, v int) USING mergetree
+  WITH (order_by = 'k', low_cardinality = 'k', settings = 'index_granularity = 512');
+INSERT INTO lck SELECT 'k' || lpad((i % 50)::text, 2, '0'), i FROM generate_series(1, 50000) i;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(*), sum(v) FROM lck WHERE k = 'k07';
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (ChScan) on lck (actual rows=1000.00 loops=1)
+         Filter: (k = 'k07'::text)
+         Rows Removed by Filter: 536
+         Columns: k, v
+         Pruning: (k = 'k07'::text)
+         Granules: 3 read of 98
+(7 rows)
+
+SELECT count(*), sum(v) FROM lck WHERE k = 'k07';
+ count |   sum    
+-------+----------
+  1000 | 24982000
+(1 row)
+
+SELECT count(*) FROM lck WHERE k BETWEEN 'k10' AND 'k12';
+ count 
+-------
+  3000
+(1 row)
+
+-- the option is fixed while the table has parts; an empty one may take it
+ALTER TABLE lck SET (low_cardinality = '');
+ERROR:  cannot change the storage, keys or engine options of "lck" while it has data
+HINT:  TRUNCATE the table first, or make a new table with CREATE TABLE AS.
+TRUNCATE lck;
+ALTER TABLE lck RESET (low_cardinality);
+SELECT ch.definition('lck');
+                                                                                                                                                                                               definition                                                                                                                                                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE TABLE t (c1 Nullable(String) CODEC(LZ4), c2 Nullable(Int32) CODEC(LZ4), _pg_rowid UInt64 CODEC(T64, LZ4), PROJECTION _pg_rowid_index (SELECT _pg_rowid, _part_offset ORDER BY _pg_rowid)) ENGINE = MergeTree ORDER BY (c1) SETTINGS index_granularity = 8192, allow_nullable_key = 1, fsync_after_insert = 0, fsync_part_directory = 0, auto_statistics_types = 'basic', index_granularity = 512
+(1 row)
+
+ALTER TABLE lck SET (low_cardinality = 'k');
+INSERT INTO lck VALUES ('a', 1), (NULL, 2), ('', 3);
+SELECT k, v FROM lck ORDER BY v;
+ k | v 
+---+---
+ a | 1
+   | 2
+   | 3
+(3 rows)
+
+SELECT k IS NULL AS null_k, k = '' AS empty_k FROM lck ORDER BY v;
+ null_k | empty_k 
+--------+---------
+ f      | f
+ t      | 
+ f      | t
+(3 rows)
+
+-- the names are checked as the option is given; a column dropped since is
+-- passed over, and one of the option's may not become another type
+CREATE TABLE lcd (a int, b text, c text) USING mergetree WITH (low_cardinality = 'b, c');
+ALTER TABLE lcd SET (low_cardinality = 'b, nope');
+ERROR:  column "nope" named in option "low_cardinality" does not exist
+ALTER TABLE lcd SET (low_cardinality = 'a');
+ERROR:  column "a" named in option "low_cardinality" is of type integer, which is not kept as a string
+DETAIL:  Only a column of a variable-length type is kept as ClickHouse's String, which LowCardinality takes.
+INSERT INTO lcd VALUES (1, 'x', 'y'), (2, NULL, 'z');
+ALTER TABLE lcd DROP COLUMN b;
+INSERT INTO lcd VALUES (3, 'w');
+SELECT * FROM lcd ORDER BY a;
+ a | c 
+---+---
+ 1 | y
+ 2 | z
+ 3 | w
+(3 rows)
+
+ALTER TABLE lcd ALTER COLUMN c TYPE int USING length(c);
+ERROR:  column "c" named in option "low_cardinality" is of type integer, which is not kept as a string
+DETAIL:  Only a column of a variable-length type is kept as ClickHouse's String, which LowCardinality takes.
+SELECT * FROM lcd ORDER BY a;
+ a | c 
+---+---
+ 1 | y
+ 2 | z
+ 3 | w
+(3 rows)
+
+DROP TABLE lc, lc_heap, lck, lcd;
+DROP FUNCTION as_heap(text);

@@ -262,6 +262,40 @@ CHTE_API chte_batch *chte_read_retain(chte_reader *reader);
 CHTE_API void		chte_batch_release(chte_batch *batch);
 
 /*
+ * A LowCardinality column of a batch as ClickHouse keeps it (ch_table_engines.md §3,
+ * VC5): its dictionary's nvalues values, of the column's type without LowCardinality
+ * and Nullable, with no NULL, and the rows' indexes into them, index_width bytes each
+ * (1, 2, 4 or 8), native-endian.  Where the type is LowCardinality(Nullable(T)), index
+ * null_index is NULL, its value the type's default.  id names the dictionary: the
+ * batches of a reader's column with the same id share it -- ClickHouse's dictionary of
+ * a part's granules -- and the library never gives one id to two dictionaries in a
+ * process.  encoded is 0 where the column of this batch is not LowCardinality, and is
+ * then read by chte_read_vector.
+ */
+typedef struct chte_dictionary
+{
+	int32_t		encoded;
+	int32_t		has_null;
+	uint64_t	null_index;
+	chte_vector values;
+	uint64_t	nvalues;
+	const void *indexes;
+	uint32_t	index_width;
+	uint64_t	id;
+} chte_dictionary;
+
+/*
+ * Before the first chte_read_next: the columns, keep[c] nonzero, that the reader's
+ * batches leave LowCardinality, for chte_read_dictionary; every other column is
+ * expanded into its values, as without the call.  Both calls are optional: a library
+ * built before them lacks them, and its columns are always expanded.
+ */
+CHTE_API int			chte_read_keep_dictionaries(chte_reader *reader, const uint8_t *keep, size_t ncolumns,
+										chte_error *error);
+CHTE_API int			chte_read_dictionary(chte_reader *reader, uint32_t column, chte_dictionary *dictionary,
+								 chte_error *error);
+
+/*
  * Rows by their row ids (Appendix E): the offsets in a part of the rows whose
  * _pg_rowid are rowids[0 .. n), ascending, found through the part's _pg_rowid
  * projection; offsets[i] is UINT64_MAX where the part has no such row.

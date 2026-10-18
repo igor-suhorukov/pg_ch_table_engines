@@ -186,6 +186,14 @@ ch_engine(void)
 	LOAD(part_locate, "chte_part_locate");
 	LOAD(read_rows, "chte_read_rows");
 	LOAD(rewrite_part, "chte_rewrite_part");
+	/* optional: a library built before VC5 hands no dictionary, and its columns are expanded */
+	*(void **) &engine.read_keep_dictionaries = dlsym(handle, "chte_read_keep_dictionaries");
+	*(void **) &engine.read_dictionary = dlsym(handle, "chte_read_dictionary");
+	if (engine.read_keep_dictionaries == NULL || engine.read_dictionary == NULL)
+	{
+		engine.read_keep_dictionaries = NULL;
+		engine.read_dictionary = NULL;
+	}
 
 	memset(&options, 0, sizeof(options));
 	options.abi_version = CHTE_ABI_VERSION;

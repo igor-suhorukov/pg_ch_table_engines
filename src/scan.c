@@ -97,6 +97,8 @@ typedef struct ChScanDescData
 	int			asked_rowid;	/* the row id's column among them, or -1 */
 	chte_vector *vectors;		/* ncols + 1: the row id last where the reader adds it */
 	bool	   *missing;		/* per column read: not in the current part */
+	bool	   *keep_dict;		/* per column read: handed as its dictionary (VC5), or NULL */
+	chte_dictionary *dicts;		/* per column read: the batch's dictionary, where encoded */
 	bool		all_columns;	/* every column and the row id, as getnextslot reads */
 	chte_filter *filter;		/* NULL: every granule */
 	ResourceOwner filter_owner;
@@ -507,6 +509,16 @@ begin_reader(ChScanDesc scan)
 	/* a part written before a column was added has none: its rows take the column's missing value */
 	for (int c = 0; c < scan->ncols; c++)
 		scan->missing[c] = !eng->read_present(scan->reader, c);
+	/* the columns left LowCardinality, the row id the reader may add never among them */
+	if (scan->keep_dict)
+	{
+		uint8	   *keep = palloc0(scan->ncols + 1);
+
+		for (int c = 0; c < scan->ncols; c++)
+			keep[c] = scan->keep_dict[c] && !scan->missing[c];
+		CH_CALL("reading a part", eng->read_keep_dictionaries(scan->reader, keep, scan->ncols + 1, CH_ERR));
+		pfree(keep);
+	}
 }
 
 /* The next batch, from this unit or the next; false at the end */
@@ -528,7 +540,15 @@ next_batch(ChScanDesc scan)
 
 				MemoryContextReset(scan->batch_cxt);
 				for (int c = 0; c < nvec; c++)
+				{
+					if (c < scan->ncols && scan->keep_dict && scan->keep_dict[c])
+					{
+						CH_CALL("reading a part", eng->read_dictionary(scan->reader, c, &scan->dicts[c], CH_ERR));
+						if (scan->dicts[c].encoded)
+							continue;
+					}
 					CH_CALL("reading a part", eng->read_vector(scan->reader, c, &scan->vectors[c], CH_ERR));
+				}
 				scan->nrows = n;
 				scan->row = 0;
 				return true;
@@ -582,6 +602,12 @@ set_columns(ChScanDesc scan, int n, const int *attnos)
 		pfree(scan->vectors);
 	if (scan->missing)
 		pfree(scan->missing);
+	if (scan->keep_dict)
+		pfree(scan->keep_dict);
+	if (scan->dicts)
+		pfree(scan->dicts);
+	scan->keep_dict = NULL;
+	scan->dicts = NULL;
 	scan->ncols = n;
 	scan->attnos = palloc(sizeof(int) * Max(n, 1));
 	scan->vectors = palloc0(sizeof(chte_vector) * (n + 1));
@@ -682,6 +708,9 @@ fill_row(ChScanDesc scan, uint32 row, TupleTableSlot *slot, MemoryContext cxt)
 			continue;
 		else if (scan->missing[c])
 			slot->tts_values[att] = getmissingattr(slot->tts_tupleDescriptor, att + 1, &slot->tts_isnull[att]);
+		else if (scan->dicts && scan->dicts[c].encoded)
+			ch_dictionary_to_datum(&t->columns[att], &scan->dicts[c], row,
+								   &slot->tts_values[att], &slot->tts_isnull[att]);
 		else
 			ch_vector_to_datum(&t->columns[att], &scan->vectors[c], row,
 							   &slot->tts_values[att], &slot->tts_isnull[att], NULL);
@@ -812,6 +841,10 @@ ch_scan_end(TableScanDesc sscan)
 	pfree(scan->attnos);
 	pfree(scan->vectors);
 	pfree(scan->missing);
+	if (scan->keep_dict)
+		pfree(scan->keep_dict);
+	if (scan->dicts)
+		pfree(scan->dicts);
 	pfree(scan);
 }
 
@@ -936,6 +969,37 @@ ch_scan_set_filter(TableScanDesc sscan, List *quals)
 	return scan->filter != NULL;
 }
 
+/*
+ * Before the first batch, after the columns: those of keep[] -- LowCardinality
+ * columns, by their ChColumn -- handed as their dictionaries.  False where
+ * the engine library cannot: every column is then handed as its values.
+ */
+bool
+ch_scan_set_dictionaries(TableScanDesc sscan, const bool *keep)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	const ChEngine *eng = ch_engine();
+	MemoryContext old;
+	bool		any = false;
+
+	Assert(scan->part == NULL);
+	if (eng->read_keep_dictionaries == NULL)
+		return false;
+	for (int c = 0; c < scan->ncols; c++)
+		if (keep[c] && scan->attnos[c] >= 0 && scan->table->columns[scan->attnos[c]].low_cardinality)
+			any = true;
+	if (!any)
+		return false;
+	old = MemoryContextSwitchTo(scan->scan_cxt);
+	scan->keep_dict = palloc0(sizeof(bool) * Max(scan->ncols, 1));
+	scan->dicts = palloc0(sizeof(chte_dictionary) * Max(scan->ncols, 1));
+	for (int c = 0; c < scan->ncols; c++)
+		scan->keep_dict[c] = keep[c] && scan->attnos[c] >= 0 &&
+			scan->table->columns[scan->attnos[c]].low_cardinality;
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
 bool
 ch_scan_next_batch(TableScanDesc sscan, ChScanBatch *batch)
 {
@@ -950,6 +1014,7 @@ ch_scan_next_batch(TableScanDesc sscan, ChScanBatch *batch)
 	batch->attnos = scan->attnos;
 	batch->vectors = scan->vectors;
 	batch->missing = scan->missing;
+	batch->dicts = scan->keep_dict ? scan->dicts : NULL;
 	batch->reader = scan->reader;
 	batch->visible = NULL;
 	batch->nvisible = scan->nrows;

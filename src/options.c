@@ -80,6 +80,7 @@ static const ChOptionName option_names[] = {
 	{"is_deleted", true},
 	{"sign", true},
 	{"sum_columns", true},
+	{"low_cardinality", true},
 };
 
 /*
@@ -219,7 +220,7 @@ ch_options_validate(List *defs, ChEngineKind kind)
 
 		}
 		else if (strcmp(name, "order_by") == 0 || strcmp(name, "primary_key") == 0 ||
-				 strcmp(name, "sum_columns") == 0)
+				 strcmp(name, "sum_columns") == 0 || strcmp(name, "low_cardinality") == 0)
 			check_column_list(name, def_string(def));
 		else if (strcmp(name, "ver") == 0 || strcmp(name, "is_deleted") == 0 || strcmp(name, "sign") == 0)
 		{
@@ -300,6 +301,8 @@ apply_option(ChOptions *opts, const char *name, const char *value)
 		opts->sign = pstrdup(value);
 	else if (strcmp(name, "sum_columns") == 0)
 		opts->sum_columns = pstrdup(value);
+	else if (strcmp(name, "low_cardinality") == 0)
+		opts->low_cardinality = pstrdup(value);
 }
 
 /* The engines' options in a reloptions array; the others are heap's */
@@ -628,7 +631,12 @@ alter_table_options(Oid relid, AlterTableCmd *cmd)
 		elog(ERROR, "relation \"%s\" is not of an engine's access method", RelationGetRelationName(rel));
 
 	if (cmd->subtype == AT_SetRelOptions)
+	{
 		ch_options_validate(ours, kind);
+		foreach(lc, ours)
+			if (strcmp(lfirst_node(DefElem, lc)->defname, "low_cardinality") == 0)
+				ch_low_cardinality_check(rel, defGetString(lfirst_node(DefElem, lc)));
+	}
 	if (defining && relation_has_parts(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
