@@ -26,6 +26,12 @@
 #include <set>
 #include <string>
 
+namespace DB::ErrorCodes
+{
+    extern const int UNKNOWN_AGGREGATE_FUNCTION;
+    extern const int UNKNOWN_FUNCTION;
+}
+
 namespace chte
 {
 
@@ -93,6 +99,14 @@ Engine & engine();
 /// Throws QUERY_WAS_CANCELLED when the caller's interrupted() callback says so.
 void checkInterrupted();
 
+/// ClickHouse's functions a process has (VC12): chte_init registers those the filters and ClickHouse's
+/// analysis of them use; the others, and the aggregate functions, as a table's definition, a write, a
+/// merge or a rewrite first needs them.  Each is a no-op once done.
+void registerAllFunctions();
+bool allFunctionsRegistered();
+/// Whether the function factory knows every name, an aggregate function's included.
+bool functionsRegistered(const Names & names);
+
 void setError(chte_error * error, int code, const std::string & message) noexcept;
 
 /// Runs f; an exception becomes *error and a nonzero result.
@@ -124,6 +138,19 @@ int guarded(chte_error * error, F && f) noexcept
         }
         if (code == 0)
             code = -1;
+        /// a function looked up where the first registrations did not foresee it (VC12): every
+        /// one from now on, so that the statement succeeds when it is run again
+        if ((code == ErrorCodes::UNKNOWN_FUNCTION || code == ErrorCodes::UNKNOWN_AGGREGATE_FUNCTION)
+            && !allFunctionsRegistered())
+        {
+            try
+            {
+                registerAllFunctions();
+            }
+            catch (...)
+            {
+            }
+        }
         setError(error, code, message);
         return code;
     }
@@ -152,14 +179,22 @@ public:
     StoragePolicyPtr own_policy;
     std::shared_ptr<PagesDisk> pages_disk;
 
-    /// Part object for an existing directory under the table's path.
+    /// Part object for an existing directory under the table's path: what a read of it needs
+    /// (VC12), without the check of every file's size against its checksums, which a merge and a
+    /// rewrite, reading every file, make (checkedPart).
     MutableDataPartPtr loadPart(const String & part_name) const;
 
     /// A committed part, loaded once: a part's directory never changes once committed, and
     /// its name is never reused in a table's storage.  The pages store's files are attached
     /// before a part is first loaded.
     DataPartPtr getPart(const String & part_name) const;
+    /// The same, its files checked against its checksums, as ClickHouse checks a part it loads.
+    DataPartPtr checkedPart(const String & part_name) const;
     void forgetPart(const String & part_name) const;
+
+    /// A part's statistics of the named columns, loaded once a column (VC12), where ClickHouse's
+    /// getEstimates() loads every column's.  A column without statistics is not in the result.
+    Estimates partEstimates(const DataPartPtr & part, const Names & columns) const;
 
     MergeTreeDataWriter writer;
     MergeTreeDataMergerMutator merger;
@@ -194,6 +229,8 @@ private:
     [[noreturn]] static void unsupported(const char * what);
 
     mutable std::map<String, DataPartPtr> parts;
+    /// per part, each column's statistics asked for so far: nullopt where it has none
+    mutable std::map<String, std::map<String, std::optional<Estimate>>> estimates;
 };
 
 /// The names of a comma-separated list; throws when there is none.

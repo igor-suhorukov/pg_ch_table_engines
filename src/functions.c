@@ -105,14 +105,19 @@ Datum
 ch_engine_info(PG_FUNCTION_ARGS)
 {
 	TupleDesc	desc;
-	Datum		values[2];
-	bool		nulls[2] = {false};
+	Datum		values[3];
+	bool		nulls[3] = {false};
 	const ChEngine *eng = ch_engine();
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	values[0] = CStringGetTextDatum("ClickHouse v26.8.8.8-lts");
 	values[1] = Int32GetDatum(eng->thread_count());
+	/* VC12's: a library built before it has every one */
+	if (eng->function_count)
+		values[2] = Int32GetDatum(eng->function_count());
+	else
+		nulls[2] = true;
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
 

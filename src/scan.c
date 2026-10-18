@@ -782,7 +782,7 @@ ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	scan->table = t = ch_table(rel);
 	ch_table_pin(t);
 	scan->pinned = t;
-	scan->parts = ch_parts_visible(&t->storage, ch_parts_snapshot(rel, snapshot, &scan->nonvacuumable));
+	scan->parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &scan->nonvacuumable));
 	setup_units(scan);
 	scan->counts.parts = scan->nparts;
 	load_deletions(scan, snapshot);
@@ -1369,7 +1369,7 @@ ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *s
 	{
 		if (row_survives(t, rowid, snapshot))
 		{
-			parts = ch_parts_visible(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
+			parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
 			foreach(lc, parts)
 			{
 				ChPart	   *p = lfirst(lc);
@@ -1520,7 +1520,7 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		*raw = 0;
 	/* pinned from the start: the catalog's read may accept an invalidation of the table */
 	ch_table_pin(t);
-	parts = ch_parts_visible(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
+	parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
 	if (parts == NIL)
 	{
 		ch_table_unpin(t);

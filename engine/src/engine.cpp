@@ -7,14 +7,17 @@
 
 #include <sys/resource.h>
 
+#include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Common/Exception.h>
+#include <Common/MemoryTrackerBlockerInThread.h>
+#include <Common/register_objects.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/StoragePolicy.h>
 #include <Common/ThreadStatus.h>
 #include <Core/Settings.h>
-#include <Functions/registerFunctions.h>
+#include <Functions/FunctionFactory.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ParserSetQuery.h>
 #include <Parsers/parseQuery.h>
@@ -29,6 +32,8 @@
 #include <filesystem>
 #include <pthread.h>
 #include <signal.h>
+#include <string_view>
+#include <unordered_set>
 
 namespace DB::ErrorCodes
 {
@@ -48,6 +53,34 @@ namespace
 Engine * state = nullptr;
 pthread_t main_thread;
 chte_callbacks callbacks{};
+
+/// VC12: ClickHouse registers its functions and aggregate functions as a process starts
+/// (registerFunctions.cpp, registerAggregateFunctions.cpp), 4.3 of chte_init's 5.2 ms; here first only
+/// the registrations -- REGISTER_FUNCTION's names (Common/register_objects.h) -- of the functions the
+/// filters name (select.cpp, FilterBuilder) and ClickHouse's key analysis adds to them
+/// (KeyCondition.cpp:747-749, 1323), and a sorting key's tuple.
+constexpr std::string_view used_registrations[] = {
+    "Equals", "NotEquals", "Less", "LessOrEquals", "Greater", "GreaterOrEquals",
+    "Logical", "IsNull", "IsNotNull", "Tuple",
+};
+std::unordered_set<std::string_view> registered;
+bool all_registered = false;
+
+void registerUsedFunctions()
+{
+    /// as registerFunctions() does: what registration allocates is not a call's
+    MemoryTrackerBlockerInThread blocker;
+    auto & factory = FunctionFactory::instance();
+    const auto & registrations = FunctionRegisterMap::instance();
+    for (auto name : used_registrations)
+    {
+        auto it = registrations.find(name);
+        if (it == registrations.end())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "ClickHouse registers no functions as {}", name);
+        it->second(factory);
+        registered.insert(it->first);
+    }
+}
 
 /// ClickHouse's log messages go to the caller's log callback, and only from the thread that
 /// called into the library: PostgreSQL's elog is not thread-safe.
@@ -89,6 +122,35 @@ void applySettings(ContextMutablePtr & context, const char * settings)
     context->applySettingsChanges(ast->as<ASTSetQuery &>().changes);
 }
 
+}
+
+void registerAllFunctions()
+{
+    if (all_registered)
+        return;
+    MemoryTrackerBlockerInThread blocker;
+    auto & factory = FunctionFactory::instance();
+    for (const auto & [name, registration] : FunctionRegisterMap::instance())
+        if (!registered.contains(name))
+        {
+            registration(factory);
+            registered.insert(name);
+        }
+    registerAggregateFunctions();
+    all_registered = true;
+}
+
+bool allFunctionsRegistered()
+{
+    return all_registered;
+}
+
+bool functionsRegistered(const Names & names)
+{
+    for (const auto & name : names)
+        if (!FunctionFactory::instance().has(name) && !AggregateFunctionFactory::instance().isAggregateFunctionName(name))
+            return false;
+    return true;
 }
 
 Engine & engine()
@@ -153,8 +215,7 @@ extern "C" int chte_init(const chte_init_options * options, chte_error * error)
         Poco::Logger::setChannel("", channel);
         Poco::Logger::setLevel("", level);
 
-        registerFunctions();
-        registerAggregateFunctions();
+        registerUsedFunctions();
 
         auto engine = std::make_unique<Engine>();
         engine->shared = Context::createShared();
@@ -256,6 +317,28 @@ extern "C" void chte_shutdown(void)
     catch (...)
     {
         tryLogCurrentException("chte_shutdown");
+    }
+}
+
+extern "C" int chte_register_all_functions(chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        engine();
+        registerAllFunctions();
+    });
+}
+
+extern "C" int chte_function_count(void)
+{
+    try
+    {
+        return static_cast<int>(FunctionFactory::instance().getAllRegisteredNames().size()
+                                + AggregateFunctionFactory::instance().getAllRegisteredNames().size());
+    }
+    catch (...)
+    {
+        return -1;
     }
 }
 

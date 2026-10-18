@@ -37,8 +37,9 @@ extern "C" int chte_rewrite_part(chte_table * table, const char * part_name, con
         for (size_t i = 1; i < n; ++i)
             if (dead[i] <= dead[i - 1])
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_rewrite_part: row ids not ascending");
+        registerAllFunctions();
         auto & storage = *table->storage;
-        auto part = storage.getPart(part_name);
+        auto part = storage.checkedPart(part_name);
 
         auto w = std::make_unique<chte_writer>();
         w->table = table;

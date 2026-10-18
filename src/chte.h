@@ -190,7 +190,9 @@ typedef struct ChPart
 	int64		max_rowid;
 	int32		level;
 	int32		marks;			/* granules */
-	bytea	   *manifest;		/* the pages store's: the files' pages; NULL in the files store */
+	bytea	   *manifest;		/* the pages store's: the files' pages, a TOAST pointer where
+								 * ch_parts_to_scan() left it unread (ch_part_manifest()); NULL
+								 * in the files store */
 	TimestampTz created;		/* when it was written; 0 at an insert: now */
 } ChPart;
 
@@ -200,6 +202,8 @@ extern Oid	ch_catalog_index(Relation catalog);
 extern int	ch_catalog_storage_keys(const ChStorageId *id, ScanKeyData *keys);
 extern void ch_catalog_insert(Relation catalog, HeapTuple tuple, CommandId cid);
 extern List *ch_parts_visible(const ChStorageId *id, Snapshot snapshot);
+extern List *ch_parts_to_scan(const ChStorageId *id, Snapshot snapshot);
+extern bytea *ch_part_manifest(const ChPart *part);
 extern void ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid);
 extern List *ch_parts_manifests(const ChStorageId *id);
 extern List *ch_parts_names(const ChStorageId *id);

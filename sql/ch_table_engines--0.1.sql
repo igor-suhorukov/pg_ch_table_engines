@@ -119,8 +119,9 @@ CREATE FUNCTION ch.definition(rel regclass) RETURNS text
 CREATE FUNCTION ch.table_size(rel regclass) RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_table_size' LANGUAGE C STRICT STABLE;
 
--- The engine library: ClickHouse's release, and the process's threads.
-CREATE FUNCTION ch.engine_info(OUT version text, OUT threads integer)
+-- The engine library: ClickHouse's release, the process's threads, and the
+-- functions and aggregate functions it has registered so far.
+CREATE FUNCTION ch.engine_info(OUT version text, OUT threads integer, OUT functions integer)
 	AS 'MODULE_PATHNAME', 'ch_engine_info' LANGUAGE C STRICT VOLATILE;
 
 -- The deletions every snapshot sees, folded into their parts (§2.10): each

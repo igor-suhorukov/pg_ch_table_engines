@@ -1,0 +1,176 @@
+-- The engine's start in each process (ch_table_engines.md §3, VC12).
+SET client_min_messages = warning;
+-- the postmaster mapped the engine library as it preloaded the extension: a
+-- new backend has it before its first call into it
+SELECT current_setting('ch.engine_preload') AS preload,
+	   count(*) > 0 AS mapped
+  FROM regexp_split_to_table(pg_read_file('/proc/self/maps'), E'\n') AS line
+ WHERE line LIKE '%/libchte_engine.so%';
+ preload | mapped 
+---------+--------
+ on      | t
+(1 row)
+
+-- and called nothing of it: the postmaster has its one thread
+SELECT count(*) AS postmaster_threads
+  FROM pg_ls_dir('/proc/' || split_part(pg_read_file('postmaster.pid'), E'\n', 1) || '/task');
+ postmaster_threads 
+--------------------
+                  1
+(1 row)
+
+CREATE TABLE ef (a int, b text) USING mergetree WITH (order_by = 'a');
+INSERT INTO ef SELECT g, 'v' || g FROM generate_series(1, 100) g;
+-- a write registers every function, and the aggregate functions
+SELECT threads, functions > 1000 AS all_functions FROM ch.engine_info();
+ threads | all_functions 
+---------+---------------
+       5 | t
+(1 row)
+
+\c
+SET client_min_messages = warning;
+-- a filtered scan registers only the functions its filter uses
+SELECT count(*), sum(a) FROM ef WHERE a > 10 AND b IS NOT NULL AND a <> 50;
+ count | sum  
+-------+------
+    89 | 4945
+(1 row)
+
+SELECT threads, functions BETWEEN 1 AND 100 AS filters_functions FROM ch.engine_info();
+ threads | filters_functions 
+---------+-------------------
+       5 | t
+(1 row)
+
+-- an index-like fetch, statistics, a sort by the key: no others
+SELECT min(a), max(a) FROM ef WHERE a IN (3, 30, 300);
+ min | max 
+-----+-----
+   3 |  30
+(1 row)
+
+SELECT a FROM ef WHERE a < 4 ORDER BY a;
+ a 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+SELECT functions BETWEEN 1 AND 100 AS filters_functions FROM ch.engine_info();
+ filters_functions 
+-------------------
+ t
+(1 row)
+
+-- the first write registers the rest
+INSERT INTO ef VALUES (101, 'v101');
+SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+ all_functions 
+---------------
+ t
+(1 row)
+
+SELECT count(*), sum(a) FROM ef WHERE a > 10;
+ count | sum  
+-------+------
+    91 | 5096
+(1 row)
+
+-- a definition that names more: statistics that aggregate
+CREATE TABLE eu (a int) USING mergetree
+	WITH (order_by = 'a', settings = 'auto_statistics_types = ''basic, uniq''');
+INSERT INTO eu SELECT generate_series(1, 50);
+\c
+SET client_min_messages = warning;
+SELECT count(*) FROM eu WHERE a > 25;
+ count 
+-------
+    25
+(1 row)
+
+SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+ all_functions 
+---------------
+ t
+(1 row)
+
+-- every function at once
+\c
+SET ch.engine_functions = 'all';
+SELECT count(*) FROM ef WHERE a > 90;
+ count 
+-------
+    11
+(1 row)
+
+SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+ all_functions 
+---------------
+ t
+(1 row)
+
+RESET ch.engine_functions;
+-- a scan reads the manifests of the parts it attaches alone, from TOAST: a
+-- table of the pages store whose parts, wide -- a file or two a column --
+-- have manifests stored out of line
+SELECT format('CREATE TABLE ew (a int, %s) USING mergetree WITH (storage = ''pages'', order_by = ''a'', '
+			  'settings = ''min_bytes_for_wide_part = 0'')', string_agg(format('c%s int', i), ', ')) AS ddl
+  FROM generate_series(1, 60) i \gset
+:ddl;
+INSERT INTO ew (a, c1, c40, c60) SELECT g, g, g * 2, g * 3 FROM generate_series(1, 3000) g;
+INSERT INTO ew (a, c1, c40, c60) SELECT g, g, g * 2, g * 3 FROM generate_series(3001, 6000) g;
+CREATE INDEX ew_a ON ew (a);
+SELECT count(*) AS parts, bool_and(pg_column_toast_chunk_id(p.manifest) IS NOT NULL) AS out_of_line
+  FROM ch.parts p JOIN pg_class c ON c.relfilenode = p.relfilenumber
+ WHERE c.oid = 'ew'::regclass;
+ parts | out_of_line 
+-------+-------------
+     2 | t
+(1 row)
+
+\c
+SET client_min_messages = warning;
+SELECT count(*), sum(a), sum(c40) FROM ew WHERE a > 100;
+ count |   sum    |   sum    
+-------+----------+----------
+  5900 | 17997950 | 35995900
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT a, c1, c40, c60 FROM ew WHERE a IN (7, 3007);
+  a   |  c1  | c40  | c60  
+------+------+------+------
+    7 |    7 |   14 |   21
+ 3007 | 3007 | 6014 | 9021
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+\c
+SET client_min_messages = warning;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(c60) FROM ew WHERE c1 % 2 = 0;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (ChScan) on ew
+                     Filter: ((c1 % 2) = 0)
+                     Columns: c1, c60
+(7 rows)
+
+SELECT count(*), sum(c60) FROM ew WHERE c1 % 2 = 0;
+ count |   sum    
+-------+----------
+  3000 | 27009000
+(1 row)
+
+DROP TABLE ef, eu, ew;
