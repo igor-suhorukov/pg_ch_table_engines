@@ -1502,6 +1502,27 @@ ch_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot, bool *reche
 /* ---- estimates (scan.h) ---- */
 
 void
+ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted)
+{
+	ChTable    *t = ch_table(rel);
+	SnapshotData nonvacuumable;
+	int			ndead = 0;
+
+	ch_table_pin(t);
+	*units = list_length(ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable)));
+	*deleted = true;
+	if (snapshot != NULL)
+	{
+		uint64	   *dead = ch_tombstones_visible(&t->storage, snapshot, 0, PG_INT64_MAX, &ndead);
+
+		*deleted = ndead > 0;
+		if (dead)
+			pfree(dead);
+	}
+	ch_table_unpin(t);
+}
+
+void
 ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, bool rowid, List *quals,
 			double *rows, double *bytes, double *raw)
 {

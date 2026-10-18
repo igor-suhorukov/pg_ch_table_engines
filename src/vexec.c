@@ -31,7 +31,8 @@
  *		a collapsing sign		FIXED, widened				the values
  *		a column a part lacks	CONST, its missing value	one value
  *
- *	  a Nullable's null map as validity bits, and the row ids as TIDs.  A
+ *	  a Nullable's null map as validity bits, none where a batch holds no
+ *	  NULL (VC11), and the row ids as TIDs.  A
  *	  batch's arrays are written over by the next batch; one vexec retains
  *	  keeps them and the library's columns it points into until released,
  *	  retained before the next call of next(), as vexec's contract has it.
@@ -46,7 +47,9 @@
  *	  count(*) of any unit, from its granules' rows; sums are left to next().
  *	  set_keys() and the spec's keys pass over a unit whose part's
  *	  statistics show no row within them.  estimate() is the needed columns'
- *	  compressed bytes in the granules the quals keep.
+ *	  compressed bytes in the granules the quals keep, and their rows;
+ *	  estimate_ex() (the contract's minor 3, VC13) adds the parts a serial
+ *	  scan reads, and whether aggregate() answers every one of them.
  *
  *	  The sink.  VecInsert's batches go into the write buffer (buffer.c) by
  *	  column, in the layouts ClickHouse's columns have, as rows of the same
@@ -355,28 +358,44 @@ next_out(SrcState *st)
 	return st->out;
 }
 
-/* A null map's rows [pos, pos + n) as validity bits, or NULL where none is NULL */
+/*
+ * A null map's rows [pos, pos + n) as validity bits, or NULL where none is
+ * NULL (VC11).  ClickHouse's null map is a byte a row, 1 for a NULL and 0
+ * for a value (ColumnNullable), so a memchr() for a 1 finds whether the
+ * batch holds a NULL at all: most do not, and they need no bits.  Where one
+ * does, eight bytes become a byte of bits at a time: each byte's low bit
+ * inverted, and the eight gathered into the top byte of a product -- the
+ * multiplier puts byte k's bit at bit 56 + k, and no two partial products
+ * meet there.  A bit a row took 31% of a scan's cycles (§3, "Transfer and
+ * statistics, measured 2026-10-17").
+ */
 static const uint64 *
 validity_of(SrcOut *out, const chte_vector *v, uint32 pos, uint32 n)
 {
+	const uint8 *nulls;
 	uint64	   *words;
-	bool		any = false;
+	uint32		i = 0;
 
 	if (v->nulls == NULL)
 		return NULL;
-	words = MemoryContextAllocZero(out->cxt, sizeof(uint64) * ((n + 63) / 64));
-	for (uint32 i = 0; i < n; i++)
-	{
-		if (v->nulls[pos + i])
-			any = true;
-		else
-			words[i / 64] |= UINT64CONST(1) << (i % 64);
-	}
-	if (!any)
-	{
-		pfree(words);
+	nulls = v->nulls + pos;
+	if (memchr(nulls, 1, n) == NULL)
 		return NULL;
+	words = MemoryContextAllocZero(out->cxt, sizeof(uint64) * ((n + 63) / 64));
+#ifndef WORDS_BIGENDIAN
+	/* a little-endian word's byte k holds its bits 8k to 8k + 7 */
+	for (; i + 8 <= n; i += 8)
+	{
+		uint64		w;
+
+		memcpy(&w, nulls + i, sizeof(w));
+		w = ~w & UINT64CONST(0x0101010101010101);
+		((uint8 *) words)[i / 8] = (uint8) ((w * UINT64CONST(0x0102040810204080)) >> 56);
 	}
+#endif
+	for (; i < n; i++)
+		if (!nulls[i])
+			words[i / 64] |= UINT64CONST(1) << (i % 64);
 	return words;
 }
 
@@ -925,6 +944,45 @@ src_estimate(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, doubl
 				spec->quals, rows, bytes, NULL);
 }
 
+/*
+ * estimate_ex() (VC13): estimate()'s rows and bytes; the parts a serial scan
+ * reads, its units; and VEXEC_EST_AGG_EXACT where aggregate() answers each
+ * of them from its statistics -- a scan with no qual and no TIDs, no row of
+ * it deleted, and every column one whose least and greatest values a part's
+ * statistics keep (answer_from_stats()).
+ */
+static void
+src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, VexecSourceEstimate *est)
+{
+	bool		tids = spec->size >= offsetof(VexecSourceSpec, flags) + sizeof(spec->flags) &&
+		(spec->flags & VEXEC_SRC_TIDS) != 0;
+	double		rows;
+	double		bytes;
+	double		units;
+	bool		deleted;
+	uint32		flags = 0;
+
+	ch_estimate(rel, snapshot, spec->ncolumns, spec->attnums, tids, spec->quals, &rows, &bytes, NULL);
+	ch_estimate_units(rel, snapshot, &units, &deleted);
+	if (spec->quals == NIL && !tids && !deleted)
+	{
+		ChTable    *t = ch_table(rel);
+		bool		kept = true;
+
+		for (int i = 0; i < spec->ncolumns && kept; i++)
+			kept = spec->attnums[i] >= 1 && spec->attnums[i] <= t->natts &&
+				ch_column_minmax_kept(&t->columns[spec->attnums[i] - 1]);
+		if (kept)
+			flags |= VEXEC_EST_AGG_EXACT;
+	}
+	est->rows = rows;
+	est->bytes = bytes;
+	if (est->size >= offsetof(VexecSourceEstimate, units) + sizeof(est->units))
+		est->units = units;
+	if (est->size >= offsetof(VexecSourceEstimate, flags) + sizeof(est->flags))
+		est->flags = flags;
+}
+
 /* An aggregate's answer from a whole part's statistics; false where there is none */
 static bool
 answer_from_stats(SrcState *st, const ChScanUnit *unit, const VexecSourceAgg *req, VexecSourceAggAnswer *answer)
@@ -1170,6 +1228,7 @@ ch_vexec_register(void)
 		r->aggregate = src_aggregate;
 		r->set_keys = src_set_keys;
 		r->dictionary_id = src_dictionary_id;
+		r->estimate_ex = src_estimate_ex;
 		vexec_register_source(r);
 
 		memset(s, 0, sizeof(VexecSinkRoutine));

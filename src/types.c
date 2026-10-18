@@ -4,11 +4,14 @@
  *	  A PostgreSQL column's ClickHouse type (ch_table_engines.md §2.5): one
  *	  whose values are exactly the column's, so a round trip is the identity.
  *
- *	  Every column is Nullable(T), NOT NULL or not: SET and DROP NOT NULL then
- *	  change nothing in the parts, and a null map of zeros costs next to
- *	  nothing compressed.  A column is named c<attnum> in ClickHouse, so a
- *	  rename changes nothing and no PostgreSQL name meets ClickHouse's
- *	  quoting or its virtual columns' names.
+ *	  A column is Nullable(T), or T where its storage was made with it NOT
+ *	  NULL and it is NOT NULL since, and is neither a key column nor a
+ *	  low_cardinality one (VC11, table.c): no null map is then written,
+ *	  read, decompressed or turned into validity bits.  SET NOT NULL changes
+ *	  nothing in the parts; DROP NOT NULL makes the column Nullable(T), its
+ *	  plain parts read through ClickHouse's conversion.  A column is named
+ *	  c<attnum> in ClickHouse, so a rename changes nothing and no PostgreSQL
+ *	  name meets ClickHouse's quoting or its virtual columns' names.
  *
  * SPDX-License-Identifier: Apache-2.0
  *

@@ -11,13 +11,17 @@
  */
 #include "postgres.h"
 
+#include "access/relation.h"
+#include "access/table.h"
 #include "access/xlog.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
 #include "common/relpath.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/lmgr.h"
 #include "storage/procnumber.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -439,17 +443,68 @@ ch_low_cardinality_check(Relation rel, const char *list)
 	}
 }
 
+/*
+ * The columns of a descriptor that a storage made now may keep as
+ * ClickHouse's plain types (§2.5, VC11): those NOT NULL by a constraint not
+ * known to be invalid.  A running CREATE's own descriptor says no more than
+ * that a NOT NULL exists, and its NOT NULLs are valid, as relcache takes
+ * them (RelationBuildTupleDesc()); a rewrite's new storage gets the old
+ * relation's validity with its NOT NULLs (RelationBuildLocalRelation()).
+ */
+Bitmapset *
+ch_plain_columns(TupleDesc desc)
+{
+	Bitmapset  *plain = NULL;
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped && att->attnotnull &&
+			TupleDescCompactAttr(desc, i)->attnullability != ATTNULLABLE_INVALID)
+			plain = bms_add_member(plain, att->attnum);
+	}
+	return plain;
+}
+
+/*
+ * Whether a column is ClickHouse's plain type in a storage's table, not
+ * Nullable (VC11): one of the storage's plain columns, NOT NULL still, and
+ * neither a key column -- ClickHouse reads a part's index by the table's
+ * types, so its type never changes -- nor a low_cardinality one, whose NULL
+ * is an entry of its dictionary, not a null map.  A column that loses NOT
+ * NULL is Nullable from then on, its plain parts read through ClickHouse's
+ * conversion of T into Nullable(T); the storage's set loses it before the
+ * next ALTER TABLE (ch_plain_revoke()), so that it is not plain again while
+ * a part may hold a NULL of it.
+ */
+static bool
+stored_plain(const ChOptions *opts, const Bitmapset *plain, TupleDesc desc, int i, const ChColumn *col)
+{
+	Form_pg_attribute att = TupleDescAttr(desc, i);
+
+	return bms_is_member(att->attnum, plain) && att->attnotnull &&
+		TupleDescCompactAttr(desc, i)->attnullability != ATTNULLABLE_INVALID &&
+		!col->low_cardinality &&
+		!lists_column(opts->order_by, NameStr(att->attname)) &&
+		!lists_column(opts->primary_key, NameStr(att->attname));
+}
+
 /* The ClickHouse CREATE TABLE of a relation, as the engine library compiles it */
 char *
 ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind)
 {
+	ChStorageId id;
+
 	if (opts->low_cardinality)
 		ch_low_cardinality_check(rel, opts->low_cardinality);
-	return ch_table_definition_for(rel, RelationGetDescr(rel), opts, kind);
+	ch_storage_id(rel, &rel->rd_locator, &id);
+	return ch_table_definition_for(rel, RelationGetDescr(rel), opts, kind, ch_table_row_plain(&id));
 }
 
 char *
-ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind)
+ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind,
+						const Bitmapset *plain)
 {
 	StringInfoData buf;
 	const char *c = codec(opts->compression);
@@ -476,6 +531,8 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 		}
 		else if (col.low_cardinality)
 			appendStringInfo(&buf, "%s LowCardinality(Nullable(%s)) %s, ", column_name(att->attnum), col.chtype, c);
+		else if (stored_plain(opts, plain, desc, i, &col))
+			appendStringInfo(&buf, "%s %s %s, ", column_name(att->attnum), col.chtype, c);
 		else
 			appendStringInfo(&buf, "%s Nullable(%s) %s, ", column_name(att->attnum), col.chtype, c);
 	}
@@ -560,7 +617,7 @@ open_table(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cx
 	(void) ch_is_engine_rel(rel, &t->kind);
 	ch_relation_options(rel, &t->options);
 	t->relative_path = ch_storage_path(id, true);
-	t->definition = ch_table_definition_for(rel, desc, &t->options, t->kind);
+	t->definition = ch_table_definition_for(rel, desc, &t->options, t->kind, ch_table_row_plain(id));
 	t->natts = desc->natts;
 	t->columns = palloc0(sizeof(ChColumn) * Max(desc->natts, 1));
 	initStringInfo(&cols);
@@ -705,4 +762,101 @@ ch_desc_matches(Relation rel, TupleDesc desc)
 			return false;
 	}
 	return true;
+}
+
+/*
+ * Before an ALTER TABLE (the option hook's): each storage of the relation,
+ * and of its descendants and a partition it attaches, loses from its plain
+ * columns those NOT NULL no longer (VC11).  A column leaves NOT NULL only
+ * by an ALTER TABLE, and becomes NOT NULL again only by one, so that this
+ * runs before any command that could make a column plain whose parts may
+ * hold a NULL.  The update takes the table's ACCESS EXCLUSIVE lock, as the
+ * commands that change NOT NULL do, and only where there is something to
+ * revoke: a column that lost NOT NULL by an earlier command.
+ */
+void
+ch_plain_revoke(Oid relid)
+{
+	List	   *relids = find_all_inheritors(relid, NoLock, NULL);
+	ListCell   *lc;
+
+	foreach(lc, relids)
+	{
+		Oid			child = lfirst_oid(lc);
+		Relation	rel = RelationIdGetRelation(child);
+		ChStorageId id;
+		Bitmapset  *plain;
+		Bitmapset  *now;
+
+		if (!RelationIsValid(rel))
+			continue;
+		/*
+		 * Read without a lock -- one weaker than the command's own, taken
+		 * first, would deadlock two of them -- and read again under it
+		 */
+		if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind) || !ch_is_engine_rel(rel, NULL))
+		{
+			RelationClose(rel);
+			continue;
+		}
+		ch_storage_id(rel, &rel->rd_locator, &id);
+		plain = ch_table_row_plain(&id);
+		now = ch_plain_columns(RelationGetDescr(rel));
+		RelationClose(rel);
+		if (bms_is_subset(plain, now))
+			continue;
+
+		LockRelationOid(child, AccessExclusiveLock);
+		rel = relation_open(child, NoLock);
+		ch_storage_id(rel, &rel->rd_locator, &id);
+		plain = bms_intersect(ch_table_row_plain(&id), ch_plain_columns(RelationGetDescr(rel)));
+		ch_table_row_set_plain(&id, plain);
+		CacheInvalidateRelcache(rel);
+		relation_close(rel, NoLock);
+	}
+}
+
+/*
+ * After an ALTER TABLE: a column it added NOT NULL is plain in the storage
+ * the column was added to (VC11), since no part of it holds the column; a
+ * relation of natts attributes before.  A rewrite made new storage with
+ * them already.
+ */
+void
+ch_plain_grow(Oid relid, int natts)
+{
+	Relation	rel = RelationIdGetRelation(relid);
+	ChStorageId id;
+	Bitmapset  *plain;
+	Bitmapset  *now;
+	Bitmapset  *added = NULL;
+	int			i = -1;
+
+	/*
+	 * Read without a lock: a relation the command added no column to -- a
+	 * partition beside the one ATTACH PARTITION takes -- it may not have
+	 * locked; one it added columns to, it holds
+	 */
+	if (!RelationIsValid(rel))
+		return;
+	if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind) || !ch_is_engine_rel(rel, NULL) ||
+		RelationGetNumberOfAttributes(rel) <= natts)
+	{
+		RelationClose(rel);
+		return;
+	}
+	RelationClose(rel);
+	rel = relation_open(relid, NoLock);
+	ch_storage_id(rel, &rel->rd_locator, &id);
+	plain = ch_table_row_plain(&id);
+	now = ch_plain_columns(RelationGetDescr(rel));
+	while ((i = bms_next_member(now, i)) >= 0)
+		if (i > natts && !bms_is_member(i, plain))
+			added = bms_add_member(added, i);
+	if (added != NULL)
+	{
+		ch_table_row_set_plain(&id, bms_union(plain, added));
+		CacheInvalidateRelcache(rel);
+	}
+	relation_close(rel, NoLock);
 }

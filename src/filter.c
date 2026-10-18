@@ -600,6 +600,13 @@ minmax_type(const ChColumn *col)
 		 typid == DATEOID || typid == TIMEOID || typid == TIMESTAMPOID || typid == TIMESTAMPTZOID);
 }
 
+/* Whether a part's statistics keep a column's least and greatest values */
+bool
+ch_column_minmax_kept(const ChColumn *col)
+{
+	return minmax_type(col);
+}
+
 bool
 ch_part_minmax(ChTable *t, const ChPart *part, AttrNumber attnum, bool *has_values,
 			   Datum *min, Datum *max, int64 *nulls)
