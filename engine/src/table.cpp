@@ -23,6 +23,8 @@
 #include <Storages/Statistics/Statistics.h>
 #include <Storages/StorageInMemoryMetadata.h>
 
+#include <base/scope_guard.h>
+
 namespace DB::MergeTreeSetting
 {
     extern const MergeTreeSettingsString auto_statistics_types;
@@ -165,6 +167,32 @@ void PgMergeTree::unsupported(const char * what)
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} is done by PostgreSQL, not by the engine", what);
 }
 
+namespace
+{
+
+/// The table whose part this thread is loading, for getInMemoryMetadataPtr()
+thread_local const PgMergeTree * loading_part_of = nullptr;
+
+}
+
+StorageMetadataHandle PgMergeTree::getInMemoryMetadataPtr(ContextPtr query_context, bool bypass_metadata_cache) const
+{
+    StorageMetadataHandle handle = MergeTreeData::getInMemoryMetadataPtr(query_context, bypass_metadata_cache);
+    if (loading_part_of != this)
+        return handle;
+    StorageMetadataPtr metadata = handle;
+    if (metadata->projections.empty())
+        return handle;
+    if (without_projections_of != metadata)
+    {
+        auto copy = std::make_shared<StorageInMemoryMetadata>(*metadata);
+        copy->projections = ProjectionsDescription{};
+        without_projections = std::move(copy);
+        without_projections_of = metadata;
+    }
+    return without_projections;
+}
+
 MergeTreeData::MutableDataPartPtr PgMergeTree::loadPart(const String & part_name) const
 {
     auto info = MergeTreePartInfo::fromPartName(part_name, format_version);
@@ -174,25 +202,45 @@ MergeTreeData::MutableDataPartPtr PgMergeTree::loadPart(const String & part_name
         .withPartInfo(info)
         .withPartFormatFromDisk()
         .build();
-    /// a read finds a missing or short file as it reads it, as a checksum's mismatch
+    /// a read finds a missing or short file as it reads it, as a checksum's mismatch; the projections
+    /// as they are first needed (partWithProjections), the row id's a part of its own to load
+    loading_part_of = this;
+    SCOPE_EXIT({ loading_part_of = nullptr; });
     part->loadColumnsChecksumsIndexes(/* require_columns_checksums= */ true, /* check_consistency= */ false);
     part->setState(DataPartState::Active);
     return part;
 }
 
-MergeTreeData::DataPartPtr PgMergeTree::getPart(const String & part_name) const
+PgMergeTree::LoadedPart & PgMergeTree::loadedPart(const String & part_name) const
 {
     auto it = parts.find(part_name);
-    if (it != parts.end())
-        return it->second;
-    DataPartPtr part = loadPart(part_name);
-    parts.emplace(part_name, part);
-    return part;
+    if (it == parts.end())
+        it = parts.emplace(part_name, LoadedPart{loadPart(part_name), false, {}}).first;
+    return it->second;
+}
+
+MergeTreeData::DataPartPtr PgMergeTree::getPart(const String & part_name) const
+{
+    return loadedPart(part_name).part;
+}
+
+MergeTreeData::DataPartPtr PgMergeTree::partWithProjections(const String & part_name) const
+{
+    auto & loaded = loadedPart(part_name);
+    if (!loaded.projections)
+    {
+        /// as loadColumnsChecksumsIndexes() loads them: one that fails to load kept as broken
+        bool broken = false;
+        loaded.part->loadProjections(/* require_columns_checksums= */ true, /* check_consistency= */ false, broken,
+                                     /* if_not_loaded= */ true);
+        loaded.projections = true;
+    }
+    return loaded.part;
 }
 
 MergeTreeData::DataPartPtr PgMergeTree::checkedPart(const String & part_name) const
 {
-    DataPartPtr part = getPart(part_name);
+    DataPartPtr part = partWithProjections(part_name);
     part->checkConsistencyWithProjections(/* require_part_metadata= */ true);
     return part;
 }
@@ -201,6 +249,54 @@ void PgMergeTree::forgetPart(const String & part_name) const
 {
     parts.erase(part_name);
     estimates.erase(part_name);
+}
+
+namespace
+{
+
+/// A column's bytes in a part: its streams' files in the part's checksums, as
+/// MergeTreeDataPartWide::getColumnSizeImpl adds them up.  A compact part's, whose columns share one
+/// file, and a column's of dynamic subcolumns, as ClickHouse has them.
+ColumnSize columnSize(const IMergeTreeDataPart & part, const String & name)
+{
+    const auto & checksums = part.checksums;
+    auto column = part.tryGetColumn(name);
+    if (part.getType() != MergeTreeDataPartType::Wide || !column || column->type->hasDynamicSubcolumns() || checksums.empty())
+        return part.getColumnSize(name);
+    ColumnSize size;
+    String marks = part.getMarksFileExtension();
+    auto settings = part.storage.getSettings();
+    part.getSerialization(name)->enumerateStreams([&](const ISerialization::SubstreamPath & path)
+    {
+        auto stream = IMergeTreeDataPart::getStreamNameForColumn(*column, path, IMergeTreeDataPart::DATA_FILE_EXTENSION,
+                                                                 checksums, settings);
+        if (!stream)
+            return;
+        if (auto it = checksums.files.find(*stream + IMergeTreeDataPart::DATA_FILE_EXTENSION); it != checksums.files.end())
+        {
+            size.data_compressed += it->second.file_size;
+            size.data_uncompressed += it->second.uncompressed_size;
+        }
+        if (auto it = checksums.files.find(*stream + marks); it != checksums.files.end())
+            size.marks += it->second.file_size;
+    }, column->type, part.getColumnSample(*column));
+    return size;
+}
+
+}
+
+ColumnSize PgMergeTree::columnsSize(const String & part_name, const Names & columns) const
+{
+    auto & loaded = loadedPart(part_name);
+    ColumnSize total;
+    for (const auto & name : columns)
+    {
+        auto it = loaded.column_sizes.find(name);
+        if (it == loaded.column_sizes.end())
+            it = loaded.column_sizes.emplace(name, columnSize(*loaded.part, name)).first;
+        total.add(it->second);
+    }
+    return total;
 }
 
 Estimates PgMergeTree::partEstimates(const DataPartPtr & part, const Names & columns) const
@@ -403,10 +499,7 @@ extern "C" int chte_pages_attach(chte_table * table, const char * part_name, con
         auto & storage = *table->storage;
         if (!storage.pages_disk)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} is not a table of the pages store", storage.getStorageID().getTableName());
-        std::map<String, PagesDisk::File> map;
-        for (size_t i = 0; i < nfiles; ++i)
-            map[files[i].path] = PagesDisk::File{files[i].size, files[i].first_block, files[i].nblocks};
-        storage.pages_disk->attachPart(fs::path(storage.getRelativeDataPath()) / part_name, std::move(map));
+        storage.pages_disk->attachPart(fs::path(storage.getRelativeDataPath()) / part_name, files, nfiles);
     });
 }
 

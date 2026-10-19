@@ -34,6 +34,14 @@ SELECT count(*) < 10 AS fewer_parts FROM ch.parts('m_mt');
 SELECT same_rows();
 SELECT count(*) AS moved FROM m_mt JOIN m_tids USING (a) WHERE m_mt.ctid <> m_tids.tid;
 SELECT max(level) > 0 AS merged_level FROM ch.parts('m_mt');
+-- each part has its row ids' projection, the merged ones too, though the
+-- index build read the inputs without theirs: a part's projections are loaded
+-- as a search by row id or a merge first needs them (VC20) -- in its manifest
+-- in the pages store, in its directory in the files store
+SELECT bool_and(CASE WHEN manifest IS NOT NULL
+                     THEN position(convert_to('_pg_rowid_index.proj/', 'UTF8') IN manifest) > 0
+                     ELSE '_pg_rowid_index.proj' IN (SELECT pg_ls_dir(:'dbdir' || '/ch_' || relfilenumber || '/' || name)) END) AS projections
+  FROM ch.parts WHERE relfilenumber = pg_relation_filenode('m_mt');
 -- the index's entries find them, and a fetch by TID
 SET enable_seqscan = off;
 SET ch.enable_chscan = off;
@@ -100,7 +108,11 @@ CREATE TABLE m_files (a int) USING mergetree WITH (storage = 'files');
 INSERT INTO m_files SELECT generate_series(1, 100);
 INSERT INTO m_files SELECT generate_series(101, 200);
 INSERT INTO m_files SELECT generate_series(201, 300);
+SELECT sum(a) FROM m_files WHERE a % 2 = 0;
 SELECT ch.optimize('m_files', true) AS merged;
+SELECT count(*) AS projections FROM ch.parts('m_files') p,
+  LATERAL pg_ls_dir(:'dbdir' || '/ch_' || pg_relation_filenode('m_files') || '/' || p.name) f
+  WHERE f = '_pg_rowid_index.proj';
 SELECT count(*) AS directories FROM pg_ls_dir(:'dbdir' || '/ch_' || pg_relation_filenode('m_files')) d
   WHERE d LIKE 'all\_%';
 VACUUM ch.parts;

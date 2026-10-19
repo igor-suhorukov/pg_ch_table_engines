@@ -364,15 +364,9 @@ extern "C" int chte_part_column_bytes(chte_table * table, const char * part_name
 {
     return guarded(error, [&]
     {
-        auto part = table->storage->getPart(part_name);
-        *compressed = 0;
-        *uncompressed = 0;
-        for (const auto & name : splitNames(columns))
-        {
-            auto size = part->getColumnSize(name);
-            *compressed += size.data_compressed;
-            *uncompressed += size.data_uncompressed;
-        }
+        auto size = table->storage->columnsSize(part_name, splitNames(columns));
+        *compressed = size.data_compressed;
+        *uncompressed = size.data_uncompressed;
     });
 }
 

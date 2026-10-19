@@ -57,9 +57,14 @@ public:
         UInt32 nblocks;
     };
 
+    /// A directory's entries: names, a trailing '/' for a subdirectory, in order.
+    using Entries = std::shared_ptr<const std::vector<String>>;
+
     PagesDisk(const String & name_, const String & path_, const chte_pages_ops & ops_);
 
-    void attachPart(const String & part_dir, std::map<String, File> files);
+    /// A part's files, by their paths below its directory as its manifest has them; each directory's
+    /// entries listed here, once a part, not at each listing of the directory (VC20).
+    void attachPart(const String & part_dir, const chte_page_file * part_files, size_t nfiles);
     void detachPart(const String & part_dir);
     void readPage(UInt32 block, char * dst) const;
     UInt32 pagePayload() const { return ops.page_payload; }
@@ -102,17 +107,17 @@ public:
 private:
     bool hasLocal(const String & path) const;
     const File * findFile(const String & path) const;
-    /// The entries of a directory of a part in pages: names, a trailing '/' for a subdirectory.
-    std::vector<String> entries(const String & dir) const;
+    /// The entries of a directory of a part in pages; none where it is not one.
+    Entries entries(const String & dir) const;
     /// VC18: whether a path is a directory in memory or below one; the entries of one
     bool inMemory(const String & path) const;
     String memoryKey(const String & path) const;
     std::vector<String> memoryEntries(const String & dir) const;
 
     chte_pages_ops ops;
-    /// full relative path of each file of the parts in pages, and their directories
+    /// full relative path of each file of the parts in pages, and their directories' entries
     std::map<String, File> files;
-    std::set<String> dirs;
+    std::map<String, Entries> dirs;
 
     bool memory_writes = false;
     mutable std::mutex memory_mutex;
@@ -218,20 +223,30 @@ public:
 
     /// Part object for an existing directory under the table's path: what a read of it needs
     /// (VC12), without the check of every file's size against its checksums, which a merge and a
-    /// rewrite, reading every file, make (checkedPart).
+    /// rewrite, reading every file, make (checkedPart), and without its projections, which only a
+    /// search by row id, a merge and a rewrite read (VC20).
     MutableDataPartPtr loadPart(const String & part_name) const;
 
     /// A committed part, loaded once: a part's directory never changes once committed, and
     /// its name is never reused in a table's storage.  The pages store's files are attached
     /// before a part is first loaded.
     DataPartPtr getPart(const String & part_name) const;
+    /// The same, its projections loaded (VC20): a search by row id's.
+    DataPartPtr partWithProjections(const String & part_name) const;
     /// The same, its files checked against its checksums, as ClickHouse checks a part it loads.
     DataPartPtr checkedPart(const String & part_name) const;
     void forgetPart(const String & part_name) const;
 
+    /// While this process loads a part of the table, the table's metadata without its projections,
+    /// so that IMergeTreeDataPart::loadProjections() finds none to load (VC20).
+    StorageMetadataHandle getInMemoryMetadataPtr(ContextPtr query_context, bool bypass_metadata_cache) const override;
+
     /// A part's statistics of the named columns, loaded once a column (VC12), where ClickHouse's
     /// getEstimates() loads every column's.  A column without statistics is not in the result.
     Estimates partEstimates(const DataPartPtr & part, const Names & columns) const;
+    /// A part's bytes of the named columns, each column's worked out once (VC20), where a part's first
+    /// getColumnSize() works out every column's (calculateColumnsSizesOnDisk).
+    ColumnSize columnsSize(const String & part_name, const Names & columns) const;
 
     MergeTreeDataWriter writer;
     MergeTreeDataMergerMutator merger;
@@ -265,7 +280,17 @@ public:
 private:
     [[noreturn]] static void unsupported(const char * what);
 
-    mutable std::map<String, DataPartPtr> parts;
+    struct LoadedPart
+    {
+        MutableDataPartPtr part;
+        bool projections = false;    /// its projections loaded
+        std::map<String, ColumnSize> column_sizes;    /// columnsSize()'s, so far
+    };
+    mutable std::map<String, LoadedPart> parts;
+    LoadedPart & loadedPart(const String & part_name) const;
+    /// the metadata loadPart() loads a part by, and the table's metadata it is a copy of
+    mutable StorageMetadataPtr without_projections;
+    mutable StorageMetadataPtr without_projections_of;
     /// per part, each column's statistics asked for so far: nullopt where it has none
     mutable std::map<String, std::map<String, std::optional<Estimate>>> estimates;
 };
