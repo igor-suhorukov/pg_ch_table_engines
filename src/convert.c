@@ -19,6 +19,7 @@
 #include "access/tupmacs.h"
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
+#include "lib/stringinfo.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
@@ -375,6 +376,13 @@ ch_builder_rows(ChVectorBuilder *b)
 	return b->nrows;
 }
 
+/* The builder's columns, the row id's among them: a writer's, in this order */
+int
+ch_builder_ncolumns(ChVectorBuilder *b)
+{
+	return b->ncols;
+}
+
 Size
 ch_builder_bytes(ChVectorBuilder *b)
 {
@@ -414,7 +422,16 @@ ch_builder_rowid(ChVectorBuilder *b, uint32 row)
 bool
 ch_builder_fetch(ChVectorBuilder *b, uint32 row, TupleTableSlot *slot)
 {
-	chte_vector *vectors = ch_builder_vectors(b);
+	return ch_builder_fetch_vectors(b, ch_builder_vectors(b), row, slot);
+}
+
+/*
+ * A row of vectors in the builder's column order -- its own, or a writer's
+ * (VC18) -- into a slot, as ch_builder_fetch() makes it
+ */
+bool
+ch_builder_fetch_vectors(ChVectorBuilder *b, const chte_vector *vectors, uint32 row, TupleTableSlot *slot)
+{
 	MemoryContext old;
 
 	ExecClearTuple(slot);
@@ -596,6 +613,116 @@ append_fixed(ChVectorBuilder *b, BuilderColumn *bc, const VexecColumn *vc, uint3
 			if (!column_valid(vc, i))
 				memset(dst + (Size) i * width, 0, width);
 	bc->values.len += (Size) nrows * width;
+}
+
+/*
+ * VC18: a sink's batch -- nrows rows of the relation's attributes, a column
+ * each in the layout the sink took it in (vexec.c) -- and their row ids, as
+ * the engine library takes them into ClickHouse's columns
+ * (chte_write_columns()), in the builder's column order: the values, and
+ * text's offsets, where the batch holds them, read by the library alone; a
+ * collapsing sign narrowed to Int8 and a varlena that is not text made
+ * bytes and offsets in cxt, as ch_builder_add_columns() makes them.
+ * Returns the bytes they hold, as the builder counts its own.
+ */
+Size
+ch_builder_columns_in(ChVectorBuilder *b, const VexecColumn *columns, uint32 nrows, const uint64 *rowids,
+					  MemoryContext cxt, chte_column_in *out)
+{
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	Size		bytes = 0;
+
+	for (int c = 0; c < b->ncols; c++)
+	{
+		const ChColumn *col = b->cols[c].col;
+		chte_column_in *in = &out[c];
+		const VexecColumn *vc;
+
+		memset(in, 0, sizeof(chte_column_in));
+		if (b->attnums[c] < 0)
+		{
+			in->values = rowids;
+			in->width = in->stride = sizeof(uint64);
+			bytes += sizeof(uint64) * nrows;
+			continue;
+		}
+		vc = &columns[b->attnums[c]];
+		in->validity = vc->validity;
+		bytes += nrows;			/* a null map's byte a row */
+		switch (col->kind)
+		{
+			case CH_COL_FIXED:
+			case CH_COL_NUMERIC:
+				in->values = vc->values;
+				in->width = (uint32) vc->width;
+				in->stride = (uint32) vc->stride;
+				bytes += (Size) col->width * nrows;
+				break;
+			case CH_COL_SIGN:
+				{
+					int8	   *signs = palloc(Max(nrows, 1));
+
+					for (uint32 i = 0; i < nrows; i++)
+					{
+						const char *p = (const char *) vc->values + (Size) i * vc->stride;
+						int64		v = 0;
+
+						if (column_valid(vc, i))
+							v = vc->width == 2 ? *(const int16 *) p : vc->width == 4 ? *(const int32 *) p :
+								*(const int64 *) p;
+						if (v < PG_INT8_MIN || v > PG_INT8_MAX)
+							ereport(ERROR,
+									(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+									 errmsg("sign value " INT64_FORMAT " is out of range", v),
+									 errhint("A collapsing engine's sign is 1 or -1.")));
+						signs[i] = (int8) v;
+					}
+					in->values = signs;
+					in->width = in->stride = 1;
+					bytes += nrows;
+				}
+				break;
+			case CH_COL_VARLENA:
+				if (vc->layout == VEXEC_OFFSETS)
+				{
+					const int32 *off = vc->values;
+
+					in->values = vc->buffers[0];
+					in->offsets32 = off;
+					bytes += (Size) (off[nrows] - off[0]) + sizeof(uint64) * nrows;
+				}
+				else
+				{
+					/* DATUM: headered values, never external or compressed (vexec_sink.h) */
+					const Datum *datums = vc->values;
+					uint64	   *offsets = palloc(sizeof(uint64) * (nrows + 1));
+					StringInfoData data;
+
+					initStringInfo(&data);
+					offsets[0] = 0;
+					for (uint32 i = 0; i < nrows; i++)
+					{
+						if (column_valid(vc, i))
+						{
+							struct varlena *v = (struct varlena *) DatumGetPointer(datums[i]);
+
+							appendBinaryStringInfo(&data, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v));
+						}
+						offsets[i + 1] = data.len;
+					}
+					in->values = data.data;
+					in->offsets64 = offsets;
+					bytes += data.len + sizeof(uint64) * nrows;
+				}
+				break;
+			case CH_COL_CSTRING:
+			case CH_COL_DROPPED:
+				elog(ERROR, "a column of kind %d cannot be taken from a batch", (int) col->kind);
+				break;
+		}
+	}
+	MemoryContextSwitchTo(old);
+	return bytes;
 }
 
 /*

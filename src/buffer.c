@@ -16,6 +16,16 @@
  *	  Each row gets its row id, its TID, as it enters: from a range taken
  *	  from the storage's counter, in chunks that grow to the buffer's limit.
  *
+ *	  vexec's sink's batches go straight into the engine library's writer
+ *	  where it takes them (VC18): ClickHouse's columns filled from the
+ *	  batch's own arrays, the buffer holding only their row ids -- where the
+ *	  rows of tuple_insert are copied into the builder's buffers, and from
+ *	  them into ClickHouse's columns as the part is made.  A buffer holds
+ *	  rows of one of the two kinds at a time: a row of the other makes the
+ *	  part first.  A pages-store part is written into memory, where the
+ *	  library can, and copied into its pages from there, with no temporary
+ *	  files.
+ *
  * SPDX-License-Identifier: Apache-2.0
  *
  *-------------------------------------------------------------------------
@@ -33,6 +43,7 @@
 #include "utils/snapmgr.h"
 
 #include "chte.h"
+#include "vexec/vexec_sink.h"
 
 typedef struct ChBuffer
 {
@@ -43,6 +54,15 @@ typedef struct ChBuffer
 	MemoryContext cxt;
 	ChTable    *table;			/* pinned: the builder points into it */
 	ChVectorBuilder *builder;
+	/* VC18: a sink's rows, in the library's writer; their row ids, ascending */
+	chte_writer *writer;
+	ResourceOwner writer_owner;
+	uint32		wrows;
+	Size		wbytes;
+	uint64	   *wrowids;
+	uint32		wcap;
+	uint32		reserve_rows;	/* the rows of a part made at the limits: the next writer's room */
+	MemoryContext batch_cxt;	/* a batch's conversions (ch_builder_columns_in()) */
 	uint64		next_rowid;		/* the taken range, [next_rowid, end_rowid) */
 	uint64		end_rowid;
 	uint64		chunk;			/* the next range's size */
@@ -67,10 +87,38 @@ find_buffer(Oid relid)
 	return NULL;
 }
 
+/* The buffer's writer of a sink's rows closed, its rows gone with it */
+static void
+close_writer(ChBuffer *b)
+{
+	if (b->writer == NULL)
+		return;
+	ch_handle_closing(b->writer_owner, CH_HANDLE_WRITER, b->writer);
+	ch_engine()->write_close(b->writer);
+	b->writer = NULL;
+	b->wrows = 0;
+	b->wbytes = 0;
+}
+
+/* The buffer's rows, of either kind */
+static uint32
+buffered_rows(ChBuffer *b)
+{
+	return b->writer != NULL ? b->wrows : ch_builder_rows(b->builder);
+}
+
+/* The row id of buffered row i, of either kind */
+static uint64
+buffer_rowid(ChBuffer *b, uint32 i)
+{
+	return b->writer != NULL ? b->wrowids[i] : ch_builder_rowid(b->builder, i);
+}
+
 static void
 drop_buffer(ChBuffer *b)
 {
 	buffers = list_delete_ptr(buffers, b);
+	close_writer(b);
 	ch_table_unpin(b->table);
 	MemoryContextDelete(b->cxt);
 	pfree(b);
@@ -120,15 +168,21 @@ flush(ChBuffer *b)
 	const ChEngine *eng;
 	Relation	rel;
 	ChTable    *table;
-	uint32		nrows = ch_builder_rows(b->builder);
+	uint32		nrows = buffered_rows(b);
+	bool		sink = b->writer != NULL;
 	uint64		block;
 	uint64		ignored;
 	chte_writer *writer;
 	size_t		nparts;
 	ResourceOwner owner;
+	uint64		last_rowid;
 
+	b->reserve_rows = 0;
 	if (nrows == 0)
+	{
+		close_writer(b);
 		return;
+	}
 
 	eng = ch_engine();
 	rel = relation_open(b->relid, NoLock);
@@ -136,12 +190,28 @@ flush(ChBuffer *b)
 	wait_for_merges(rel, b);
 	ch_counters_allocate(&b->storage, 0, 1, &ignored, &block);
 
-	owner = ch_handle_reserve();
-	CH_CALL("starting a part", eng->write_begin(table->handle, block, &writer, CH_ERR));
-	ch_handle_opened(owner, CH_HANDLE_WRITER, writer);
+	if (sink)
+	{
+		/* VC18: the sink's rows, in the writer since its first batch, numbered now */
+		writer = b->writer;
+		owner = b->writer_owner;
+		last_rowid = b->wrowids[nrows - 1];
+		CH_CALL("writing a part", eng->write_block(writer, block, CH_ERR));
+	}
+	else
+	{
+		last_rowid = ch_builder_rowid(b->builder, nrows - 1);
+		owner = ch_handle_reserve();
+		CH_CALL("starting a part", eng->write_begin(table->handle, block, &writer, CH_ERR));
+		ch_handle_opened(owner, CH_HANDLE_WRITER, writer);
+	}
 	PG_TRY();
 	{
-		CH_CALL("writing a part", eng->write_batch(writer, nrows, ch_builder_vectors(b->builder), CH_ERR));
+		if (!sink)
+			CH_CALL("writing a part", eng->write_batch(writer, nrows, ch_builder_vectors(b->builder), CH_ERR));
+		/* VC18: a pages-store part into memory, for its pages, where the library can */
+		if (table->options.storage == CH_STORAGE_PAGES && eng->write_in_memory != NULL && ch_enable_memory_parts)
+			CH_CALL("writing a part", eng->write_in_memory(writer, CH_ERR));
 		CH_CALL("writing a part", eng->write_finish(writer, &nparts, CH_ERR));
 		for (size_t i = 0; i < nparts; i++)
 		{
@@ -155,15 +225,27 @@ flush(ChBuffer *b)
 			part.rows = info.rows;
 			part.bytes = info.bytes_on_disk;
 			part.min_rowid = b->first_rowid;
-			part.max_rowid = ch_builder_rowid(b->builder, nrows - 1);
+			part.max_rowid = last_rowid;
 			part.level = info.level;
 			part.marks = (int32) info.marks;
 			part.manifest = NULL;
 			part.created = 0;
 			if (table->options.storage == CH_STORAGE_PAGES)
 			{
-				/* the pages store copies the part into pages, and inserts its row; its directory goes with the writer */
-				ch_pages_store_part(rel, table, tmp_dir, &part, b->cid);
+				const chte_part_file *files = NULL;
+				size_t		nfiles = 0;
+
+				/*
+				 * the pages store copies the part into pages -- from memory, where
+				 * the library wrote it there -- and inserts its row; its
+				 * directory goes with the writer
+				 */
+				if (eng->write_part_files != NULL)
+					CH_CALL("writing a part", eng->write_part_files(writer, i, &files, &nfiles, CH_ERR));
+				if (nfiles > 0)
+					ch_pages_store_part_files(rel, table, files, nfiles, &part, b->cid);
+				else
+					ch_pages_store_part(rel, table, tmp_dir, &part, b->cid);
 				ch_pages_attach(table, &part);
 			}
 			else
@@ -185,6 +267,12 @@ flush(ChBuffer *b)
 	PG_END_TRY();
 	ch_handle_closing(owner, CH_HANDLE_WRITER, writer);
 	eng->write_close(writer);
+	if (sink)
+	{
+		b->writer = NULL;
+		b->wrows = 0;
+		b->wbytes = 0;
+	}
 
 	relation_close(rel, NoLock);
 	ch_builder_reset(b->builder);
@@ -223,6 +311,7 @@ buffer_for(Relation rel, CommandId cid)
 		b->table = ch_table_for_storage(rel, &storage);
 		ch_table_pin(b->table);
 		b->builder = ch_builder_create(b->table, b->cxt);
+		b->batch_cxt = AllocSetContextCreate(b->cxt, "ch write buffer batch", ALLOCSET_SMALL_SIZES);
 		b->chunk = 1024;
 		buffers = lappend(buffers, b);
 		MemoryContextSwitchTo(old);
@@ -248,19 +337,38 @@ take_rowid(ChBuffer *b)
 	return rowid;
 }
 
-/* At the buffer's limits its rows become a part */
+/*
+ * At the buffer's limits its rows become a part; more are coming, as many,
+ * which the next writer makes room for (VC18)
+ */
 static void
 check_limits(ChBuffer *b)
 {
-	if (ch_builder_rows(b->builder) >= (uint32) ch_insert_buffer_rows ||
-		ch_builder_bytes(b->builder) >= (Size) ch_insert_buffer_bytes * 1024)
+	uint32		nrows = buffered_rows(b);
+
+	if (nrows >= (uint32) ch_insert_buffer_rows ||
+		(b->writer != NULL ? b->wbytes : ch_builder_bytes(b->builder)) >= (Size) ch_insert_buffer_bytes * 1024)
+	{
 		flush(b);
+		b->reserve_rows = nrows;
+	}
+}
+
+/* The buffer of (rel, cid), for a row of tuple_insert: a sink's rows made a part first */
+static ChBuffer *
+buffer_for_row(Relation rel, CommandId cid)
+{
+	ChBuffer   *b = buffer_for(rel, cid);
+
+	if (b->writer != NULL)
+		flush(b);
+	return b;
 }
 
 void
 ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 {
-	ChBuffer   *b = buffer_for(rel, cid);
+	ChBuffer   *b = buffer_for_row(rel, cid);
 	uint64		rowid = take_rowid(b);
 
 	if (ch_builder_rows(b->builder) == 0)
@@ -279,13 +387,13 @@ ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 uint64
 ch_buffer_reserve_rowid(Relation rel, CommandId cid)
 {
-	return take_rowid(buffer_for(rel, cid));
+	return take_rowid(buffer_for_row(rel, cid));
 }
 
 void
 ch_buffer_insert_rowid(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid)
 {
-	ChBuffer   *b = buffer_for(rel, cid);
+	ChBuffer   *b = buffer_for_row(rel, cid);
 
 	if (ch_builder_rows(b->builder) == 0)
 		b->first_rowid = rowid;
@@ -296,29 +404,77 @@ ch_buffer_insert_rowid(Relation rel, TupleTableSlot *slot, CommandId cid, uint64
 }
 
 /*
- * A batch of rows by column, from vexec's sink (vexec.c): the buffer of
- * (rel, cid), the batch's row ids taken in rowids[], its builder for the
- * caller to append the rows to; ch_buffer_batch_done() after.
+ * A batch of rows by column, from vexec's sink (vexec.c), into the buffer of
+ * (rel, cid), the batch's row ids taken in rowids[]: straight into the
+ * library's writer, opened at the buffer's first batch, where it takes them
+ * so (VC18) -- else appended to the builder, as rows are.
  */
-ChVectorBuilder *
-ch_buffer_batch_begin(Relation rel, CommandId cid, uint32 nrows, uint64 *rowids)
+void
+ch_buffer_put_columns(Relation rel, CommandId cid, const VexecColumn *columns, uint32 nrows, uint64 *rowids)
 {
 	ChBuffer   *b = buffer_for(rel, cid);
+	const ChEngine *eng = ch_engine();
+	chte_column_in *in;
 
+	if (eng->write_columns == NULL || !ch_enable_sink_columns)
+	{
+		if (b->writer != NULL)
+			flush(b);
+		for (uint32 i = 0; i < nrows; i++)
+			rowids[i] = take_rowid(b);
+		if (nrows > 0 && ch_builder_rows(b->builder) == 0)
+			b->first_rowid = rowids[0];
+		ch_builder_add_columns(b->builder, columns, nrows, rowids);
+		check_limits(b);
+		return;
+	}
+	if (ch_builder_rows(b->builder) > 0)
+		flush(b);
+	if (b->writer == NULL)
+	{
+		/*
+		 * the transaction's, not the statement's: a buffer outlives the
+		 * statement whose rows it took until it is made a part
+		 */
+		ResourceOwner save = CurrentResourceOwner;
+
+		if (TopTransactionResourceOwner != NULL)
+			CurrentResourceOwner = TopTransactionResourceOwner;
+		PG_TRY();
+		{
+			b->writer_owner = ch_handle_reserve();
+			CH_CALL("starting a part", eng->write_begin(b->table->handle, 0, &b->writer, CH_ERR));
+			ch_handle_opened(b->writer_owner, CH_HANDLE_WRITER, b->writer);
+			if (b->reserve_rows > 0)
+				CH_CALL("starting a part", eng->write_reserve(b->writer, b->reserve_rows, CH_ERR));
+		}
+		PG_FINALLY();
+		{
+			CurrentResourceOwner = save;
+		}
+		PG_END_TRY();
+		b->wrows = 0;
+		b->wbytes = 0;
+	}
 	for (uint32 i = 0; i < nrows; i++)
 		rowids[i] = take_rowid(b);
-	if (nrows > 0 && ch_builder_rows(b->builder) == 0)
+	if (nrows > 0 && b->wrows == 0)
 		b->first_rowid = rowids[0];
-	return b->builder;
-}
+	in = MemoryContextAlloc(b->batch_cxt, sizeof(chte_column_in) * ch_builder_ncolumns(b->builder));
+	b->wbytes += ch_builder_columns_in(b->builder, columns, nrows, rowids, b->batch_cxt, in);
+	CH_CALL("writing a part", eng->write_columns(b->writer, nrows, in, CH_ERR));
+	MemoryContextReset(b->batch_cxt);
+	if (b->wrows + nrows > b->wcap)
+	{
+		uint32		cap = Max(b->wcap * 2, Max(b->wrows + nrows, 1024));
 
-void
-ch_buffer_batch_done(Relation rel)
-{
-	ChBuffer   *b = find_buffer(RelationGetRelid(rel));
-
-	if (b)
-		check_limits(b);
+		b->wrowids = b->wrowids ? repalloc_huge(b->wrowids, sizeof(uint64) * cap) :
+			MemoryContextAllocHuge(b->cxt, sizeof(uint64) * cap);
+		b->wcap = cap;
+	}
+	memcpy(b->wrowids + b->wrows, rowids, sizeof(uint64) * nrows);
+	b->wrows += nrows;
+	check_limits(b);
 }
 
 void
@@ -336,7 +492,7 @@ ch_buffer_flush_for_scan(Relation rel, Snapshot snapshot)
 {
 	ChBuffer   *b = find_buffer(RelationGetRelid(rel));
 
-	if (b == NULL || ch_builder_rows(b->builder) == 0)
+	if (b == NULL || buffered_rows(b) == 0)
 		return;
 	if (snapshot == NULL || !IsMVCCSnapshot(snapshot) || snapshot->curcid > b->cid)
 		flush(b);
@@ -370,12 +526,12 @@ ch_buffer_fetch(Relation rel, uint64 rowid, Snapshot snapshot, TupleTableSlot *s
 	uint32		nrows;
 	uint64		first;
 
-	if (b == NULL || (nrows = ch_builder_rows(b->builder)) == 0)
+	if (b == NULL || (nrows = buffered_rows(b)) == 0)
 		return false;
 	if (snapshot && IsMVCCSnapshot(snapshot) && snapshot->curcid <= b->cid)
 		return false;
 	first = b->first_rowid;
-	if (rowid < first || rowid > ch_builder_rowid(b->builder, nrows - 1))
+	if (rowid < first || rowid > buffer_rowid(b, nrows - 1))
 		return false;
 	/* row ids of a buffer ascend with its rows, gaps allowed between ranges */
 	{
@@ -385,16 +541,29 @@ ch_buffer_fetch(Relation rel, uint64 rowid, Snapshot snapshot, TupleTableSlot *s
 		while (lo < hi)
 		{
 			uint32		mid = lo + (hi - lo) / 2;
-			uint64		v = ch_builder_rowid(b->builder, mid);
+			uint64		v = buffer_rowid(b, mid);
 
 			if (v < rowid)
 				lo = mid + 1;
 			else
 				hi = mid;
 		}
-		if (lo < nrows && ch_builder_rowid(b->builder, lo) == rowid)
+		if (lo < nrows && buffer_rowid(b, lo) == rowid)
 		{
-			ch_builder_fetch(b->builder, lo, slot);
+			if (b->writer != NULL)
+			{
+				/* VC18: the row from the writer's columns */
+				int			n = ch_builder_ncolumns(b->builder);
+				chte_vector *vectors = palloc(sizeof(chte_vector) * n);
+
+				for (int c = 0; c < n; c++)
+					CH_CALL("reading a buffered row",
+							ch_engine()->write_vector(b->writer, (uint32) c, &vectors[c], CH_ERR));
+				ch_builder_fetch_vectors(b->builder, vectors, lo, slot);
+				pfree(vectors);
+			}
+			else
+				ch_builder_fetch(b->builder, lo, slot);
 			ItemPointerSet(&slot->tts_tid, CH_ROWID_TO_BLOCK(rowid), CH_ROWID_TO_OFFSET(rowid));
 			slot->tts_tableOid = RelationGetRelid(rel);
 			return true;

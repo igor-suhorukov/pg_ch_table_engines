@@ -54,11 +54,16 @@
  *	  fetch.c), which fetch_columns() makes a fetch into a slot read alone.
  *	  ordering() (minor 4, VC4) is the table's key, as far as its parts,
  *	  read one after another in the key's order, keep it -- one part, or
- *	  parts whose ranges of its first column are apart.
+ *	  parts whose ranges of its first column are apart.  A scan begun with
+ *	  VEXEC_SRC_STEPS (minor 5, VC2) reads its first step's columns with
+ *	  each granule and a later step's only where next_rest() asks for it,
+ *	  the engine library leaving the granules no batch asked it for
+ *	  undecoded (scan.c).
  *
  *	  The sink.  VecInsert's batches go into the write buffer (buffer.c) by
- *	  column, in the layouts ClickHouse's columns have, as rows of the same
- *	  command id: FIXED for fixed-width types, BYTE_BOOL for bool, SCALED
+ *	  column -- straight into the engine library's writer where it takes
+ *	  them so (VC18) -- in the layouts ClickHouse's columns have, as rows of
+ *	  the same command id: FIXED for fixed-width types, BYTE_BOOL for bool, SCALED
  *	  for numeric(p, s), OFFSETS for text, varchar, bpchar and bytea, DATUM
  *	  for any other varlena; a cstring column takes no batch.  Each row gets
  *	  its row id, its TID, as a row through tuple_insert gets it, and the
@@ -147,6 +152,9 @@ typedef struct SrcOut
 	bool		retained;
 	chte_batch *keep;
 	ResourceOwner keep_owner;
+	uint32		pos;			/* its rows of the library's batch */
+	uint32		n;
+	uint32		steps_handed;	/* VC2: a bit a step handed */
 } SrcOut;
 
 typedef struct SrcState
@@ -173,6 +181,9 @@ typedef struct SrcState
 	/* VEXEC_SRC_ORDERED: the key's attributes this scan hands its rows in the order of (VC4) */
 	int			norder;
 	AttrNumber *order;
+	/* VEXEC_SRC_STEPS (VC2): the steps, and each column's; 0, every column with next() */
+	int			nsteps;
+	int		   *col_step;
 } SrcState;
 
 static uint64 null_row = 0;		/* a constant's validity: its one value NULL */
@@ -349,6 +360,26 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 
 			st->norder = level == 2 ? k : level == 1 ? 1 : 0;
 		}
+	}
+	/*
+	 * VC2: the columns in the spec's steps, where the library reads steps --
+	 * else every one with next(), next_rest() handing nothing more
+	 */
+	if ((flags & VEXEC_SRC_STEPS) &&
+		spec->size >= offsetof(VexecSourceSpec, step_ends) + sizeof(spec->step_ends) &&
+		spec->nsteps >= 2 && spec->nsteps <= VEXEC_SRC_MAX_STEPS && n == spec->ncolumns)
+	{
+		int			step = 0;
+
+		st->col_step = palloc0(sizeof(int) * Max(n, 1));
+		for (int i = 0; i < n; i++)
+		{
+			while (step < spec->nsteps - 1 && i >= spec->step_ends[step])
+				step++;
+			st->col_step[i] = step;
+		}
+		if (ch_scan_set_steps(scan, st->col_step, spec->nsteps))
+			st->nsteps = spec->nsteps;
 	}
 	if (spec->quals != NIL)
 		(void) ch_scan_set_filter(scan, spec->quals);
@@ -851,8 +882,13 @@ src_next(void *arg, VexecSourceBatch *out_batch)
 	returned = n;
 	st->pos += n;
 	out = next_out(st);
+	out->pos = pos;
+	out->n = n;
+	out->steps_handed = 1;
+	/* VC2: the first step's columns; a later step's come from next_rest() */
 	for (int i = 0; i < st->ncols; i++)
-		fill_column(st, out, i, pos, n);
+		if (st->nsteps == 0 || st->col_step[i] == 0)
+			fill_column(st, out, i, pos, n);
 	if (st->tids)
 	{
 		const uint64 *ids = (const uint64 *) st->batch.vectors[st->rowid_col].values + pos;
@@ -888,6 +924,42 @@ src_next(void *arg, VexecSourceBatch *out_batch)
 	return true;
 }
 
+/*
+ * VC2: step `step`'s columns of a batch, read from the library's batch -- a
+ * granule -- where no batch of it asked for them before
+ */
+static void
+hand_step(SrcState *st, SrcOut *out, int step)
+{
+	if (out->steps_handed & (1U << step))
+		return;
+	ch_scan_read_step(st->scan, step, &st->batch);
+	for (int i = 0; i < st->ncols; i++)
+		if (st->col_step[i] == step)
+			fill_column(st, out, i, out->pos, out->n);
+	out->steps_handed |= 1U << step;
+}
+
+/*
+ * next_rest() (minor 5, VC2): a later step's columns of the batch next()
+ * handed last.  The library decodes a granule's columns of a step where a
+ * batch of it first asks for them, for every row of it; the rows vexec
+ * selects need not be looked at.
+ */
+static void
+src_next_rest(void *arg, VexecSourceBatch *batch, int step, const uint64 *selected)
+{
+	SrcState   *st = arg;
+	SrcOut	   *out = batch->owner;
+
+	if (st->nsteps == 0)
+		return;					/* every column came with next() */
+	if (out != st->out || !st->have_batch || step < 1 || step >= st->nsteps)
+		elog(ERROR, "the batch source of the ClickHouse engines was asked for step %d of a batch it no longer holds",
+			 step);
+	hand_step(st, out, step);
+}
+
 static void
 src_retain(void *arg, void *owner)
 {
@@ -896,6 +968,10 @@ src_retain(void *arg, void *owner)
 
 	if (out->retained)
 		return;
+	/* VC2: the library's batch kept with every step, so that no later step is read into another */
+	if (st->nsteps > 0 && out == st->out && st->have_batch)
+		for (int step = 1; step < st->nsteps; step++)
+			hand_step(st, out, step);
 	out->retained = true;
 	for (int i = 0; i < st->ncols; i++)
 		if (out->dicts[i])
@@ -1250,7 +1326,6 @@ static void
 sink_put(void *state, VexecSinkBatch *batch)
 {
 	SinkState  *st = state;
-	ChVectorBuilder *builder;
 
 	CHECK_FOR_INTERRUPTS();
 	if (batch->nrows <= 0)
@@ -1261,13 +1336,12 @@ sink_put(void *state, VexecSinkBatch *batch)
 			palloc(sizeof(uint64) * batch->nrows);
 		st->cap = batch->nrows;
 	}
-	builder = ch_buffer_batch_begin(st->rel, st->cid, batch->nrows, st->rowids);
-	ch_builder_add_columns(builder, batch->columns, batch->nrows, st->rowids);
+	/* VC18: into the library's writer where it takes the batch's columns so */
+	ch_buffer_put_columns(st->rel, st->cid, batch->columns, batch->nrows, st->rowids);
 	if (st->tids && batch->tids)
 		for (int i = 0; i < batch->nrows; i++)
 			ItemPointerSet(&batch->tids[i], CH_ROWID_TO_BLOCK(st->rowids[i]), CH_ROWID_TO_OFFSET(st->rowids[i]));
 	pgstat_count_heap_insert(st->rel, batch->nrows);
-	ch_buffer_batch_done(st->rel);
 }
 
 /* The statement's end makes the part, as for its rows through tuple_insert (module.c) */
@@ -1313,6 +1387,7 @@ ch_vexec_register(void)
 		r->estimate_ex = src_estimate_ex;
 		r->fetch_columns = src_fetch_columns;
 		r->ordering = src_ordering;
+		r->next_rest = src_next_rest;
 		vexec_register_source(r);
 
 		memset(s, 0, sizeof(VexecSinkRoutine));

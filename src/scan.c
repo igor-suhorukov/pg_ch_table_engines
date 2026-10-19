@@ -42,6 +42,11 @@
  *	  where their ranges of its first column are apart, and so hand its rows
  *	  in that order (VC4).
  *
+ *	  vexec's source may read its columns in steps (VC2): each granule's
+ *	  first step's columns -- the row ids among them -- as it comes, and a
+ *	  later step's only where the source asks, the engine library leaving
+ *	  the granules it is not asked for undecoded (chte_read_begin_steps).
+ *
  * SPDX-License-Identifier: Apache-2.0
  *
  *-------------------------------------------------------------------------
@@ -112,6 +117,9 @@ typedef struct ChScanDescData
 	bool	   *missing;		/* per column read: not in the current part */
 	bool	   *keep_dict;		/* per column read: handed as its dictionary (VC5), or NULL */
 	chte_dictionary *dicts;		/* per column read: the batch's dictionary, where encoded */
+	int			nsteps;			/* VC2: the steps they are read in; 0, all at once */
+	uint8	   *col_step;		/* per column read: its step, the row id's 0 */
+	uint8	   *step_read;		/* per step: read of the current batch */
 	bool		all_columns;	/* every column and the row id, as getnextslot reads */
 	chte_filter *filter;		/* NULL: every granule */
 	ResourceOwner filter_owner;
@@ -516,9 +524,22 @@ begin_reader(ChScanDesc scan)
 		scan->rowid_col = scan->ncols;
 	}
 	scan->reader_owner = ch_handle_reserve();
-	CH_CALL("reading a part",
-			eng->read_begin(scan->table->handle, scan->part->name, columns,
-							scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader, CH_ERR));
+	if (scan->nsteps > 0)
+	{
+		/* VC2: each column's step, the row id the reader adds in the first */
+		uint8	   *steps = palloc0(scan->ncols + 1);
+
+		memcpy(steps, scan->col_step, scan->ncols);
+		CH_CALL("reading a part",
+				eng->read_begin_steps(scan->table->handle, scan->part->name, columns, steps,
+									  scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader,
+									  CH_ERR));
+		pfree(steps);
+	}
+	else
+		CH_CALL("reading a part",
+				eng->read_begin(scan->table->handle, scan->part->name, columns,
+								scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader, CH_ERR));
 	ch_handle_opened(scan->reader_owner, CH_HANDLE_READER, scan->reader);
 	/* a part written before a column was added has none: its rows take the column's missing value */
 	for (int c = 0; c < scan->ncols; c++)
@@ -533,6 +554,21 @@ begin_reader(ChScanDesc scan)
 		CH_CALL("reading a part", eng->read_keep_dictionaries(scan->reader, keep, scan->ncols + 1, CH_ERR));
 		pfree(keep);
 	}
+}
+
+/* Column c of the reader's current batch: its vector, or its dictionary where kept */
+static void
+read_column(ChScanDesc scan, int c)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (c < scan->ncols && scan->keep_dict && scan->keep_dict[c])
+	{
+		CH_CALL("reading a part", eng->read_dictionary(scan->reader, c, &scan->dicts[c], CH_ERR));
+		if (scan->dicts[c].encoded)
+			return;
+	}
+	CH_CALL("reading a part", eng->read_vector(scan->reader, c, &scan->vectors[c], CH_ERR));
 }
 
 /* The next batch, from this unit or the next; false at the end */
@@ -555,13 +591,15 @@ next_batch(ChScanDesc scan)
 				MemoryContextReset(scan->batch_cxt);
 				for (int c = 0; c < nvec; c++)
 				{
-					if (c < scan->ncols && scan->keep_dict && scan->keep_dict[c])
-					{
-						CH_CALL("reading a part", eng->read_dictionary(scan->reader, c, &scan->dicts[c], CH_ERR));
-						if (scan->dicts[c].encoded)
-							continue;
-					}
-					CH_CALL("reading a part", eng->read_vector(scan->reader, c, &scan->vectors[c], CH_ERR));
+					/* VC2: a later step's columns are read where it is asked for */
+					if (c < scan->ncols && scan->nsteps > 0 && scan->col_step[c] > 0)
+						continue;
+					read_column(scan, c);
+				}
+				if (scan->nsteps > 0)
+				{
+					memset(scan->step_read, 0, scan->nsteps);
+					scan->step_read[0] = 1;
 				}
 				scan->nrows = n;
 				scan->row = 0;
@@ -620,8 +658,15 @@ set_columns(ChScanDesc scan, int n, const int *attnos)
 		pfree(scan->keep_dict);
 	if (scan->dicts)
 		pfree(scan->dicts);
+	if (scan->col_step)
+		pfree(scan->col_step);
+	if (scan->step_read)
+		pfree(scan->step_read);
 	scan->keep_dict = NULL;
 	scan->dicts = NULL;
+	scan->nsteps = 0;
+	scan->col_step = NULL;
+	scan->step_read = NULL;
 	scan->ncols = n;
 	scan->attnos = palloc(sizeof(int) * Max(n, 1));
 	scan->vectors = palloc0(sizeof(chte_vector) * (n + 1));
@@ -859,6 +904,10 @@ ch_scan_end(TableScanDesc sscan)
 		pfree(scan->keep_dict);
 	if (scan->dicts)
 		pfree(scan->dicts);
+	if (scan->col_step)
+		pfree(scan->col_step);
+	if (scan->step_read)
+		pfree(scan->step_read);
 	pfree(scan);
 }
 
@@ -1012,6 +1061,51 @@ ch_scan_set_dictionaries(TableScanDesc sscan, const bool *keep)
 			scan->table->columns[scan->attnos[c]].low_cardinality;
 	MemoryContextSwitchTo(old);
 	return true;
+}
+
+/*
+ * VC2: before the first batch, after the columns -- and their dictionaries
+ * -- the step each attribute set is in, step_of[i] (0 the first, below
+ * nsteps), read in steps: each batch the first step's columns and the row
+ * ids, ch_scan_read_step() a later one's of the batch.  False where the
+ * engine library reads no step: every column is then read with each batch.
+ */
+bool
+ch_scan_set_steps(TableScanDesc sscan, const int *step_of, int nsteps)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	MemoryContext old;
+	int			i = 0;
+
+	Assert(scan->part == NULL);
+	if (ch_engine()->read_begin_steps == NULL || nsteps < 2 || scan->all_columns)
+		return false;
+	old = MemoryContextSwitchTo(scan->scan_cxt);
+	scan->col_step = palloc0(Max(scan->ncols, 1));
+	scan->step_read = palloc0(nsteps);
+	for (int c = 0; c < scan->ncols; c++)
+		scan->col_step[c] = c == scan->asked_rowid ? 0 : (uint8) step_of[i++];
+	scan->nsteps = nsteps;
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
+/* VC2: step `step`'s columns of the batch ch_scan_next_batch() handed last, into it */
+void
+ch_scan_read_step(TableScanDesc sscan, int step, ChScanBatch *batch)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	Assert(scan->reader != NULL && step > 0 && step < scan->nsteps);
+	if (scan->step_read[step])
+		return;
+	CH_CALL("reading a part", ch_engine()->read_step(scan->reader, (uint32) step, CH_ERR));
+	for (int c = 0; c < scan->ncols; c++)
+		if (scan->col_step[c] == step)
+			read_column(scan, c);
+	scan->step_read[step] = 1;
+	batch->vectors = scan->vectors;
+	batch->dicts = scan->keep_dict ? scan->dicts : NULL;
 }
 
 bool

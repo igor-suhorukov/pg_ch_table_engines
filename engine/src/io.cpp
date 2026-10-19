@@ -19,10 +19,15 @@
 #include <QueryPipeline/QueryPipeline.h>
 #include <Storages/MergeTree/Compaction/CompactionStatistics.h>
 #include <Storages/MergeTree/FutureMergedMutatedPart.h>
+#include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MergeTask.h>
+#include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
+#include <Storages/MergeTree/MergeTreeIOSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
+
+#include <base/scope_guard.h>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
@@ -163,8 +168,7 @@ extern "C" int chte_write_begin(chte_table * table, uint64_t block_number, chte_
 {
     return guarded(error, [&]
     {
-        if (block_number == 0)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "block numbers start at 1");
+        /// block 0: numbered by chte_write_block before chte_write_finish (VC18)
         /// a part's writing -- its sort, statistics and projections -- looks up functions of its own
         registerAllFunctions();
         auto w = std::make_unique<chte_writer>();
@@ -187,6 +191,205 @@ extern "C" int chte_write_batch(chte_writer * writer, uint32_t nrows, const chte
     });
 }
 
+namespace
+{
+
+inline bool validAt(const uint64_t * validity, size_t i)
+{
+    return validity == nullptr || ((validity[i / 64] >> (i % 64)) & 1);
+}
+
+/// nrows values of a column of vexec's layouts (chte_column_in) appended to a ClickHouse column, read
+/// once: a NULL row's value the type's default, as appendVector makes it (VC18).
+void appendIn(IColumn & column, uint32_t nrows, const chte_column_in & in)
+{
+    if (auto * nullable = typeid_cast<ColumnNullable *>(&column))
+    {
+        auto & map = nullable->getNullMapData();
+        size_t old = map.size();
+        map.resize(old + nrows);
+        for (uint32_t i = 0; i < nrows; ++i)
+            map[old + i] = validAt(in.validity, i) ? 0 : 1;
+        appendIn(nullable->getNestedColumn(), nrows, in);
+        return;
+    }
+    if (auto * low_cardinality = typeid_cast<ColumnLowCardinality *>(&column))
+    {
+        auto full = low_cardinality->getDictionary().getNestedColumn()->cloneEmpty();
+        appendIn(*full, nrows, in);
+        low_cardinality->insertRangeFromFullColumn(*full, 0, nrows);
+        return;
+    }
+    if (auto * strings = typeid_cast<ColumnString *>(&column))
+    {
+        auto & chars = strings->getChars();
+        auto & offsets = strings->getOffsets();
+        const auto * bytes = static_cast<const UInt8 *>(in.values);
+        size_t base = chars.size();
+        offsets.reserve(offsets.size() + nrows);
+        if (in.offsets32)
+        {
+            int32_t first = in.offsets32[0];
+            chars.insert(bytes + first, bytes + in.offsets32[nrows]);
+            for (uint32_t i = 0; i < nrows; ++i)
+                offsets.push_back(base + static_cast<size_t>(in.offsets32[i + 1] - first));
+        }
+        else if (in.offsets64)
+        {
+            uint64_t first = in.offsets64[0];
+            chars.insert(bytes + first, bytes + in.offsets64[nrows]);
+            for (uint32_t i = 0; i < nrows; ++i)
+                offsets.push_back(base + (in.offsets64[i + 1] - first));
+        }
+        else
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "a String column needs offsets");
+        return;
+    }
+    if (column.isFixedAndContiguous())
+    {
+        size_t width = column.sizeOfValueIfFixed();
+        size_t old = column.size();
+        const auto * src = static_cast<const char *>(in.values);
+        column.insertManyDefaults(nrows);
+        /// the defaults just inserted are the column's own buffer: overwritten in place
+        char * dst = const_cast<char *>(column.getRawData().data()) + old * width;
+        if (in.width == width && in.stride == width)
+            memcpy(dst, src, nrows * width);
+        else if (in.width == width)
+            for (uint32_t i = 0; i < nrows; ++i)
+                memcpy(dst + i * width, src + static_cast<size_t>(i) * in.stride, width);
+        else if (in.width == 8 && width == 4)
+        {
+            /// a Decimal32's values, scaled as int64
+            for (uint32_t i = 0; i < nrows; ++i)
+            {
+                Int64 v;
+                memcpy(&v, src + static_cast<size_t>(i) * in.stride, sizeof(v));
+                Int32 narrow = static_cast<Int32>(v);
+                memcpy(dst + i * width, &narrow, sizeof(narrow));
+            }
+        }
+        else
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "values of {} bytes for a column of type {}", in.width, column.getName());
+        if (in.validity)
+            for (uint32_t i = 0; i < nrows; ++i)
+                if (!validAt(in.validity, i))
+                    memset(dst + i * width, 0, width);
+        return;
+    }
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "columns of type {} are not supported yet", column.getName());
+}
+
+}
+
+extern "C" int chte_write_columns(chte_writer * writer, uint32_t nrows, const chte_column_in * columns, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (writer->finished)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_write_columns after chte_write_finish");
+        for (size_t i = 0; i < writer->columns.size(); ++i)
+            appendIn(*writer->columns[i], nrows, columns[i]);
+    });
+}
+
+extern "C" int chte_write_block(chte_writer * writer, uint64_t block_number, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (block_number == 0 || writer->finished)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_write_block: block {} of a writer {}finished", block_number,
+                            writer->finished ? "" : "not ");
+        writer->block_number = block_number;
+    });
+}
+
+namespace
+{
+
+/// A column's string chars, below Nullable and LowCardinality, or null
+ColumnString::Chars * charsOf(IColumn & column)
+{
+    IColumn * c = &column;
+    if (auto * nullable = typeid_cast<ColumnNullable *>(c))
+        c = &nullable->getNestedColumn();
+    if (auto * strings = typeid_cast<ColumnString *>(c))
+        return &strings->getChars();
+    return nullptr;
+}
+
+}
+
+extern "C" int chte_write_reserve(chte_writer * writer, uint64_t nrows, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (writer->finished)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_write_reserve after chte_write_finish");
+        const auto & per_row = writer->table->last_bytes_per_row;
+        for (size_t i = 0; i < writer->columns.size(); ++i)
+        {
+            auto & column = *writer->columns[i];
+            if (column.size() != 0 || typeid_cast<ColumnLowCardinality *>(&column))
+                continue;
+            column.reserve(nrows);
+            if (auto * chars = charsOf(column); chars && i < per_row.size())
+                chars->reserve(static_cast<size_t>(per_row[i] * static_cast<double>(nrows) * 1.05));
+        }
+    });
+}
+
+extern "C" int chte_write_vector(chte_writer * writer, uint32_t column, chte_vector * vector, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (column >= writer->columns.size() || writer->finished)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_write_vector: no column {}", column);
+        const IColumn & c = *writer->columns[column];
+        if (!typeid_cast<const ColumnLowCardinality *>(&c))
+        {
+            *vector = vectorOf(c);
+            return;
+        }
+        /// its values made full once for the rows it holds now
+        writer->full_columns.resize(writer->columns.size());
+        auto & full = writer->full_columns[column];
+        if (!full.first || full.second != c.size())
+            full = {c.convertToFullColumnIfLowCardinality(), c.size()};
+        *vector = vectorOf(*full.first);
+    });
+}
+
+extern "C" int chte_write_in_memory(chte_writer * writer, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (writer->finished || !writer->table->storage->pages_disk)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_write_in_memory: a writer of the pages store, before its parts");
+        writer->in_memory = true;
+    });
+}
+
+extern "C" int chte_write_part_files(chte_writer * writer, size_t i, const chte_part_file ** files, size_t * nfiles,
+                                     chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (i >= writer->parts.size())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "no part {}", i);
+        *files = nullptr;
+        *nfiles = 0;
+        if (!writer->in_memory || i >= writer->part_files.size())
+            return;
+        auto & pf = writer->part_files[i];
+        pf.listed.clear();
+        for (const auto & [path, data] : pf.files)
+            pf.listed.push_back(chte_part_file{path.c_str(), data->data(), data->size()});
+        *files = pf.listed.data();
+        *nfiles = pf.listed.size();
+    });
+}
+
 namespace chte
 {
 
@@ -195,11 +398,27 @@ void writeParts(chte_writer & writer, ContextPtr context)
 {
     if (writer.finished)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "a writer's parts written twice");
+    if (writer.block_number == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "block numbers start at 1");
     writer.finished = true;
     auto & table = *writer.table;
     auto & storage = *table.storage;
+    /// the strings' bytes a row, for the next writer's room (chte_write_reserve)
+    if (!writer.columns.empty() && writer.columns[0]->size() > 0)
+    {
+        double rows = static_cast<double>(writer.columns[0]->size());
+        table.last_bytes_per_row.assign(writer.columns.size(), 0);
+        for (size_t i = 0; i < writer.columns.size(); ++i)
+            if (auto * chars = charsOf(*writer.columns[i]))
+                table.last_bytes_per_row[i] = static_cast<double>(chars->size()) / rows;
+    }
     Block block = writer.header.cloneWithColumns(std::move(writer.columns));
     auto blocks = MergeTreeDataWriter::splitBlockIntoParts(std::move(block), /* max_parts= */ 0, table.metadata, context);
+    /// VC18: the pages store's parts into memory, for the caller to copy into pages
+    auto * pages_disk = writer.in_memory ? storage.pages_disk.get() : nullptr;
+    SCOPE_EXIT({ if (pages_disk) pages_disk->setMemoryWrites(false); });
+    if (pages_disk)
+        pages_disk->setMemoryWrites(true);
     for (auto & part_block : blocks)
     {
         checkInterrupted();
@@ -211,6 +430,13 @@ void writeParts(chte_writer & writer, ContextPtr context)
             continue;
         temp->finalize();
         temp->part->getDataPartStorage().commitTransaction();
+        if (pages_disk)
+        {
+            chte_writer::PartFiles pf;
+            for (auto & [path, data] : pages_disk->memoryFiles(temp->part->getDataPartStorage().getRelativePath()))
+                pf.files.emplace_back(path, data);
+            writer.part_files.push_back(std::move(pf));
+        }
         writer.parts.push_back(std::move(temp));
     }
 }
@@ -379,11 +605,191 @@ extern "C" int chte_read_begin(chte_table * table, const char * part_name, const
     });
 }
 
+namespace chte
+{
+
+/// A column of a read as the caller takes it: no wrapper, and LowCardinality kept only where
+/// chte_read_keep_dictionaries asked for it (chte_read_next).
+static ColumnPtr handedColumn(const chte_reader & reader, ColumnPtr column, size_t c)
+{
+    column = column->convertToFullIfWrapped();
+    if (c >= reader.keep_dictionary.size() || !reader.keep_dictionary[c])
+        column = column->convertToFullColumnIfLowCardinality();
+    return column;
+}
+
+/// The chain that reads a step's columns from granule `mark` on, to the end of its run: the step's
+/// reader -- its files open, its buffers -- kept, its stream begun anew, so that the first read seeks.
+static void restartStep(chte_reader & reader, ReadStep & step)
+{
+    auto & main = step.readers.main;
+    MergeTreeRangeReader range_reader(main.get(), {}, nullptr, reader.counters, true, main->canReadIncompleteGranules());
+    std::vector<MergeTreeRangeReader> range_readers;
+    range_readers.push_back(std::move(range_reader));
+    step.chain.emplace(std::move(range_readers), MergeTreePatchReaders{});
+    step.next_mark.reset();
+}
+
+/// Step `s`'s columns of the granule chte_read_next read last into the reader's columns: the
+/// step's stream read on where it stands at the granule, else begun there, as ClickHouse's
+/// PREWHERE reads a later step's columns of the granules its filter left rows in.
+static void readStep(chte_reader & reader, size_t s)
+{
+    auto & step = reader.steps[s];
+    size_t mark = *reader.granule;
+    MarkRanges ranges;
+    if (!step.chain || step.next_mark != mark)
+    {
+        restartStep(reader, step);
+        ranges.push_back(MarkRange(mark, reader.granule_run_end));
+    }
+    std::vector<MarkRanges> patch_ranges;
+    auto result = step.chain->read(reader.granule_rows, ranges, patch_ranges);
+    if (result.num_rows != reader.granule_rows)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "step {} read {} rows of granule {}, its first step {}", s,
+                        result.num_rows, mark, reader.granule_rows);
+    if (mark + 1 < reader.granule_run_end)
+        step.next_mark = mark + 1;
+    else
+        step.next_mark.reset();
+    const auto & header = step.chain->getSampleBlock();
+    for (size_t i = 0; i < step.names.size(); ++i)
+    {
+        size_t c = step.columns[i];
+        reader.columns[c] = handedColumn(reader, result.columns[header.getPositionByName(step.names[i])], c);
+    }
+    reader.step_read[s] = 1;
+}
+
+/// The next granule of a reader in steps, its first step's columns read: false at the end.
+static bool nextGranule(chte_reader & reader)
+{
+    while (reader.range_at < reader.step_ranges.size() && reader.mark_at >= reader.step_ranges[reader.range_at].end)
+    {
+        ++reader.range_at;
+        if (reader.range_at < reader.step_ranges.size())
+            reader.mark_at = reader.step_ranges[reader.range_at].begin;
+    }
+    if (reader.range_at >= reader.step_ranges.size())
+        return false;
+    const auto & part_info = *reader.steps[0].info->data_part_info;
+    reader.granule = reader.mark_at;
+    reader.granule_rows = part_info.getIndexGranularity().getMarkRows(reader.mark_at);
+    reader.granule_run_end = reader.step_ranges[reader.range_at].end;
+    ++reader.mark_at;
+    reader.columns.assign(reader.present.size(), nullptr);
+    std::fill(reader.step_read.begin(), reader.step_read.end(), 0);
+    readStep(reader, 0);
+    return true;
+}
+
+}
+
+extern "C" int chte_read_begin_steps(chte_table * table, const char * part_name, const char * columns, const uint8_t * steps,
+                                     const chte_mark_range * ranges, size_t nranges, chte_reader ** reader, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & storage = *table->storage;
+        Names names = columnNames(columns);
+        MergeTreeData::DataPartPtr part = storage.getPart(part_name);
+        size_t marks = part->index_granularity->getMarksCountWithoutFinal();
+        size_t nsteps = 0;
+
+        for (size_t c = 0; c < names.size(); ++c)
+            nsteps = std::max<size_t>(nsteps, steps[c] + 1);
+
+        auto r = std::make_unique<chte_reader>();
+        r->table = table;
+        for (const auto & name : names)
+            r->present.push_back(!table->metadata->getColumns().hasPhysical(name) || part->getColumnPosition(name).has_value());
+        if (nranges > 0)
+        {
+            for (size_t i = 0; i < nranges; ++i)
+            {
+                if (ranges[i].begin >= ranges[i].end || ranges[i].end > marks || (i > 0 && ranges[i].begin < ranges[i - 1].end))
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_read_begin_steps: marks [{}, {}) are not a range of part {} in order",
+                                    ranges[i].begin, ranges[i].end, part_name);
+                r->step_ranges.push_back(MarkRange(ranges[i].begin, ranges[i].end));
+            }
+        }
+        else if (marks > 0)
+            r->step_ranges.push_back(MarkRange(0, marks));
+        r->mark_at = r->step_ranges.empty() ? 0 : r->step_ranges.front().begin;
+
+        /// each step's reader as a merge's sequential source makes its own (MergeTreeSequentialSource.cpp)
+        auto snapshot = storage.getStorageSnapshot(table->metadata, table->context);
+        auto mutations = storage.getMutationsSnapshot({});
+        auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table->context);
+        if (alter_conversions->hasPatches() || alter_conversions->hasLightweightDelete() || part->hasLightweightDelete())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "chte_read_begin_steps: part {} has patches or a lightweight delete", part_name);
+        ReadSettings read_settings = storage.getContext()->getReadSettings();
+        read_settings.local_fs_settings.method = LocalFSReadMethod::pread;
+        r->mark_cache = storage.getContext()->getMarkCache();
+        r->counters = std::make_shared<ReadStepPerformanceCounters>();
+        MergeTreeReadTask::Extras extras =
+        {
+            .mark_cache = r->mark_cache.get(),
+            .patch_join_cache = nullptr,
+            .reader_settings = MergeTreeReaderSettings::createForMergeMutation(std::move(read_settings)),
+            .storage_snapshot = snapshot,
+        };
+
+        r->steps.resize(nsteps);
+        for (size_t c = 0; c < names.size(); ++c)
+        {
+            r->steps[steps[c]].names.push_back(names[c]);
+            r->steps[steps[c]].columns.push_back(c);
+        }
+        for (size_t s = 0; s < nsteps; ++s)
+        {
+            auto & step = r->steps[s];
+            if (step.names.empty())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_read_begin_steps: no column of step {}", s);
+            auto info = std::make_shared<MergeTreeReadTaskInfo>();
+            info->alter_conversions = alter_conversions;
+            info->data_part_info = std::make_shared<LoadedMergeTreeDataPartInfoForReader>(part, info->alter_conversions);
+            info->const_virtual_fields.emplace("_part_index", static_cast<UInt64>(0));
+            info->const_virtual_fields.emplace("_part_starting_offset", static_cast<UInt64>(0));
+            info->const_virtual_fields.emplace("_sample_factor", 1.0);
+            info->task_columns = getReadTaskColumnsForMerge(*info->data_part_info, snapshot, step.names, info->mutation_steps);
+            info->task_columns.moveAllColumnsFromPrewhere();
+            step.info = info;
+            step.readers = MergeTreeReadTask::createReaders(info, extras, r->step_ranges, {});
+        }
+        r->step_read.assign(nsteps, 0);
+        *reader = r.release();
+    });
+}
+
+extern "C" int chte_read_step(chte_reader * reader, uint32_t step, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (reader->steps.empty() || step >= reader->steps.size() || !reader->granule)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_read_step: no step {} of a granule to read", step);
+        if (!reader->step_read[step])
+            readStep(*reader, step);
+    });
+}
+
 extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error * error)
 {
     return guarded(error, [&]
     {
         *nrows = 0;
+        if (!reader->steps.empty())
+        {
+            checkInterrupted();
+            if (nextGranule(*reader))
+                *nrows = static_cast<uint32_t>(reader->granule_rows);
+            else
+            {
+                reader->columns.clear();
+                reader->granule.reset();
+            }
+            return;
+        }
         reader->columns.clear();
         Block block;
         while (reader->pull(block))
@@ -392,14 +798,9 @@ extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error
             if (block.rows() == 0)
                 continue;
             Columns columns;
+            /// a column chte_read_keep_dictionaries keeps stays LowCardinality, for chte_read_dictionary
             for (size_t c = 0; c < block.columns(); ++c)
-            {
-                ColumnPtr column = block.getByPosition(c).column->convertToFullIfWrapped();
-                /// a column chte_read_keep_dictionaries keeps stays LowCardinality, for chte_read_dictionary
-                if (c >= reader->keep_dictionary.size() || !reader->keep_dictionary[c])
-                    column = column->convertToFullColumnIfLowCardinality();
-                columns.push_back(std::move(column));
-            }
+                columns.push_back(handedColumn(*reader, block.getByPosition(c).column, c));
             size_t rows = block.rows();
             if (reader->by_offset)
             {
@@ -438,6 +839,8 @@ extern "C" int chte_read_vector(chte_reader * reader, uint32_t i, chte_vector * 
     {
         if (i >= reader->columns.size())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "no column {}", i);
+        if (!reader->columns[i])
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "column {} of a step not read", i);
         *vector = vectorOf(*reader->columns[i]);
     });
 }
@@ -465,6 +868,8 @@ extern "C" int chte_read_dictionary(chte_reader * reader, uint32_t i, chte_dicti
     {
         if (i >= reader->columns.size())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "no column {}", i);
+        if (!reader->columns[i])
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "column {} of a step not read", i);
         *dictionary = {};
         const auto * low_cardinality = typeid_cast<const ColumnLowCardinality *>(reader->columns[i].get());
         if (!low_cardinality)

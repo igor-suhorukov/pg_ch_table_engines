@@ -62,6 +62,14 @@ extern void ch_scan_set_columns(TableScanDesc scan, int n, const AttrNumber *att
 extern bool ch_scan_set_filter(TableScanDesc scan, List *quals);
 
 extern bool ch_scan_set_dictionaries(TableScanDesc scan, const bool *keep);
+
+/*
+ * VC2: before the first batch, the attributes set read in steps, step_of[i]
+ * each's (0 the first, the row id's); false where they cannot be.  A batch then holds the first
+ * step's columns, and ch_scan_read_step() reads a later one's of it.
+ */
+extern bool ch_scan_set_steps(TableScanDesc scan, const int *step_of, int nsteps);
+extern void ch_scan_read_step(TableScanDesc scan, int step, ChScanBatch *batch);
 extern bool ch_scan_next_batch(TableScanDesc scan, ChScanBatch *batch);
 
 /*

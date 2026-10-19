@@ -243,6 +243,37 @@ ch_engine(void)
 	/* optional: a library built before VC12 registers every function in chte_init */
 	*(void **) &engine.register_all_functions = dlsym(handle, "chte_register_all_functions");
 	*(void **) &engine.function_count = dlsym(handle, "chte_function_count");
+	/* optional: a library built before VC2 reads no step, its columns all at once */
+	*(void **) &engine.read_begin_steps = dlsym(handle, "chte_read_begin_steps");
+	*(void **) &engine.read_step = dlsym(handle, "chte_read_step");
+	if (engine.read_begin_steps == NULL || engine.read_step == NULL)
+	{
+		engine.read_begin_steps = NULL;
+		engine.read_step = NULL;
+	}
+	/*
+	 * optional: a library built before VC18 takes a sink's rows through
+	 * chte_write_batch, and writes a pages-store part into files first
+	 */
+	*(void **) &engine.write_columns = dlsym(handle, "chte_write_columns");
+	*(void **) &engine.write_block = dlsym(handle, "chte_write_block");
+	*(void **) &engine.write_vector = dlsym(handle, "chte_write_vector");
+	*(void **) &engine.write_reserve = dlsym(handle, "chte_write_reserve");
+	if (engine.write_columns == NULL || engine.write_block == NULL || engine.write_vector == NULL ||
+		engine.write_reserve == NULL)
+	{
+		engine.write_columns = NULL;
+		engine.write_block = NULL;
+		engine.write_vector = NULL;
+		engine.write_reserve = NULL;
+	}
+	*(void **) &engine.write_in_memory = dlsym(handle, "chte_write_in_memory");
+	*(void **) &engine.write_part_files = dlsym(handle, "chte_write_part_files");
+	if (engine.write_in_memory == NULL || engine.write_part_files == NULL)
+	{
+		engine.write_in_memory = NULL;
+		engine.write_part_files = NULL;
+	}
 
 	memset(&options, 0, sizeof(options));
 	options.abi_version = CHTE_ABI_VERSION;
