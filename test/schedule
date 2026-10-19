@@ -10,6 +10,7 @@ test: ddl
 test: notnull
 test: scans
 test: chscan
+test: summaries
 test: dictionaries
 test: dml
 test: indexes
@@ -21,4 +22,4 @@ test: engine
 test: store
 nopreload: nopreload
 # again with the files store as the default (§2.9): the tests whose answers do not name a store
-files: setup types insert visibility ddl notnull scans chscan dictionaries dml indexes fetch merge discard functions
+files: setup types insert visibility ddl notnull scans chscan summaries dictionaries dml indexes fetch merge discard functions

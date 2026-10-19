@@ -38,7 +38,9 @@ CREATE TABLE ch.parts (
 	level			integer NOT NULL,
 	marks			integer NOT NULL,	-- its granules
 	manifest		bytea,				-- the pages store's: each file's pages; NULL in the files store
-	created			timestamptz NOT NULL	-- when it was written: its age for the merge selector
+	created			timestamptz NOT NULL,	-- when it was written: its age for the merge selector
+	summary			bytea				-- its columns' bytes and statistics, the engine library's: the
+										-- planner's without loading the part; NULL where none was kept
 ) USING heap;
 CREATE UNIQUE INDEX parts_storage_name ON ch.parts (tablespace, relfilenumber, backend, name);
 
@@ -66,6 +68,10 @@ CREATE UNIQUE INDEX parts_unlogged_storage_name ON ch.parts_unlogged (tablespace
 -- under the default thresholds.
 ALTER TABLE ch.parts SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
 ALTER TABLE ch.parts_unlogged SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
+-- A part's summary, read at every planning, stays in its row, compressed, where
+-- the row's other values leave it room: no TOAST fetch for it.
+ALTER TABLE ch.parts ALTER COLUMN summary SET STORAGE MAIN;
+ALTER TABLE ch.parts_unlogged ALTER COLUMN summary SET STORAGE MAIN;
 CREATE UNLOGGED TABLE ch.tombstones_unlogged (LIKE ch.tombstones) USING heap;
 CREATE INDEX tombstones_unlogged_storage_rowid ON ch.tombstones_unlogged (tablespace, relfilenumber, backend, rowid);
 

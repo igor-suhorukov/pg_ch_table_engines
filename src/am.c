@@ -433,9 +433,8 @@ ch_relation_vacuum(Relation rel, const VacuumParams *params, BufferAccessStrateg
 static uint64
 ch_relation_size(Relation rel, ForkNumber forkNumber)
 {
-	List	   *parts;
-	ListCell   *lc;
-	uint64		bytes = 0;
+	uint64		bytes;
+	double		rows;
 
 	if (forkNumber != MAIN_FORKNUM && forkNumber != InvalidForkNumber)
 		return 0;
@@ -450,11 +449,10 @@ ch_relation_size(Relation rel, ForkNumber forkNumber)
 	{
 		ChStorageId id;
 
+		/* the parts' rows' bytes alone, their manifests and summaries left unread (VC20's B8) */
 		ch_storage_id(rel, &rel->rd_locator, &id);
-		parts = ch_parts_visible(&id, NULL);
+		ch_parts_totals(&id, NULL, &rows, &bytes);
 	}
-	foreach(lc, parts)
-		bytes += ((ChPart *) lfirst(lc))->bytes;
 	return bytes;
 }
 
@@ -462,23 +460,15 @@ static void
 ch_relation_estimate_size(Relation rel, int32 *attr_widths, BlockNumber *pages, double *tuples,
 						  double *allvisfrac)
 {
-	List	   *parts;
-	ListCell   *lc;
-	uint64		bytes = 0;
-	double		rows = 0;
+	uint64		bytes;
+	double		rows;
 
 	{
 		ChStorageId id;
 
+		/* every query's: the parts' rows and bytes alone, no manifest copied out of TOAST (VC20's B8) */
 		ch_storage_id(rel, &rel->rd_locator, &id);
-		parts = ch_parts_visible(&id, NULL);
-	}
-	foreach(lc, parts)
-	{
-		ChPart	   *p = lfirst(lc);
-
-		bytes += p->bytes;
-		rows += p->rows;
+		ch_parts_totals(&id, NULL, &rows, &bytes);
 	}
 	*pages = (BlockNumber) ((bytes + BLCKSZ - 1) / BLCKSZ);
 	*tuples = rows;

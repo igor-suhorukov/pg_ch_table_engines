@@ -462,6 +462,21 @@ extern "C" int chte_write_part(chte_writer * writer, size_t i, chte_part_info * 
     });
 }
 
+extern "C" int chte_write_part_summary(chte_writer * writer, size_t i, const void ** summary, size_t * size,
+                                       chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (i >= writer->parts.size())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "no part {}", i);
+        auto it = writer->summaries.find(i);
+        if (it == writer->summaries.end())
+            it = writer->summaries.emplace(i, summarizePart(*writer->parts[i]->part)).first;
+        *summary = it->second.data();
+        *size = it->second.size();
+    });
+}
+
 extern "C" int chte_write_commit(chte_writer * writer, chte_error * error)
 {
     return guarded(error, [&]

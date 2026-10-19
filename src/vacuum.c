@@ -298,6 +298,7 @@ ch_fold_deletions(Relation rel)
 			next.marks = (int32) info.marks;
 			next.manifest = NULL;
 			next.created = 0;
+			next.summary = ch_part_summary_written(writer, i);
 			if (t->options.storage == CH_STORAGE_PAGES)
 				next.manifest = ch_pages_store_part(rel, t, info.temp_dir, &next, GetCurrentCommandId(true));
 			else

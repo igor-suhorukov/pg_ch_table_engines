@@ -230,6 +230,7 @@ flush(ChBuffer *b)
 			part.marks = (int32) info.marks;
 			part.manifest = NULL;
 			part.created = 0;
+			part.summary = ch_part_summary_written(writer, i);
 			if (table->options.storage == CH_STORAGE_PAGES)
 			{
 				const chte_part_file *files = NULL;
