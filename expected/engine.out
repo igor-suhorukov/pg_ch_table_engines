@@ -21,10 +21,13 @@ SELECT count(*) AS postmaster_threads
 
 CREATE TABLE ef (a int, b text) USING mergetree WITH (order_by = 'a');
 INSERT INTO ef SELECT g, 'v' || g FROM generate_series(1, 100) g;
--- a write registers every function, and the aggregate functions
-SELECT threads, functions > 1000 AS all_functions FROM ch.engine_info();
- threads | all_functions 
----------+---------------
+-- a write registers every function the library links, and its aggregate
+-- functions: those the engine and ClickHouse's own code name, where ClickHouse
+-- has 1,770 (engine.cmake)
+SELECT functions AS all_functions FROM ch.engine_info() \gset
+SELECT threads, :all_functions < 100 AS linked_functions FROM ch.engine_info();
+ threads | linked_functions 
+---------+------------------
        5 | t
 (1 row)
 
@@ -37,7 +40,7 @@ SELECT count(*), sum(a) FROM ef WHERE a > 10 AND b IS NOT NULL AND a <> 50;
     89 | 4945
 (1 row)
 
-SELECT threads, functions BETWEEN 1 AND 100 AS filters_functions FROM ch.engine_info();
+SELECT threads, functions BETWEEN 1 AND :all_functions - 1 AS filters_functions FROM ch.engine_info();
  threads | filters_functions 
 ---------+-------------------
        5 | t
@@ -58,7 +61,7 @@ SELECT a FROM ef WHERE a < 4 ORDER BY a;
  3
 (3 rows)
 
-SELECT functions BETWEEN 1 AND 100 AS filters_functions FROM ch.engine_info();
+SELECT functions BETWEEN 1 AND :all_functions - 1 AS filters_functions FROM ch.engine_info();
  filters_functions 
 -------------------
  t
@@ -66,7 +69,7 @@ SELECT functions BETWEEN 1 AND 100 AS filters_functions FROM ch.engine_info();
 
 -- the first write registers the rest
 INSERT INTO ef VALUES (101, 'v101');
-SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+SELECT functions = :all_functions AS all_functions FROM ch.engine_info();
  all_functions 
 ---------------
  t
@@ -90,7 +93,7 @@ SELECT count(*) FROM eu WHERE a > 25;
     25
 (1 row)
 
-SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+SELECT functions = :all_functions AS all_functions FROM ch.engine_info();
  all_functions 
 ---------------
  t
@@ -105,7 +108,7 @@ SELECT count(*) FROM ef WHERE a > 90;
     11
 (1 row)
 
-SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+SELECT functions = :all_functions AS all_functions FROM ch.engine_info();
  all_functions 
 ---------------
  t

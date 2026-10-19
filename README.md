@@ -101,6 +101,12 @@ ClickHouse's engine starts in each process as it first needs a table,
 registering only the functions the filters use (`ch.engine_functions`), the
 others at the first write, merge or rewrite, or a table whose definition
 names them.  `ch.engine_info()` counts a process's threads and functions.
+The library links ClickHouse's functions as an archive, not all of them: the
+filters' and those ClickHouse's own code names, with the aggregate functions
+the summing and coalescing engines and the `uniq` statistics look up --
+46 functions and aggregate functions where ClickHouse has 1,770
+(`engine/src/engine.cpp`), its code 128 MB where it was 266.  A function the
+library does not link stays unknown to ClickHouse's code.
 
 ## Building and testing
 

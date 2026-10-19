@@ -143,7 +143,8 @@ void checkInterrupted();
 
 /// ClickHouse's functions a process has (VC12): chte_init registers those the filters and ClickHouse's
 /// analysis of them use; the others, and the aggregate functions, as a table's definition, a write, a
-/// merge or a rewrite first needs them.  Each is a no-op once done.
+/// merge or a rewrite first needs them.  Each is a no-op once done.  The others are the functions the
+/// library links, not all of ClickHouse's (engine.cmake, engine.cpp).
 void registerAllFunctions();
 bool allFunctionsRegistered();
 /// Whether the function factory knows every name, an aggregate function's included.
@@ -181,7 +182,8 @@ int guarded(chte_error * error, F && f) noexcept
         if (code == 0)
             code = -1;
         /// a function looked up where the first registrations did not foresee it (VC12): every
-        /// one from now on, so that the statement succeeds when it is run again
+        /// one from now on, so that the statement succeeds when it is run again -- unless the
+        /// library does not link it, when it fails again with the same error
         if ((code == ErrorCodes::UNKNOWN_FUNCTION || code == ErrorCodes::UNKNOWN_AGGREGATE_FUNCTION)
             && !allFunctionsRegistered())
         {

@@ -8,7 +8,7 @@
 #include <sys/resource.h>
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
-#include <AggregateFunctions/registerAggregateFunctions.h>
+#include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTrackerBlockerInThread.h>
 #include <Common/register_objects.h>
@@ -42,6 +42,29 @@ namespace DB::ErrorCodes
     extern const int QUERY_WAS_CANCELLED;
 }
 
+/// The registrations of the functions and aggregate functions the library has: called here by their
+/// symbols, they are what the linker takes out of the functions' archive and the aggregate functions'
+/// (engine.cmake), with what ClickHouse's own code names.
+namespace DB
+{
+void registerFunctionEquals(FunctionFactory &);
+void registerFunctionNotEquals(FunctionFactory &);
+void registerFunctionLess(FunctionFactory &);
+void registerFunctionLessOrEquals(FunctionFactory &);
+void registerFunctionGreater(FunctionFactory &);
+void registerFunctionGreaterOrEquals(FunctionFactory &);
+void registerFunctionLogical(FunctionFactory &);
+void registerFunctionIsNull(FunctionFactory &);
+void registerFunctionIsNotNull(FunctionFactory &);
+void registerFunctionTuple(FunctionFactory &);
+void registerAggregateFunctionSum(AggregateFunctionFactory &);
+void registerAggregateFunctionSumMap(AggregateFunctionFactory &);
+void registerAggregateFunctionsAny(AggregateFunctionFactory &);
+void registerAggregateFunctionsUniq(AggregateFunctionFactory &);
+void registerAggregateFunctionUniqCombined(AggregateFunctionFactory &);
+void registerAggregateFunctionCombinatorNull(AggregateFunctionCombinatorFactory &);
+}
+
 namespace fs = std::filesystem;
 
 namespace chte
@@ -58,10 +81,25 @@ chte_callbacks callbacks{};
 /// (registerFunctions.cpp, registerAggregateFunctions.cpp), 4.3 of chte_init's 5.2 ms; here first only
 /// the registrations -- REGISTER_FUNCTION's names (Common/register_objects.h) -- of the functions the
 /// filters name (select.cpp, FilterBuilder) and ClickHouse's key analysis adds to them
-/// (KeyCondition.cpp:747-749, 1323), and a sorting key's tuple.
-constexpr std::string_view used_registrations[] = {
-    "Equals", "NotEquals", "Less", "LessOrEquals", "Greater", "GreaterOrEquals",
-    "Logical", "IsNull", "IsNotNull", "Tuple",
+/// (KeyCondition.cpp:747-749, 1323), and a sorting key's tuple.  They are also every function of the
+/// functions' archive the library links, with what ClickHouse's own code takes out of it; dbms adds
+/// the casts, if and multiIf, which it compiles in.
+struct Registration
+{
+    std::string_view name;
+    void (*registration)(FunctionFactory &);
+};
+constexpr Registration used_registrations[] = {
+    {"Equals", registerFunctionEquals},
+    {"NotEquals", registerFunctionNotEquals},
+    {"Less", registerFunctionLess},
+    {"LessOrEquals", registerFunctionLessOrEquals},
+    {"Greater", registerFunctionGreater},
+    {"GreaterOrEquals", registerFunctionGreaterOrEquals},
+    {"Logical", registerFunctionLogical},
+    {"IsNull", registerFunctionIsNull},
+    {"IsNotNull", registerFunctionIsNotNull},
+    {"Tuple", registerFunctionTuple},
 };
 std::unordered_set<std::string_view> registered;
 bool all_registered = false;
@@ -71,15 +109,31 @@ void registerUsedFunctions()
     /// as registerFunctions() does: what registration allocates is not a call's
     MemoryTrackerBlockerInThread blocker;
     auto & factory = FunctionFactory::instance();
-    const auto & registrations = FunctionRegisterMap::instance();
-    for (auto name : used_registrations)
+    for (const auto & [name, registration] : used_registrations)
     {
-        auto it = registrations.find(name);
-        if (it == registrations.end())
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "ClickHouse registers no functions as {}", name);
-        it->second(factory);
-        registered.insert(it->first);
+        registration(factory);
+        registered.insert(name);
     }
+}
+
+/// The aggregate functions ClickHouse's own code looks up by name where the library runs it, where
+/// registerAggregateFunctions() registers 107 and 13 combinators: a summing merge's and insert's
+/// sumWithOverflow and sumMapWithOverflow (SummingSortedTransform.h:40-41,
+/// MergeTreeDataWriter.cpp:622-623), a coalescing one's last_value (CoalescingSortedTransform.h:38-39,
+/// MergeTreeDataWriter.cpp:649), the uniq statistics' uniq and uniqCombined64 (StatisticsUniq.cpp:18,
+/// StatisticsUniqV2.cpp:28), and the -Null combinator, which each takes for Nullable arguments
+/// (AggregateFunctionFactory.cpp:101-110).  Not count, min and max: the minmax_count projection that
+/// names them is not made (openTable), and the extension's definitions have no TTL, whose part
+/// infos do (MergeTreeDataPartTTLInfo.cpp).
+void registerUsedAggregateFunctions()
+{
+    auto & factory = AggregateFunctionFactory::instance();
+    registerAggregateFunctionSum(factory);
+    registerAggregateFunctionSumMap(factory);
+    registerAggregateFunctionsAny(factory);
+    registerAggregateFunctionsUniq(factory);
+    registerAggregateFunctionUniqCombined(factory);
+    registerAggregateFunctionCombinatorNull(AggregateFunctionCombinatorFactory::instance());
 }
 
 /// ClickHouse's log messages go to the caller's log callback, and only from the thread that
@@ -136,7 +190,7 @@ void registerAllFunctions()
             registration(factory);
             registered.insert(name);
         }
-    registerAggregateFunctions();
+    registerUsedAggregateFunctions();
     all_registered = true;
 }
 

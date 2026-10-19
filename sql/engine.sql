@@ -12,21 +12,24 @@ SELECT count(*) AS postmaster_threads
 
 CREATE TABLE ef (a int, b text) USING mergetree WITH (order_by = 'a');
 INSERT INTO ef SELECT g, 'v' || g FROM generate_series(1, 100) g;
--- a write registers every function, and the aggregate functions
-SELECT threads, functions > 1000 AS all_functions FROM ch.engine_info();
+-- a write registers every function the library links, and its aggregate
+-- functions: those the engine and ClickHouse's own code name, where ClickHouse
+-- has 1,770 (engine.cmake)
+SELECT functions AS all_functions FROM ch.engine_info() \gset
+SELECT threads, :all_functions < 100 AS linked_functions FROM ch.engine_info();
 
 \c
 SET client_min_messages = warning;
 -- a filtered scan registers only the functions its filter uses
 SELECT count(*), sum(a) FROM ef WHERE a > 10 AND b IS NOT NULL AND a <> 50;
-SELECT threads, functions BETWEEN 1 AND 100 AS filters_functions FROM ch.engine_info();
+SELECT threads, functions BETWEEN 1 AND :all_functions - 1 AS filters_functions FROM ch.engine_info();
 -- an index-like fetch, statistics, a sort by the key: no others
 SELECT min(a), max(a) FROM ef WHERE a IN (3, 30, 300);
 SELECT a FROM ef WHERE a < 4 ORDER BY a;
-SELECT functions BETWEEN 1 AND 100 AS filters_functions FROM ch.engine_info();
+SELECT functions BETWEEN 1 AND :all_functions - 1 AS filters_functions FROM ch.engine_info();
 -- the first write registers the rest
 INSERT INTO ef VALUES (101, 'v101');
-SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+SELECT functions = :all_functions AS all_functions FROM ch.engine_info();
 SELECT count(*), sum(a) FROM ef WHERE a > 10;
 
 -- a definition that names more: statistics that aggregate
@@ -36,13 +39,13 @@ INSERT INTO eu SELECT generate_series(1, 50);
 \c
 SET client_min_messages = warning;
 SELECT count(*) FROM eu WHERE a > 25;
-SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+SELECT functions = :all_functions AS all_functions FROM ch.engine_info();
 
 -- every function at once
 \c
 SET ch.engine_functions = 'all';
 SELECT count(*) FROM ef WHERE a > 90;
-SELECT functions > 1000 AS all_functions FROM ch.engine_info();
+SELECT functions = :all_functions AS all_functions FROM ch.engine_info();
 RESET ch.engine_functions;
 
 -- a scan reads the manifests of the parts it attaches alone, from TOAST: a

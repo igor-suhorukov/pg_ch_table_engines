@@ -12,9 +12,22 @@ add_library(chte_engine SHARED
     "${CHTE_ENGINE_DIR}/src/rewrite.cpp"
     "${CHTE_ENGINE_DIR}/src/merge.cpp")
 target_include_directories(chte_engine PRIVATE "${CHTE_ENGINE_DIR}/../include")
+# ClickHouse's functions as an archive, not as objects: clickhouse_functions hands a link every
+# function's object ($<TARGET_OBJECTS:...>, src/Functions/CMakeLists.txt:77-234), and each object
+# registers its functions from a static initializer (src/Common/register_objects.h:28-33), so that
+# --gc-sections kept all 792 of them -- 111 of the library's 252 MB of code.  From an archive the
+# linker takes only the members something references: the registrations engine.cpp calls, and what
+# dbms names (ch_table_engines.md §2.2).
+get_target_property(chte_functions_libraries clickhouse_functions INTERFACE_LINK_LIBRARIES)
+set(chte_functions_objects ${chte_functions_libraries})
+list(FILTER chte_functions_objects INCLUDE REGEX "^\\$<TARGET_OBJECTS:")
+list(FILTER chte_functions_libraries EXCLUDE REGEX "^\\$<TARGET_OBJECTS:")
+add_library(chte_functions STATIC ${chte_functions_objects})
+set_target_properties(chte_functions PROPERTIES LINKER_LANGUAGE CXX)
+target_link_libraries(chte_functions INTERFACE ${chte_functions_libraries})
 target_link_libraries(chte_engine PRIVATE
     dbms
-    clickhouse_functions
+    chte_functions
     clickhouse_aggregate_functions
     clickhouse_parsers
     clickhouse_common_io)
@@ -32,11 +45,15 @@ endif ()
 # LLD as for ClickHouse's executables (cmake/tools.cmake): it resolves symbols across the static
 # archives in any order, which ClickHouse's link lines rely on.
 target_link_options(chte_engine PRIVATE "--ld-path=${LLD_PATH}")
+# --icf=safe folds the functions whose code is the same and whose address nothing takes, as
+# ClickHouse's -faddrsig records it: 7.4 of 135.8 MB of code.  ClickHouse links its executables
+# with --icf=all (CMakeLists.txt:176).
 target_link_options(chte_engine PRIVATE
     "LINKER:--version-script=${CHTE_ENGINE_DIR}/chte_engine.map"
     "LINKER:--exclude-libs,ALL"
     "LINKER:-Bsymbolic"
     "LINKER:--gc-sections"
+    "LINKER:--icf=safe"
     "LINKER:-z,now"
     "${BUILTINS_LIBRARY}")
 
