@@ -33,6 +33,14 @@
  *	  Where a running scan that reads every column has just returned the
  *	  row -- an UPDATE's old row, which ModifyTable fetches by TID, a DELETE's
  *	  for RETURNING and triggers, a lock's -- the row is taken from its batch.
+ *	  A fetch reads only the columns its slot's node reads, where fetch.c
+ *	  knows them, and an index scan's fetches keep what they read for the
+ *	  next ones: the snapshot's parts and deletions, located row ids, the
+ *	  last granule decoded (VC16).
+ *
+ *	  A serial scan may read its parts in the order of the table's key,
+ *	  where their ranges of its first column are apart, and so hand its rows
+ *	  in that order (VC4).
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -46,6 +54,7 @@
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
@@ -54,9 +63,13 @@
 #include "port/atomics.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/typcache.h"
+#include "utils/varlena.h"
 
 #include "chte.h"
 #include "scan.h"
@@ -135,6 +148,7 @@ typedef struct ChScanDescData
 	HeapTuple  *bm_rows;
 	int			bm_nrows;
 	int			bm_pos;
+	struct FetchCols *bm_cols;	/* the columns they read (VC16), once known */
 
 	/* among the running scans, for a fetch of the row it has just returned */
 	struct RunningScan *running;
@@ -1179,39 +1193,104 @@ ch_scan_analyze_next_tuple(TableScanDesc sscan, double *liverows, double *deadro
 	return false;
 }
 
+/* ---- rows by their TIDs (VC16) ---- */
+
 /*
- * The rows of a part with the given row ids (ascending), those it holds:
- * their offsets through its _pg_rowid projection, then the granules holding
- * them read, each row found materialized into rows[] in its offset's order,
- * its row id into ids[].  Returns how many.
+ * What fetches by TID read in this backend, for ch.fetch_stats(): the rows
+ * read from a part, the columns decoded for them, those of every column,
+ * the rows taken from a granule kept from a fetch before, and the row ids
+ * found among offsets located before.
+ */
+ChFetchStats ch_fetch_counts;
+
+/* Row ids located at once, where a fetch's row id is near the one before */
+#define CH_FETCH_LOCATE_IDS 8192
+
+/* Row ids whose deletions a cache reads at once */
+#define CH_FETCH_DEAD_IDS 65536
+
+/*
+ * The columns a fetch reads: their attribute indexes, from 0, the row id
+ * (-1) last, as set_columns() takes them; whole where they are every column
+ */
+typedef struct FetchCols
+{
+	int			n;
+	int		   *attnos;
+	bool		whole;
+} FetchCols;
+
+/*
+ * The columns of attnums[0 .. n), 1-based, ascending, that the table has, or
+ * every one where n < 0; then the row id
+ */
+static void
+fetch_cols(ChTable *t, int n, const AttrNumber *attnums, MemoryContext cxt, FetchCols *cols)
+{
+	int			live = 0;
+	int			k = 0;
+
+	cols->attnos = MemoryContextAlloc(cxt, sizeof(int) * (t->natts + 1));
+	for (int i = 0; i < t->natts; i++)
+	{
+		bool		want = n < 0;
+
+		if (t->columns[i].kind == CH_COL_DROPPED)
+			continue;
+		live++;
+		for (int j = 0; j < n && !want; j++)
+			want = attnums[j] == i + 1;
+		if (want)
+			cols->attnos[k++] = i;
+	}
+	cols->whole = k == live;
+	cols->attnos[k++] = -1;
+	cols->n = k;
+}
+
+/* The library's names of the columns, as set_columns() makes them */
+static char *
+cols_names(const FetchCols *cols)
+{
+	StringInfoData names;
+
+	initStringInfo(&names);
+	for (int c = 0; c < cols->n; c++)
+	{
+		if (c > 0)
+			appendStringInfoString(&names, ", ");
+		if (cols->attnos[c] < 0)
+			appendStringInfoString(&names, CH_ROWID_COLUMN);
+		else
+			appendStringInfo(&names, "c%d", cols->attnos[c] + 1);
+	}
+	return names.data;
+}
+
+static void
+count_fetch(const FetchCols *cols, int rows)
+{
+	ch_fetch_counts.fetches += rows;
+	ch_fetch_counts.values += (int64) rows * (cols->n - 1);
+	if (cols->whole)
+		ch_fetch_counts.whole += rows;
+}
+
+/*
+ * The rows of a part at the given offsets (ascending), those it holds, the
+ * granules holding them read: each row materialized into rows[] in its
+ * offset's order, of the columns cols names, the others NULL, its row id
+ * into ids[].  Returns how many.
  */
 static int
-read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, int n, TupleDesc desc,
-				HeapTuple *rows, uint64 *ids)
+read_rows_at(Relation rel, ChTable *t, ChPart *part, const uint64 *offsets, int n, TupleDesc desc,
+			 const FetchCols *cols, HeapTuple *rows, uint64 *ids)
 {
 	const ChEngine *eng = ch_engine();
-	uint64	   *offsets = palloc(sizeof(uint64) * n);
-	uint64	   *found = palloc(sizeof(uint64) * n);
-	int			nfound = 0;
 	ChScanDescData scan;
 	ResourceOwner owner;
 	TupleTableSlot *slot;
 	int			out = 0;
-
-	if (t->options.storage == CH_STORAGE_PAGES)
-		ch_pages_attach(t, part);
-	CH_CALL("finding rows by their TIDs", eng->part_locate(t->handle, part->name, rowids, n, offsets, CH_ERR));
-	for (int i = 0; i < n; i++)
-		if (offsets[i] != PG_UINT64_MAX)
-			found[nfound++] = offsets[i];
-	if (nfound == 0)
-	{
-		pfree(offsets);
-		pfree(found);
-		return 0;
-	}
-	/* the offsets ascending, as the reader wants them */
-	qsort(found, nfound, sizeof(uint64), ch_compare_uint64);
 
 	memset(&scan, 0, sizeof(scan));
 	scan.base.rs_rd = rel;
@@ -1219,12 +1298,12 @@ read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, in
 	scan.fitted = true;
 	scan.scan_cxt = CurrentMemoryContext;
 	scan.batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "ch fetch", ALLOCSET_DEFAULT_SIZES);
-	setup_all_columns(&scan);
+	set_columns(&scan, cols->n, cols->attnos);
 	scan.part = part;
 	scan.rowid_col = scan.asked_rowid;
 	owner = ch_handle_reserve();
 	CH_CALL("reading rows by their TIDs",
-			eng->read_rows(t->handle, part->name, scan.columns, found, nfound, &scan.reader, CH_ERR));
+			eng->read_rows(t->handle, part->name, scan.columns, offsets, n, &scan.reader, CH_ERR));
 	ch_handle_opened(owner, CH_HANDLE_READER, scan.reader);
 	scan.reader_owner = owner;
 	for (int c = 0; c < scan.ncols; c++)
@@ -1242,7 +1321,7 @@ read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, in
 		for (int c = 0; c < scan.ncols; c++)
 			CH_CALL("reading rows by their TIDs", eng->read_vector(scan.reader, c, &scan.vectors[c], CH_ERR));
 		scan.nrows = nrows;
-		for (scan.row = 0; scan.row < nrows && out < nfound;)
+		for (scan.row = 0; scan.row < nrows && out < n;)
 		{
 			ids[out] = ((const uint64 *) scan.vectors[scan.asked_rowid].values)[scan.row];
 			fill_slot(&scan, slot);
@@ -1255,6 +1334,42 @@ read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, in
 	pfree(scan.attnos);
 	pfree(scan.vectors);
 	pfree(scan.missing);
+	pfree(scan.columns);
+	pfree(scan.columns_rowid);
+	count_fetch(cols, out);
+	return out;
+}
+
+/*
+ * The rows of a part with the given row ids (ascending), those it holds:
+ * their offsets through its _pg_rowid projection, then the rows at them
+ * read (read_rows_at()).  Returns how many.
+ */
+static int
+read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, int n, TupleDesc desc,
+				const FetchCols *cols, HeapTuple *rows, uint64 *ids)
+{
+	const ChEngine *eng = ch_engine();
+	uint64	   *offsets = palloc(sizeof(uint64) * n);
+	uint64	   *found = palloc(sizeof(uint64) * n);
+	int			nfound = 0;
+	int			out;
+
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, part);
+	CH_CALL("finding rows by their TIDs", eng->part_locate(t->handle, part->name, rowids, n, offsets, CH_ERR));
+	for (int i = 0; i < n; i++)
+		if (offsets[i] != PG_UINT64_MAX)
+			found[nfound++] = offsets[i];
+	if (nfound == 0)
+	{
+		pfree(offsets);
+		pfree(found);
+		return 0;
+	}
+	/* the offsets ascending, as the reader wants them */
+	qsort(found, nfound, sizeof(uint64), ch_compare_uint64);
+	out = read_rows_at(rel, t, part, found, nfound, desc, cols, rows, ids);
 	pfree(offsets);
 	pfree(found);
 	return out;
@@ -1292,7 +1407,8 @@ row_survives(ChTable *t, uint64 rowid, Snapshot snapshot)
  * lock's.  Reading a row is reading a granule of every column, so the second
  * fetch would cost as much as the first.  A row id's values never change once
  * it is given (§2.6) -- a fold or a merge writes them again as they were --
- * so the copy is the row's for its relation, storage and descriptor.
+ * so the copy is the row's for its relation, storage and descriptor.  Only a
+ * fetch of every column is kept: one of fewer columns left the others NULL.
  */
 static struct
 {
@@ -1330,26 +1446,20 @@ fetch_from_last(Relation rel, uint64 rowid, TupleTableSlot *slot)
 }
 
 /*
- * A row by its TID, visible to the snapshot: from the write buffer, or from
- * the part the snapshot sees that holds it (§2.8 rule 7).
+ * A row by its TID, visible to the snapshot, of the columns cols names: from
+ * the part the snapshot sees that holds it (§2.8 rule 7), the parts and the
+ * deletions read from the catalogs for this row alone.
  */
-bool
-ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
+static bool
+fetch_uncached(Relation rel, ItemPointer tid, uint64 rowid, Snapshot snapshot, TupleTableSlot *slot,
+			   const FetchCols *cols)
 {
-	uint64		rowid;
 	ChTable    *t;
 	SnapshotData nonvacuumable;
 	List	   *parts;
 	ListCell   *lc;
 	bool		found = false;
 
-	if (!ItemPointerIsValid(tid) || ItemPointerGetOffsetNumberNoCheck(tid) > CH_ROWS_PER_BLOCK)
-		return false;
-	rowid = CH_TID_TO_ROWID(tid);
-	if (snapshot && IsMVCCSnapshot(snapshot))
-		PredicateLockRelation(rel, snapshot);
-	if (ch_buffer_fetch(rel, rowid, snapshot, slot))
-		return true;
 	/* SnapshotAny: the row whatever its deletions, which a running scan or the last fetch may have at hand */
 	if (snapshot && snapshot->snapshot_type == SNAPSHOT_ANY)
 	{
@@ -1378,9 +1488,10 @@ ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *s
 
 				if ((int64) rowid < p->min_rowid || (int64) rowid > p->max_rowid)
 					continue;
-				if (read_rows_by_id(rel, t, p, &rowid, 1, slot->tts_tupleDescriptor, &row, &id) == 1)
+				if (read_rows_by_id(rel, t, p, &rowid, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1)
 				{
-					remember_fetch(rel, rowid, slot->tts_tupleDescriptor, row);
+					if (cols->whole)
+						remember_fetch(rel, rowid, slot->tts_tupleDescriptor, row);
 					ExecForceStoreHeapTuple(row, slot, true);
 					slot->tts_tid = *tid;
 					slot->tts_tableOid = RelationGetRelid(rel);
@@ -1398,10 +1509,520 @@ ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *s
 	return found;
 }
 
+/* The TID's row id, where it names a row at all */
+static bool
+tid_rowid(ItemPointer tid, uint64 *rowid)
+{
+	if (!ItemPointerIsValid(tid) || ItemPointerGetOffsetNumberNoCheck(tid) > CH_ROWS_PER_BLOCK)
+		return false;
+	*rowid = CH_TID_TO_ROWID(tid);
+	return true;
+}
+
+/*
+ * A row by its TID, visible to the snapshot, of the columns attnums[0 .. n)
+ * (1-based), or of every one where n < 0, the slot's other attributes NULL:
+ * from the write buffer, or from the part the snapshot sees that holds it.
+ */
+bool
+ch_fetch_row_columns(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot, int n,
+					 const AttrNumber *attnums)
+{
+	uint64		rowid;
+	FetchCols	cols;
+	ChTable    *t;
+	bool		found;
+
+	if (!tid_rowid(tid, &rowid))
+		return false;
+	if (snapshot && IsMVCCSnapshot(snapshot))
+		PredicateLockRelation(rel, snapshot);
+	if (ch_buffer_fetch(rel, rowid, snapshot, slot))
+		return true;
+	t = ch_table(rel);
+	fetch_cols(t, n, attnums, CurrentMemoryContext, &cols);
+	found = fetch_uncached(rel, tid, rowid, snapshot, slot, &cols);
+	pfree(cols.attnos);
+	return found;
+}
+
+/*
+ * A row by its TID into the slot: of the columns fetch.c knows the slot to
+ * need (ch_fetch_cache_for()), through that slot's cache, or of every column.
+ */
+bool
+ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
+{
+	ChFetchCache *cache = ch_fetch_cache_for(rel, slot);
+
+	if (cache != NULL)
+		return ch_fetch_row_cached(rel, tid, snapshot, slot, cache);
+	return ch_fetch_row_columns(rel, tid, snapshot, slot, -1, NULL);
+}
+
+/*
+ * The caches of fetches by TID (VC16).  An index scan's fetches -- a
+ * nested loop's inner index scan makes one a probe -- and those into a
+ * slot fetch.c knows, each read the snapshot's parts and the row's
+ * deletions from the catalogs, its offset through the part's _pg_rowid
+ * projection, and a granule of each column it decodes, keeping nothing:
+ * the rows of one key, adjacent in a part, cost a granule each.  A cache
+ * keeps, for one MVCC snapshot -- by its identity, the transactions it
+ * found completed among them -- the parts it sees, the deletions it sees of
+ * a range of row ids, and for each part the offsets of a range of row ids
+ * located at once, where a fetch's row id is near the one before, and the
+ * granule of the last row read: its columns as the library decoded them,
+ * the whole granule read at the cost of one row of it, where the part's
+ * granules are of index_granularity rows, and kept where they take no more
+ * than work_mem.  A row's values never change once its row id is given
+ * (§2.6), and a kept granule is the library's columns, not the part's files,
+ * which a merge may remove.  Any other snapshot reads as fetch_uncached().
+ */
+typedef struct KeptBatch
+{
+	uint64		first;			/* the offset of its first row */
+	uint32		nrows;
+	chte_vector *vectors;		/* one a column read */
+	chte_batch *keep;			/* the library's columns they point into */
+} KeptBatch;
+
+typedef struct FetchPart
+{
+	ChPart	   *part;
+	/* the row ids [loc_lo, loc_hi) located, their offsets, PG_UINT64_MAX where the part has none */
+	uint64		loc_lo;
+	uint64		loc_hi;			/* 0: none */
+	uint64	   *loc_offsets;
+	uint64		last_rowid;		/* the row id located last, + 1; 0: none */
+	/* the offsets [win_lo, win_hi) kept, a batch or more of them */
+	uint64		win_lo;
+	uint64		win_hi;			/* 0: none */
+	int			nkept;
+	int			kept_cap;
+	KeptBatch  *kept;
+	bool	   *missing;		/* per column read: the part has none */
+} FetchPart;
+
+struct ChFetchCache
+{
+	MemoryContext cxt;			/* its own */
+	FetchCols	cols;
+	char	   *names;			/* the columns', for the library */
+	bool		no_windows;		/* a granule larger than work_mem was met */
+	/*
+	 * one snapshot's parts and deletions, in snap_cxt, whose reset or
+	 * deletion -- before its parent's, which deletes its children first --
+	 * releases the library's columns it keeps (snapshot_gone())
+	 */
+	MemoryContext snap_cxt;
+	MemoryContextCallback *snap_cb;
+	bool		snap_valid;
+	Snapshot	snapshot;
+	TransactionId xmin;
+	TransactionId xmax;
+	CommandId	curcid;
+	uint64		completions;
+	RelFileNumber relfilenumber;
+	List	   *parts;
+	FetchPart  *fparts;			/* per part of parts, in their order */
+	int			nparts;
+	uint64		dead_lo;		/* the deletions of row ids [dead_lo, dead_hi) */
+	uint64		dead_hi;		/* 0: none read */
+	uint64	   *dead;
+	int			ndead;
+	MemoryContext row_cxt;		/* a row's values, as the slot is filled */
+};
+
+/* The granule a part keeps let go: the library's columns, and its batches' arrays */
+static void
+release_kept(FetchPart *fp)
+{
+	for (int i = 0; i < fp->nkept; i++)
+	{
+		if (fp->kept[i].keep)
+			ch_engine()->batch_release(fp->kept[i].keep);
+		fp->kept[i].keep = NULL;
+		if (fp->kept[i].vectors)
+			pfree(fp->kept[i].vectors);
+		fp->kept[i].vectors = NULL;
+	}
+	fp->nkept = 0;
+	fp->win_lo = fp->win_hi = 0;
+}
+
+/*
+ * A snapshot's context is going, reset for another or deleted with the
+ * cache: its memory is still there, the library's columns it kept go
+ */
+static void
+snapshot_gone(void *arg)
+{
+	ChFetchCache *c = arg;
+
+	for (int i = 0; i < c->nparts; i++)
+		release_kept(&c->fparts[i]);
+	c->nparts = 0;
+	c->fparts = NULL;
+	c->snap_valid = false;
+}
+
+/*
+ * A cache of fetches of the columns attnums[0 .. n) of the relation (1-based),
+ * every column where n < 0, in a context under parent, whose reset or
+ * deletion releases it and the library's columns it keeps.
+ */
+ChFetchCache *
+ch_fetch_cache_create(MemoryContext parent, Relation rel, int n, const AttrNumber *attnums)
+{
+	MemoryContext cxt = AllocSetContextCreate(parent, "ch fetch cache", ALLOCSET_SMALL_SIZES);
+	ChFetchCache *c = MemoryContextAllocZero(cxt, sizeof(ChFetchCache));
+	MemoryContext old;
+
+	c->cxt = cxt;
+	c->snap_cxt = AllocSetContextCreate(cxt, "ch fetch snapshot", ALLOCSET_DEFAULT_SIZES);
+	c->row_cxt = AllocSetContextCreate(cxt, "ch fetch row", ALLOCSET_DEFAULT_SIZES);
+	fetch_cols(ch_table(rel), n, attnums, cxt, &c->cols);
+	old = MemoryContextSwitchTo(cxt);
+	c->names = cols_names(&c->cols);
+	MemoryContextSwitchTo(old);
+	return c;
+}
+
+void
+ch_fetch_cache_free(ChFetchCache *cache)
+{
+	MemoryContextDelete(cache->cxt);
+}
+
+/* The parts and deletions a cache holds are the snapshot's */
+static bool
+snapshot_cached(ChFetchCache *c, Relation rel, Snapshot snapshot)
+{
+	return c->snap_valid && c->snapshot == snapshot && c->xmin == snapshot->xmin &&
+		c->xmax == snapshot->xmax && c->curcid == snapshot->curcid &&
+		c->completions == snapshot->snapXactCompletionCount &&
+		c->relfilenumber == rel->rd_locator.relNumber;
+}
+
+static void
+cache_snapshot(ChFetchCache *c, Relation rel, ChTable *t, Snapshot snapshot)
+{
+	MemoryContext old;
+	ListCell   *lc;
+	int			i = 0;
+
+	MemoryContextReset(c->snap_cxt);	/* snapshot_gone() runs */
+	c->parts = NIL;
+	c->fparts = NULL;
+	c->nparts = 0;
+	c->dead = NULL;
+	c->ndead = 0;
+	c->dead_lo = c->dead_hi = 0;
+	c->snap_cb = MemoryContextAllocZero(c->snap_cxt, sizeof(MemoryContextCallback));
+	c->snap_cb->func = snapshot_gone;
+	c->snap_cb->arg = c;
+	MemoryContextRegisterResetCallback(c->snap_cxt, c->snap_cb);
+	old = MemoryContextSwitchTo(c->snap_cxt);
+	c->parts = ch_parts_to_scan(&t->storage, snapshot);
+	c->fparts = palloc0(sizeof(FetchPart) * Max(list_length(c->parts), 1));
+	foreach(lc, c->parts)
+		c->fparts[i++].part = lfirst(lc);
+	MemoryContextSwitchTo(old);
+	c->nparts = i;
+	c->snapshot = snapshot;
+	c->xmin = snapshot->xmin;
+	c->xmax = snapshot->xmax;
+	c->curcid = snapshot->curcid;
+	c->completions = snapshot->snapXactCompletionCount;
+	c->relfilenumber = rel->rd_locator.relNumber;
+	c->snap_valid = true;
+}
+
+/* Whether the snapshot sees a deletion or update of the row, from the range of deletions read */
+static bool
+cached_row_deleted(ChFetchCache *c, ChTable *t, Snapshot snapshot, uint64 rowid)
+{
+	if (c->dead_hi == 0 || rowid < c->dead_lo || rowid >= c->dead_hi)
+	{
+		MemoryContext old = MemoryContextSwitchTo(c->snap_cxt);
+		uint64		lo = rowid - rowid % CH_FETCH_DEAD_IDS;
+
+		if (c->dead)
+			pfree(c->dead);
+		c->dead = NULL;
+		c->dead_hi = 0;
+		c->dead = ch_tombstones_visible(&t->storage, snapshot, lo, lo + CH_FETCH_DEAD_IDS - 1, &c->ndead);
+		c->dead_lo = lo;
+		c->dead_hi = lo + CH_FETCH_DEAD_IDS;
+		MemoryContextSwitchTo(old);
+	}
+	return c->ndead > 0 && ch_rowid_in(c->dead, c->ndead, rowid);
+}
+
+/*
+ * The row id's offset in the part, PG_UINT64_MAX where it has none: from the
+ * ids located before, or through its projection -- those of a range of
+ * CH_FETCH_LOCATE_IDS row ids at once where the row id located last is in
+ * the same range, as an index's rows of one key are.
+ */
+static uint64
+locate(ChTable *t, ChFetchCache *c, FetchPart *fp, uint64 rowid)
+{
+	const ChEngine *eng = ch_engine();
+	uint64		lo = rowid - rowid % CH_FETCH_LOCATE_IDS;
+	uint64		offset;
+
+	if (fp->loc_hi > 0 && rowid >= fp->loc_lo && rowid < fp->loc_hi)
+	{
+		ch_fetch_counts.located++;
+		return fp->loc_offsets[rowid - fp->loc_lo];
+	}
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, fp->part);
+	if (fp->last_rowid > 0 && (fp->last_rowid - 1) / CH_FETCH_LOCATE_IDS == rowid / CH_FETCH_LOCATE_IDS)
+	{
+		uint64		first = Max(lo, (uint64) fp->part->min_rowid);
+		uint64		end = Min(lo + CH_FETCH_LOCATE_IDS, (uint64) fp->part->max_rowid + 1);
+		uint64	   *ids = palloc(sizeof(uint64) * (end - first));
+
+		if (fp->loc_offsets == NULL)
+			fp->loc_offsets = MemoryContextAlloc(c->snap_cxt, sizeof(uint64) * CH_FETCH_LOCATE_IDS);
+		fp->loc_hi = 0;
+		for (uint64 i = first; i < end; i++)
+			ids[i - first] = i;
+		CH_CALL("finding rows by their TIDs",
+				eng->part_locate(t->handle, fp->part->name, ids, end - first, fp->loc_offsets, CH_ERR));
+		pfree(ids);
+		fp->loc_lo = first;
+		fp->loc_hi = end;
+		fp->last_rowid = rowid + 1;
+		return fp->loc_offsets[rowid - first];
+	}
+	CH_CALL("finding rows by their TIDs", eng->part_locate(t->handle, fp->part->name, &rowid, 1, &offset, CH_ERR));
+	fp->last_rowid = rowid + 1;
+	return offset;
+}
+
+/* The bytes of a kept batch's columns as decoded */
+static Size
+kept_bytes(ChTable *t, const FetchCols *cols, const KeptBatch *kb)
+{
+	Size		bytes = 0;
+
+	for (int c = 0; c < cols->n; c++)
+	{
+		const chte_vector *v = &kb->vectors[c];
+
+		if (cols->attnos[c] >= 0 && v->offsets != NULL)
+			bytes += (Size) (v->offsets[kb->nrows] - v->offsets[0]) + sizeof(uint64) * kb->nrows;
+		else if (cols->attnos[c] >= 0)
+			bytes += (Size) Max(t->columns[cols->attnos[c]].width, 1) * kb->nrows;
+		else
+			bytes += sizeof(uint64) * kb->nrows;
+	}
+	return bytes;
+}
+
+/*
+ * The granule of the part holding offsets [lo, hi), read and kept; false
+ * where it was not kept -- not all its rows came, or they take more than
+ * work_mem, which no granule of the cache's is kept for again.
+ */
+static bool
+keep_window(ChTable *t, ChFetchCache *c, FetchPart *fp, uint64 lo, uint64 hi)
+{
+	const ChEngine *eng = ch_engine();
+	uint64	   *offsets = palloc(sizeof(uint64) * (hi - lo));
+	chte_reader *reader;
+	ResourceOwner owner;
+	uint64		total = 0;
+	Size		bytes = 0;
+
+	release_kept(fp);
+	for (uint64 i = lo; i < hi; i++)
+		offsets[i - lo] = i;
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, fp->part);
+	owner = ch_handle_reserve();
+	CH_CALL("reading rows by their TIDs",
+			eng->read_rows(t->handle, fp->part->name, c->names, offsets, hi - lo, &reader, CH_ERR));
+	ch_handle_opened(owner, CH_HANDLE_READER, reader);
+	pfree(offsets);
+	if (fp->missing == NULL)
+		fp->missing = MemoryContextAlloc(c->snap_cxt, sizeof(bool) * c->cols.n);
+	for (int col = 0; col < c->cols.n; col++)
+		fp->missing[col] = !eng->read_present(reader, col);
+	for (;;)
+	{
+		uint32		nrows;
+		KeptBatch  *kb;
+		chte_vector *vectors;
+
+		CH_CALL("reading rows by their TIDs", eng->read_next(reader, &nrows, CH_ERR));
+		if (nrows == 0)
+			break;
+		if (fp->nkept == fp->kept_cap)
+		{
+			fp->kept_cap = Max(fp->kept_cap * 2, 4);
+			fp->kept = fp->kept == NULL ?
+				MemoryContextAlloc(c->snap_cxt, sizeof(KeptBatch) * fp->kept_cap) :
+				repalloc(fp->kept, sizeof(KeptBatch) * fp->kept_cap);
+		}
+		vectors = MemoryContextAlloc(c->snap_cxt, sizeof(chte_vector) * c->cols.n);
+		kb = &fp->kept[fp->nkept++];
+		kb->first = lo + total;
+		kb->nrows = nrows;
+		kb->vectors = vectors;
+		kb->keep = NULL;
+		for (int col = 0; col < c->cols.n; col++)
+			CH_CALL("reading rows by their TIDs", eng->read_vector(reader, col, &vectors[col], CH_ERR));
+		kb->keep = eng->read_retain(reader);
+		if (kb->keep == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory keeping rows of the engine library")));
+		total += nrows;
+		bytes += kept_bytes(t, &c->cols, kb);
+	}
+	ch_handle_closing(owner, CH_HANDLE_READER, reader);
+	eng->read_end(reader);
+	if (total != hi - lo || bytes > (Size) work_mem * 1024)
+	{
+		if (bytes > (Size) work_mem * 1024)
+			c->no_windows = true;
+		release_kept(fp);
+		return false;
+	}
+	fp->win_lo = lo;
+	fp->win_hi = hi;
+	return true;
+}
+
+/* The kept row at offset, into the slot */
+static void
+fill_from_kept(Relation rel, ChTable *t, ChFetchCache *c, FetchPart *fp, uint64 offset, TupleTableSlot *slot)
+{
+	ChScanDescData scan;
+	KeptBatch  *kb = NULL;
+
+	for (int i = 0; i < fp->nkept; i++)
+		if (offset >= fp->kept[i].first && offset < fp->kept[i].first + fp->kept[i].nrows)
+		{
+			kb = &fp->kept[i];
+			break;
+		}
+	Assert(kb != NULL);
+	memset(&scan, 0, sizeof(scan));
+	scan.base.rs_rd = rel;
+	scan.table = t;
+	scan.fitted = true;
+	scan.ncols = c->cols.n;
+	scan.attnos = c->cols.attnos;
+	scan.vectors = kb->vectors;
+	scan.missing = fp->missing;
+	MemoryContextReset(c->row_cxt);
+	fill_row(&scan, (uint32) (offset - kb->first), slot, c->row_cxt);
+	ExecMaterializeSlot(slot);
+	count_fetch(&c->cols, 1);
+}
+
+/* The row at offset of the part into the slot, from its kept granule, a granule kept now, or alone */
+static bool
+fetch_at(Relation rel, ChTable *t, ChFetchCache *c, FetchPart *fp, uint64 rowid, uint64 offset,
+		 TupleTableSlot *slot)
+{
+	ChPart	   *part = fp->part;
+	int			g = t->options.index_granularity;
+	HeapTuple	row;
+	uint64		id;
+
+	if (fp->win_hi > 0 && offset >= fp->win_lo && offset < fp->win_hi)
+	{
+		ch_fetch_counts.kept++;
+		fill_from_kept(rel, t, c, fp, offset, slot);
+		return true;
+	}
+	/* granules of index_granularity rows each: the row's, read whole */
+	if (!c->no_windows && ch_enable_fetch_cache && g > 0 && (uint64) offset < (uint64) part->rows &&
+		(int64) part->marks == (part->rows + g - 1) / g)
+	{
+		uint64		lo = offset - offset % g;
+		uint64		hi = Min(lo + g, (uint64) part->rows);
+
+		if (keep_window(t, c, fp, lo, hi))
+		{
+			fill_from_kept(rel, t, c, fp, offset, slot);
+			return true;
+		}
+	}
+	if (read_rows_at(rel, t, part, &offset, 1, slot->tts_tupleDescriptor, &c->cols, &row, &id) != 1)
+		return false;
+	if (c->cols.whole)
+		remember_fetch(rel, rowid, slot->tts_tupleDescriptor, row);
+	ExecForceStoreHeapTuple(row, slot, true);
+	return true;
+}
+
+/*
+ * A row by its TID into the slot, of the cache's columns, the slot's other
+ * attributes NULL, through the cache where the snapshot is an MVCC one.
+ */
+bool
+ch_fetch_row_cached(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
+					ChFetchCache *c)
+{
+	uint64		rowid;
+	ChTable    *t;
+	bool		found = false;
+
+	if (!tid_rowid(tid, &rowid))
+		return false;
+	if (snapshot && IsMVCCSnapshot(snapshot))
+		PredicateLockRelation(rel, snapshot);
+	if (ch_buffer_fetch(rel, rowid, snapshot, slot))
+		return true;
+	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC || !ch_enable_fetch_cache)
+		return fetch_uncached(rel, tid, rowid, snapshot, slot, &c->cols);
+
+	t = ch_table(rel);
+	ch_table_pin(t);
+	PG_TRY();
+	{
+		if (!snapshot_cached(c, rel, snapshot))
+			cache_snapshot(c, rel, t, snapshot);
+		if (!cached_row_deleted(c, t, snapshot, rowid))
+		{
+			for (int i = 0; i < c->nparts && !found; i++)
+			{
+				FetchPart  *fp = &c->fparts[i];
+				uint64		offset;
+
+				if ((int64) rowid < fp->part->min_rowid || (int64) rowid > fp->part->max_rowid)
+					continue;
+				offset = locate(t, c, fp, rowid);
+				if (offset != PG_UINT64_MAX)
+					found = fetch_at(rel, t, c, fp, rowid, offset, slot);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		ch_table_unpin(t);
+	}
+	PG_END_TRY();
+	if (found)
+	{
+		slot->tts_tid = *tid;
+		slot->tts_tableOid = RelationGetRelid(rel);
+	}
+	return found;
+}
+
 /*
  * A bitmap scan's next row: the TIDs of the bitmap's next block, exact or
  * the whole block where it is lossy, those no deletion the snapshot sees
- * names, read from the parts holding them, materialized for the block.
+ * names, read from the parts holding them, materialized for the block, of
+ * the columns its node reads (fetch.c), the others NULL.
  */
 bool
 ch_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot, bool *recheck, uint64 *lossy_pages,
@@ -1450,6 +2071,17 @@ ch_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot, bool *reche
 		}
 		if (scan->bm_cxt == NULL)
 			scan->bm_cxt = AllocSetContextCreate(scan->scan_cxt, "ch bitmap block", ALLOCSET_DEFAULT_SIZES);
+		/* the columns the slot's node reads (fetch.c), or every one */
+		if (scan->bm_cols == NULL)
+		{
+			int			ncols;
+			const AttrNumber *attnums = NULL;
+
+			scan->bm_cols = MemoryContextAlloc(scan->scan_cxt, sizeof(FetchCols));
+			if (!ch_fetch_slot_columns(scan->base.rs_rd, slot, &ncols, &attnums))
+				ncols = -1;
+			fetch_cols(scan->table, ncols, attnums, scan->scan_cxt, scan->bm_cols);
+		}
 		MemoryContextReset(scan->bm_cxt);
 		old = MemoryContextSwitchTo(scan->bm_cxt);
 		scan->bm_rows = palloc(sizeof(HeapTuple) * TBM_MAX_TUPLES_PER_PAGE);
@@ -1475,7 +2107,8 @@ ch_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot, bool *reche
 			if (first >= last)
 				continue;
 			got = read_rows_by_id(scan->base.rs_rd, scan->table, p, rowids + first, last - first,
-								  RelationGetDescr(scan->base.rs_rd), scan->bm_rows + scan->bm_nrows, ids);
+								  RelationGetDescr(scan->base.rs_rd), scan->bm_cols,
+								  scan->bm_rows + scan->bm_nrows, ids);
 			/* rows found leave the list: no other part holds them */
 			if (got > 0)
 			{
@@ -1596,4 +2229,187 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 	}
 	ch_table_unpin(t);
 	pfree(names.data);
+}
+
+/* ---- the order of a serial scan's rows (VC4) ---- */
+
+/*
+ * Whether rows of a column's equal values lie together wherever ClickHouse
+ * sorted them: its order's equality is the type's default equality --
+ * integers, dates and times by their values, floats by theirs (-0 = 0, NaN
+ * = NaN, as both have them), numeric(p, s) as Decimal, text, varchar and
+ * bytea of a deterministic collation by their bytes, uuid and name by
+ * theirs.  Not bpchar (its trailing spaces), unconstrained numeric (kept as
+ * its bytes, 1.0 and 1.00 two), interval and the rest.
+ */
+static bool
+key_equality_kept(Relation rel, AttrNumber attnum, const ChColumn *col)
+{
+	Form_pg_attribute att;
+	Oid			typid;
+
+	if (attnum < 1 || attnum > RelationGetNumberOfAttributes(rel))
+		return false;
+	att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+	if (att->attisdropped)
+		return false;
+	typid = getBaseType(att->atttypid);
+	switch (col->kind)
+	{
+		case CH_COL_FIXED:
+			return typid == BOOLOID || typid == INT2OID || typid == INT4OID || typid == INT8OID ||
+				typid == OIDOID || typid == CHAROID || typid == DATEOID || typid == TIMEOID ||
+				typid == TIMESTAMPOID || typid == TIMESTAMPTZOID || typid == FLOAT4OID ||
+				typid == FLOAT8OID || typid == UUIDOID || typid == NAMEOID;
+		case CH_COL_NUMERIC:
+			return true;
+		case CH_COL_VARLENA:
+			if (typid == BYTEAOID)
+				return true;
+			return (typid == TEXTOID || typid == VARCHAROID) &&
+				(!OidIsValid(att->attcollation) || get_collation_isdeterministic(att->attcollation));
+		default:
+			return false;
+	}
+}
+
+/*
+ * The attributes the table's rows are sorted by in each part -- its
+ * order_by -- as far as their order's equality is their types' own, at most
+ * max of them into attnums; how many.
+ */
+int
+ch_table_ordering(Relation rel, int max, AttrNumber *attnums)
+{
+	ChTable    *t = ch_table(rel);
+	char	   *copy;
+	List	   *names;
+	ListCell   *lc;
+	int			n = 0;
+
+	if (t->options.order_by == NULL)
+		return 0;
+	copy = pstrdup(t->options.order_by);
+	if (!SplitIdentifierString(copy, ',', &names))
+		return 0;
+	foreach(lc, names)
+	{
+		AttrNumber	attnum = get_attnum(RelationGetRelid(rel), lfirst(lc));
+
+		if (n >= max || attnum < 1 || attnum > t->natts || !key_equality_kept(rel, attnum, &t->columns[attnum - 1]))
+			break;
+		attnums[n++] = attnum;
+	}
+	return n;
+}
+
+typedef struct PartRange
+{
+	ChPart	   *part;
+	bool		has_values;
+	Datum		min;
+	Datum		max;
+	int64		nulls;
+} PartRange;
+
+static FmgrInfo *parts_cmp;
+static Oid	parts_collation;
+
+static int
+compare_ranges(const void *a, const void *b)
+{
+	const PartRange *x = a;
+	const PartRange *y = b;
+
+	/* a part of NULLs alone after the others */
+	if (x->has_values != y->has_values)
+		return x->has_values ? -1 : 1;
+	if (!x->has_values)
+		return 0;
+	return DatumGetInt32(FunctionCall2Coll(parts_cmp, parts_collation, x->min, y->min));
+}
+
+/*
+ * How far the parts, read one after another in *ordered, hand their rows in
+ * the order of the table's key, by their least and greatest values of its
+ * first column, first_key: 2, its every column -- one part, or parts whose
+ * ranges are apart; 1, its first column alone -- the ranges meet at their
+ * ends, where rows of the same first value end one part and begin the next;
+ * 0, no order -- they overlap, a part's statistics keep no least and
+ * greatest values, or a part's NULLs, which sort last, are not the last
+ * rows read.
+ */
+int
+ch_parts_order(Relation rel, ChTable *t, List *parts, AttrNumber first_key, List **ordered)
+{
+	int			n = list_length(parts);
+	PartRange  *ranges;
+	TypeCacheEntry *tc;
+	ListCell   *lc;
+	int			level = 2;
+	int			i = 0;
+
+	*ordered = parts;
+	if (n <= 1)
+		return 2;
+	if (first_key < 1 || first_key > t->natts)
+		return 0;
+	ranges = palloc(sizeof(PartRange) * n);
+	foreach(lc, parts)
+	{
+		PartRange  *r = &ranges[i++];
+
+		r->part = lfirst(lc);
+		if (!ch_part_minmax(t, r->part, first_key, &r->has_values, &r->min, &r->max, &r->nulls))
+			return 0;
+	}
+	tc = lookup_type_cache(TupleDescAttr(RelationGetDescr(rel), first_key - 1)->atttypid, TYPECACHE_CMP_PROC_FINFO);
+	if (!OidIsValid(tc->cmp_proc_finfo.fn_oid))
+		return 0;
+	parts_cmp = &tc->cmp_proc_finfo;
+	parts_collation = TupleDescAttr(RelationGetDescr(rel), first_key - 1)->attcollation;
+	qsort(ranges, n, sizeof(PartRange), compare_ranges);
+	for (i = 0; i < n - 1; i++)
+	{
+		int			c;
+
+		/* only the last part read may hold NULLs */
+		if (ranges[i].nulls > 0 || !ranges[i].has_values || !ranges[i + 1].has_values)
+			return 0;
+		c = DatumGetInt32(FunctionCall2Coll(parts_cmp, parts_collation, ranges[i].max, ranges[i + 1].min));
+		if (c > 0)
+			return 0;
+		if (c == 0)
+			level = 1;
+	}
+	*ordered = NIL;
+	for (i = 0; i < n; i++)
+		*ordered = lappend(*ordered, ranges[i].part);
+	return level;
+}
+
+/*
+ * Before a serial scan's first batch: its parts in the order of the table's
+ * key, where they can be (ch_parts_order()); how far it hands its rows in
+ * that order.  A parallel scan's participants claim their units in any
+ * order: none.
+ */
+int
+ch_scan_order_parts(TableScanDesc sscan, AttrNumber first_key)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	List	   *ordered;
+	int			level;
+
+	if (scan->base.rs_parallel != NULL || scan->part != NULL || scan->next_unit > 0)
+		return 0;
+	level = ch_parts_order(scan->base.rs_rd, scan->table, scan->parts, first_key, &ordered);
+	if (level > 0)
+	{
+		MemoryContext old = MemoryContextSwitchTo(scan->scan_cxt);
+
+		scan->parts = list_copy(ordered);
+		MemoryContextSwitchTo(old);
+	}
+	return level;
 }

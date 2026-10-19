@@ -87,6 +87,10 @@ typedef struct ChStorageId
 
 /* module.c */
 extern bool ch_enable_chscan;
+extern bool ch_enable_fetch_columns;
+extern bool ch_enable_fetch_cache;
+extern double ch_fetch_cost;
+extern double ch_fetch_value_cost;
 extern int	ch_insert_buffer_rows;
 extern int	ch_insert_buffer_bytes;
 extern int	ch_default_storage;
@@ -345,6 +349,10 @@ extern void ch_index_validate_scan(Relation table_rel, Relation index_rel, struc
 
 /* chscan.c: ChScan (§2.8) */
 extern void ch_chscan_init(void);
+
+/* fetch.c: fetches by TID, their columns and their price (VC16) */
+extern void ch_fetch_init(void);
+extern double ch_fetch_price(Relation rel, int ncols);
 
 /* vexec.c: vexec's batch source and sink (§3) */
 extern void ch_vexec_register(void);

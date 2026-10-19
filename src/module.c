@@ -28,6 +28,10 @@ PG_MODULE_MAGIC_EXT(.name = "ch_table_engines", .version = "0.1");
 int			ch_insert_buffer_rows = 1048576;
 int			ch_insert_buffer_bytes = 256 * 1024;	/* kB */
 int			ch_default_storage = CH_STORAGE_PAGES;
+bool		ch_enable_fetch_columns = true;
+bool		ch_enable_fetch_cache = true;
+double		ch_fetch_cost = 55.0;
+double		ch_fetch_value_cost = 0.0025;
 bool		ch_preloaded = false;
 
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
@@ -194,6 +198,37 @@ _PG_init(void)
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_fetch_columns",
+							 "Whether a fetch of a row by its TID decodes only the columns its scan reads.",
+							 "Off, a fetch decodes a granule of every column of the table, whatever the query "
+							 "reads of it.",
+							 &ch_enable_fetch_columns,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_fetch_cache",
+							 "Whether an index scan's fetches by TID keep the snapshot's parts and deletions, "
+							 "located row ids and the last granule read.",
+							 NULL,
+							 &ch_enable_fetch_cache,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("ch.fetch_cost",
+							 "The planner's cost of finding a row by its TID, beside its columns' granules.",
+							 "Added to each index scan's cost a row it fetches; 0 with ch.fetch_value_cost "
+							 "prices a fetch as PostgreSQL's random page alone.",
+							 &ch_fetch_cost,
+							 55.0, 0.0, 1e10,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("ch.fetch_value_cost",
+							 "The planner's cost of decoding a value of a granule a fetch by TID reads.",
+							 "A fetch decodes a granule, index_granularity rows, of each column it reads.",
+							 &ch_fetch_value_cost,
+							 0.0025, 0.0, 1e10,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 	MarkGUCPrefixReserved("ch");
 
 	ch_options_init();
@@ -205,6 +240,7 @@ _PG_init(void)
 	RegisterSubXactCallback(ch_subxact_callback, NULL);
 
 	ch_chscan_init();
+	ch_fetch_init();
 
 	if (ch_preloaded)
 	{

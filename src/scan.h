@@ -103,4 +103,49 @@ extern bool ch_column_minmax_kept(const ChColumn *col);
 /* The parts a serial scan reads, its units, and whether the snapshot sees a deleted row */
 extern void ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted);
 
+/*
+ * Rows by their TIDs (VC16): of the columns attnums[0 .. n), 1-based, or of
+ * every one where n < 0, the slot's other attributes NULL; through a cache
+ * of the snapshot's parts and deletions, located row ids and a granule kept
+ * (ch_fetch_cache_create()), which its context's reset or deletion releases.
+ */
+typedef struct ChFetchCache ChFetchCache;
+extern ChFetchCache *ch_fetch_cache_create(MemoryContext parent, Relation rel, int n, const AttrNumber *attnums);
+extern void ch_fetch_cache_free(ChFetchCache *cache);
+extern bool ch_fetch_row_cached(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
+								ChFetchCache *cache);
+extern bool ch_fetch_row_columns(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
+								 int n, const AttrNumber *attnums);
+
+/*
+ * The order a serial scan's rows come in (VC4): the table's key, as far as
+ * its order's equality is its columns' types' own (ch_table_ordering()), and
+ * how far parts read one after another keep it -- 2 every key column, 1 the
+ * first, 0 none (ch_parts_order()); a serial scan's parts put in that order
+ * before its first batch (ch_scan_order_parts()).
+ */
+extern int	ch_table_ordering(Relation rel, int max, AttrNumber *attnums);
+extern int	ch_parts_order(Relation rel, ChTable *t, List *parts, AttrNumber first_key, List **ordered);
+extern int	ch_scan_order_parts(TableScanDesc scan, AttrNumber first_key);
+
+/* What fetches by TID read in this backend (ch.fetch_stats()) */
+typedef struct ChFetchStats
+{
+	int64		fetches;		/* rows read from a part by their TIDs */
+	int64		values;			/* the columns decoded for them, summed */
+	int64		whole;			/* those rows read of every column */
+	int64		kept;			/* rows taken from a granule kept from a fetch before */
+	int64		located;		/* row ids found among offsets located before */
+} ChFetchStats;
+extern ChFetchStats ch_fetch_counts;
+
+/*
+ * fetch.c: the columns a fetch into a slot reads, where they are known --
+ * the scans of the running statements' plans, and a batch source's caller's
+ * (fetch_columns()) -- and the slot's cache, made at its first fetch
+ */
+extern bool ch_fetch_slot_columns(Relation rel, TupleTableSlot *slot, int *n, const AttrNumber **attnums);
+extern ChFetchCache *ch_fetch_cache_for(Relation rel, TupleTableSlot *slot);
+extern void ch_fetch_set_columns(Relation rel, TupleTableSlot *slot, int n, const AttrNumber *attnums);
+
 #endif							/* CHTE_SCAN_H */

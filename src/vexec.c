@@ -49,7 +49,12 @@
  *	  statistics show no row within them.  estimate() is the needed columns'
  *	  compressed bytes in the granules the quals keep, and their rows;
  *	  estimate_ex() (the contract's minor 3, VC13) adds the parts a serial
- *	  scan reads, and whether aggregate() answers every one of them.
+ *	  scan reads, and whether aggregate() answers every one of them, and
+ *	  from minor 4 the price of a fetch by TID of the spec's columns (VC16,
+ *	  fetch.c), which fetch_columns() makes a fetch into a slot read alone.
+ *	  ordering() (minor 4, VC4) is the table's key, as far as its parts,
+ *	  read one after another in the key's order, keep it -- one part, or
+ *	  parts whose ranges of its first column are apart.
  *
  *	  The sink.  VecInsert's batches go into the write buffer (buffer.c) by
  *	  column, in the layouts ClickHouse's columns have, as rows of the same
@@ -78,6 +83,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "varatt.h"
 
 #include "vexec/vexec_sink.h"
@@ -164,6 +170,9 @@ typedef struct SrcState
 	ScanKeyData *bound_keys;
 	/* aggregate()'s by-reference answers, until the next call */
 	MemoryContext answer_cxt;
+	/* VEXEC_SRC_ORDERED: the key's attributes this scan hands its rows in the order of (VC4) */
+	int			norder;
+	AttrNumber *order;
 } SrcState;
 
 static uint64 null_row = 0;		/* a constant's validity: its one value NULL */
@@ -322,6 +331,24 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 			for (int i = 0; i < n; i++)
 				st->cols[i].dict = keep[i];
 		pfree(keep);
+	}
+	/*
+	 * VC4: a serial scan's parts read in the order of the table's key, where
+	 * their ranges of its first column are apart -- its rows then come in
+	 * that order -- or meet, the first column's alone
+	 */
+	if (flags & VEXEC_SRC_ORDERED)
+	{
+		int			k;
+
+		st->order = palloc(sizeof(AttrNumber) * Max(t->natts, 1));
+		k = ch_table_ordering(rel, t->natts, st->order);
+		if (k > 0)
+		{
+			int			level = ch_scan_order_parts(scan, st->order[0]);
+
+			st->norder = level == 2 ? k : level == 1 ? 1 : 0;
+		}
 	}
 	if (spec->quals != NIL)
 		(void) ch_scan_set_filter(scan, spec->quals);
@@ -981,6 +1008,61 @@ src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, Ve
 		est->units = units;
 	if (est->size >= offsetof(VexecSourceEstimate, flags) + sizeof(est->flags))
 		est->flags = flags;
+	/* minor 4 (VC16): a row fetched by its TID, the spec's columns decoded */
+	if (est->size >= offsetof(VexecSourceEstimate, fetch) + sizeof(est->fetch) &&
+		(ch_fetch_cost > 0 || ch_fetch_value_cost > 0))
+		est->fetch = ch_fetch_price(rel, spec->ncolumns);
+}
+
+/*
+ * fetch_columns() (minor 4, VC16): the columns a fetch by TID into the slot
+ * decodes (fetch.c), the slot's others left NULL
+ */
+static void
+src_fetch_columns(Relation rel, TupleTableSlot *slot, int n, const AttrNumber *attnums)
+{
+	if (ch_enable_fetch_columns)
+		ch_fetch_set_columns(rel, slot, n, attnums);
+}
+
+/*
+ * ordering() (minor 4, VC4): the table's key, as far as its parts, read one
+ * after another, keep its order -- those the snapshot sees now, for the
+ * planner; a scan's, as it began.
+ */
+static int
+src_ordering(Relation rel, void *arg, int max, AttrNumber *attnums)
+{
+	SrcState   *st = arg;
+	ChTable    *t;
+	List	   *parts;
+	List	   *ordered;
+	int			k;
+	int			level;
+
+	if (st != NULL)
+	{
+		k = Min(st->norder, max);
+		for (int i = 0; i < k; i++)
+			attnums[i] = st->order[i];
+		return k;
+	}
+	k = ch_table_ordering(rel, max, attnums);
+	if (k == 0)
+		return 0;
+	t = ch_table(rel);
+	ch_table_pin(t);
+	PG_TRY();
+	{
+		parts = ch_parts_to_scan(&t->storage, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL);
+		level = ch_parts_order(rel, t, parts, attnums[0], &ordered);
+	}
+	PG_FINALLY();
+	{
+		ch_table_unpin(t);
+	}
+	PG_END_TRY();
+	return level == 2 ? k : level == 1 ? 1 : 0;
 }
 
 /* An aggregate's answer from a whole part's statistics; false where there is none */
@@ -1229,6 +1311,8 @@ ch_vexec_register(void)
 		r->set_keys = src_set_keys;
 		r->dictionary_id = src_dictionary_id;
 		r->estimate_ex = src_estimate_ex;
+		r->fetch_columns = src_fetch_columns;
+		r->ordering = src_ordering;
 		vexec_register_source(r);
 
 		memset(s, 0, sizeof(VexecSinkRoutine));

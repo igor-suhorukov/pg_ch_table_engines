@@ -1,0 +1,125 @@
+-- Fetches by TID (ch_table_engines.md §3, VC16): a fetch decodes only the
+-- columns its scan's node reads, as the plan above it reads them -- an
+-- index, an index-only, a bitmap and a TID scan, under joins, sorts,
+-- aggregates, appends and subqueries -- and every column where the
+-- statement modifies or locks the rows, or reads a whole row; an index
+-- scan's fetches keep the snapshot's parts and deletions, the row ids
+-- located and the last granule read; and an index path is priced by what
+-- its fetches decode.  ch.fetch_stats() counts what this session's fetches
+-- read; each query's answer is compared with its answer with every column
+-- decoded and nothing kept.
+SET client_min_messages = warning;
+CREATE TABLE fx (k int, a int, b text, c numeric(12,2), d date, w text)
+    USING mergetree WITH (order_by = 'k');
+INSERT INTO fx SELECT i / 4, i, 'b' || (i % 97), i / 7.0, DATE '2024-01-01' + i % 300, repeat('w', i % 50)
+  FROM generate_series(1, 40000) i;
+DELETE FROM fx WHERE a % 13 = 0;
+CREATE INDEX fx_k ON fx (k);
+CREATE INDEX fx_a ON fx (a);
+CREATE INDEX fx_b ON fx (b);
+ANALYZE fx;
+CREATE TABLE fo (k int, n text) USING mergetree WITH (order_by = 'k');
+INSERT INTO fo SELECT i * 37 % 10000, 'n' || i FROM generate_series(1, 300) i;
+ANALYZE fo;
+
+-- a query's first scan node, whether its answer is the one with every
+-- column decoded and nothing kept, and the columns its fetches decoded a row
+-- (every one: "all"); index paths only, unless the query's settings say
+CREATE FUNCTION fetched(q text, settings text DEFAULT '') RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  s0 record;
+  s1 record;
+  ans text;
+  ref text;
+  first text;
+  line text;
+BEGIN
+  PERFORM set_config('enable_seqscan', 'off', true), set_config('ch.enable_chscan', 'off', true);
+  IF settings <> '' THEN
+    EXECUTE settings;
+  END IF;
+  FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF first IS NULL AND line ~ 'Scan' THEN
+      first := btrim(regexp_replace(regexp_replace(line, '^.*->', ''), ' on .*$', ''));
+    END IF;
+  END LOOP;
+  SELECT * INTO s0 FROM ch.fetch_stats();
+  EXECUTE format('SELECT md5(string_agg(x::text, %L ORDER BY x::text)) FROM (%s) x', '|', q) INTO ans;
+  SELECT * INTO s1 FROM ch.fetch_stats();
+  PERFORM set_config('ch.enable_fetch_columns', 'off', true), set_config('ch.enable_fetch_cache', 'off', true);
+  EXECUTE format('SELECT md5(string_agg(x::text, %L ORDER BY x::text)) FROM (%s) x', '|', q) INTO ref;
+  PERFORM set_config('ch.enable_fetch_columns', 'on', true), set_config('ch.enable_fetch_cache', 'on', true),
+    set_config('enable_seqscan', 'on', true), set_config('ch.enable_chscan', 'on', true);
+  RETURN format('%s: %s, %s',
+    first,
+    CASE WHEN ans IS NOT DISTINCT FROM ref THEN 'same rows' ELSE 'DIFFERS' END,
+    CASE WHEN s1.fetches = s0.fetches THEN 'no fetch'
+         WHEN s1.whole - s0.whole = s1.fetches - s0.fetches THEN 'every column'
+         ELSE format('%s columns a row', round((s1.columns - s0.columns)::numeric / (s1.fetches - s0.fetches), 1))
+    END);
+END
+$$;
+
+-- the scan's quals and the columns above it: the index's key, read again
+-- from the row, and the target's; none for an index-only scan
+SELECT fetched('SELECT a, b FROM fx WHERE k = 100');
+SELECT fetched('SELECT count(*) FROM fx WHERE k BETWEEN 100 AND 200');
+SELECT fetched('SELECT a FROM fx WHERE k = 100 AND c > 50');
+SELECT fetched('SELECT * FROM fx WHERE k = 100');
+SELECT fetched('SELECT fx FROM fx WHERE k = 100');
+SELECT fetched('SELECT k, length(w) FROM fx WHERE a BETWEEN 10 AND 90');
+-- a bitmap scan's, its recheck's column among them; a TID scan's
+SELECT fetched('SELECT a, c FROM fx WHERE b IN (''b1'', ''b2'')', 'SET LOCAL enable_indexscan = off');
+SELECT fetched('SELECT a FROM fx WHERE ctid = ''(3,5)''');
+-- under the nodes above: the inner side of a nested loop, whose scan
+-- passes its rows on as they are; a sort's, an aggregate's, a limit's
+SELECT fetched('SELECT fo.n, fx.a FROM fo JOIN fx ON fx.k = fo.k',
+  'SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off; SET LOCAL enable_material = off; SET LOCAL enable_memoize = off');
+SELECT fetched('SELECT a FROM fx WHERE a < 3000 ORDER BY d DESC, a LIMIT 5');
+SELECT fetched('SELECT b, count(*), sum(c) FROM fx WHERE a < 900 GROUP BY b');
+SELECT fetched('SELECT DISTINCT d FROM fx WHERE k BETWEEN 10 AND 20');
+-- through an append, a subquery, a CTE and a subplan
+SELECT fetched('SELECT a FROM fx WHERE k = 5 UNION ALL SELECT k FROM fx WHERE k = 6');
+SELECT fetched('SELECT s.a + 1 FROM (SELECT a, b FROM fx WHERE k = 7 OFFSET 0) s');
+SELECT fetched('WITH t AS MATERIALIZED (SELECT a, b FROM fx WHERE k = 50) SELECT a FROM t');
+SELECT fetched('SELECT n, (SELECT max(c) FROM fx WHERE fx.k = fo.k) FROM fo WHERE fo.k < 500');
+-- a statement that locks the rows reads every column: its rows may be fetched again whole
+SELECT fetched('SELECT a FROM fx WHERE k = 102 FOR UPDATE');
+
+-- an update's and a delete's rows through the index: every column, and the
+-- rows as heap's would be
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL ch.enable_chscan = off;
+CREATE TEMP TABLE before_stats AS SELECT * FROM ch.fetch_stats();
+UPDATE fx SET c = c + 1 WHERE k = 101;
+DELETE FROM fx WHERE k = 103 AND a % 2 = 0;
+SELECT s.whole - b.whole = s.fetches - b.fetches AS every_column FROM ch.fetch_stats() s, before_stats b;
+COMMIT;
+SELECT k, a, c FROM fx WHERE k IN (101, 103) ORDER BY a;
+
+-- the caches: a key's rows lie together in a part, a granule read for all
+-- of them, their row ids located at once; a deleted row stays deleted
+CREATE TEMP TABLE s0 AS SELECT * FROM ch.fetch_stats();
+SELECT fetched('SELECT a, b FROM fx WHERE k BETWEEN 2000 AND 2400');
+SELECT s.kept - s0.kept > 0 AS kept, s.located - s0.located > 0 AS located FROM ch.fetch_stats() s, s0;
+SELECT count(*), sum(a) FROM fx WHERE k BETWEEN 2000 AND 2400 AND a % 13 = 0;
+
+-- the price: a fetch finds its row by its row id, and decodes a granule
+-- of each column it reads -- a granule a row for an index of a column the
+-- table is not ordered by -- so that a lookup of a value of 412 rows scans;
+-- a range of the table's own key, whose granule a pruned scan reads alone,
+-- and an index-only scan's 51 rows, each found by its row id, scan too --
+-- the same without the price takes the indexes
+EXPLAIN (COSTS OFF) SELECT a, c, d FROM fx WHERE b = 'b5';
+EXPLAIN (COSTS OFF) SELECT a, c, d FROM fx WHERE k BETWEEN 100 AND 110;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM fx WHERE a BETWEEN 100 AND 150;
+SET ch.fetch_cost = 0;
+SET ch.fetch_value_cost = 0;
+EXPLAIN (COSTS OFF) SELECT a, c, d FROM fx WHERE b = 'b5';
+RESET ch.fetch_cost;
+RESET ch.fetch_value_cost;
+SELECT fetched('SELECT a, c, d FROM fx WHERE b = ''b5''');
+
+DROP TABLE fx, fo;
+DROP FUNCTION fetched(text, text);
