@@ -105,7 +105,7 @@ extern "C" int chte_part_locate(chte_table * table, const char * part_name, cons
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_part_locate: row ids not in order");
 
         auto & storage = *table->storage;
-        auto part = storage.getPart(part_name);
+        auto part = storage.partWithProjections(part_name);
         const auto & projections = part->getProjectionParts();
         auto it = projections.find(ROWID_PROJECTION);
         if (it == projections.end() || it->second->is_broken || !table->metadata->getProjections().has(ROWID_PROJECTION))

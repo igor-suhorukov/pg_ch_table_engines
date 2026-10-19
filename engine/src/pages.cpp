@@ -15,7 +15,9 @@
 #include <IO/ReadPipeline.h>
 #include <IO/WriteBufferFromFileBase.h>
 
+#include <algorithm>
 #include <filesystem>
+#include <string_view>
 
 namespace DB::ErrorCodes
 {
@@ -32,9 +34,29 @@ namespace chte
 namespace
 {
 
+/// Whether a path is in that form already: no empty, "." or ".." component, as the manifests'
+/// names and ClickHouse's paths of a part's files are
+bool isNormal(std::string_view path)
+{
+    if (path.empty())
+        return true;
+    for (size_t start = 0;;)
+    {
+        size_t slash = path.find('/', start);
+        std::string_view component = path.substr(start, slash == std::string_view::npos ? slash : slash - start);
+        if (component.empty() || component == "." || component == "..")
+            return false;
+        if (slash == std::string_view::npos)
+            return true;
+        start = slash + 1;
+    }
+}
+
 /// A path as the manifests key it: relative to the disk, no trailing '/', no "./"
 String normalize(const String & path)
 {
+    if (isNormal(path))
+        return path;
     String p = fs::path(path).lexically_normal().string();
     while (p.size() > 1 && p.back() == '/')
         p.pop_back();
@@ -178,21 +200,19 @@ private:
 class NamesIterator final : public IDirectoryIterator
 {
 public:
-    NamesIterator(String dir_, std::vector<String> names_) : dir(std::move(dir_)), names(std::move(names_)) {}
+    NamesIterator(String dir_, PagesDisk::Entries names_) : dir(std::move(dir_)), names(std::move(names_)) {}
     void next() override { ++i; }
-    bool isValid() const override { return i < names.size(); }
-    std::string path() const override { return (fs::path(dir) / names[i]).string(); }
+    bool isValid() const override { return i < names->size(); }
+    std::string path() const override { return (fs::path(dir) / (*names)[i]).string(); }
     std::string name() const override
     {
-        String n = names[i];
-        if (!n.empty() && n.back() == '/')
-            n.pop_back();
-        return n;
+        const String & n = (*names)[i];
+        return !n.empty() && n.back() == '/' ? n.substr(0, n.size() - 1) : n;
     }
 
 private:
     String dir;
-    std::vector<String> names;
+    PagesDisk::Entries names;
     size_t i = 0;
 };
 
@@ -204,18 +224,52 @@ PagesDisk::PagesDisk(const String & name_, const String & path_, const chte_page
 {
 }
 
-void PagesDisk::attachPart(const String & part_dir, std::map<String, File> part_files)
+void PagesDisk::attachPart(const String & part_dir, const chte_page_file * part_files, size_t nfiles)
 {
     detachPart(part_dir);
     String root = normalize(part_dir);
-    dirs.insert(root);
-    for (auto & [name, f] : part_files)
+    String prefix = root.empty() ? root : root + "/";
+
+    /// the names in order, each file then going in just before the first path past the part's
+    std::vector<std::string_view> names;
+    std::vector<size_t> order(nfiles);
+    names.reserve(nfiles);
+    for (size_t i = 0; i < nfiles; ++i)
     {
-        String full = normalize(fs::path(root) / name);
-        files[full] = f;
-        /// a projection's subdirectory, and any between
-        for (fs::path d = fs::path(full).parent_path(); !d.empty() && d.string().size() > root.size(); d = d.parent_path())
-            dirs.insert(d.string());
+        names.emplace_back(part_files[i].path);
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return names[a] < names[b]; });
+
+    /// each directory's entries: the part's own, a projection's subdirectory and any between
+    std::map<String, std::vector<String>> listed;
+    auto & top = listed[root];
+    auto past = files.lower_bound(prefix);
+    for (size_t i : order)
+    {
+        String normal = isNormal(names[i]) ? String() : normalize(String(names[i]));
+        std::string_view name = normal.empty() ? names[i] : normal;
+        const auto & file = part_files[i];
+        files.insert_or_assign(past, prefix + String(name), File{file.size, file.first_block, file.nblocks});
+        auto * entries_of = &top;
+        for (size_t start = 0;;)
+        {
+            size_t slash = name.find('/', start);
+            if (slash == std::string_view::npos)
+            {
+                entries_of->emplace_back(name.substr(start));
+                break;
+            }
+            entries_of->emplace_back(name.substr(start, slash + 1 - start));
+            entries_of = &listed[prefix + String(name.substr(0, slash))];
+            start = slash + 1;
+        }
+    }
+    for (auto & [dir, list] : listed)
+    {
+        std::sort(list.begin(), list.end());
+        list.erase(std::unique(list.begin(), list.end()), list.end());
+        dirs[dir] = std::make_shared<const std::vector<String>>(std::move(list));
     }
 }
 
@@ -225,7 +279,7 @@ void PagesDisk::detachPart(const String & part_dir)
     String prefix = root + "/";
     for (auto it = files.lower_bound(prefix); it != files.end() && it->first.starts_with(prefix);)
         it = files.erase(it);
-    for (auto it = dirs.lower_bound(root); it != dirs.end() && (*it == root || it->starts_with(prefix));)
+    for (auto it = dirs.lower_bound(root); it != dirs.end() && (it->first == root || it->first.starts_with(prefix));)
         it = dirs.erase(it);
 }
 
@@ -246,18 +300,10 @@ const PagesDisk::File * PagesDisk::findFile(const String & path) const
     return it == files.end() ? nullptr : &it->second;
 }
 
-std::vector<String> PagesDisk::entries(const String & dir) const
+PagesDisk::Entries PagesDisk::entries(const String & dir) const
 {
-    String root = normalize(dir);
-    String prefix = root + "/";
-    std::set<String> names;
-    for (auto it = files.lower_bound(prefix); it != files.end() && it->first.starts_with(prefix); ++it)
-    {
-        String rest = it->first.substr(prefix.size());
-        auto slash = rest.find('/');
-        names.insert(slash == String::npos ? rest : rest.substr(0, slash + 1));
-    }
-    return {names.begin(), names.end()};
+    auto it = dirs.find(normalize(dir));
+    return it == dirs.end() ? nullptr : it->second;
 }
 
 bool PagesDisk::existsFile(const String & path) const
@@ -303,22 +349,27 @@ size_t PagesDisk::getFileSize(const String & path) const
 DirectoryIteratorPtr PagesDisk::iterateDirectory(const String & path) const
 {
     if (inMemory(path))
-        return std::make_unique<NamesIterator>(path, memoryEntries(path));
-    if (dirs.contains(normalize(path)))
-        return std::make_unique<NamesIterator>(path, entries(path));
+        return std::make_unique<NamesIterator>(path, std::make_shared<const std::vector<String>>(memoryEntries(path)));
+    if (auto names = entries(path))
+        return std::make_unique<NamesIterator>(path, std::move(names));
     return DiskLocal::iterateDirectory(path);
 }
 
 void PagesDisk::listFiles(const String & path, std::vector<String> & file_names) const
 {
-    if (inMemory(path) || dirs.contains(normalize(path)))
+    Entries names;
+    if (inMemory(path))
+        names = std::make_shared<const std::vector<String>>(memoryEntries(path));
+    else
+        names = entries(path);
+    if (!names)
     {
-        file_names.clear();
-        for (auto & n : inMemory(path) ? memoryEntries(path) : entries(path))
-            file_names.push_back(n.back() == '/' ? n.substr(0, n.size() - 1) : n);
+        DiskLocal::listFiles(path, file_names);
         return;
     }
-    DiskLocal::listFiles(path, file_names);
+    file_names.clear();
+    for (const auto & n : *names)
+        file_names.push_back(n.back() == '/' ? n.substr(0, n.size() - 1) : n);
 }
 
 Poco::Timestamp PagesDisk::getLastModified(const String & path) const
