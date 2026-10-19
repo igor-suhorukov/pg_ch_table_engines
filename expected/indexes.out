@@ -52,15 +52,15 @@ SELECT via_index('SELECT * FROM ix WHERE a = 42');
 (1 row)
 
 SELECT via_index('SELECT a, b FROM ix WHERE a BETWEEN 100 AND 300');
-       via_index        
-------------------------
- Bitmap Heap Scan on ix
+          via_index          
+-----------------------------
+ Index Scan using ix_a on ix
 (1 row)
 
 SELECT via_index('SELECT a FROM ix WHERE a > 100000');
-       via_index        
-------------------------
- Bitmap Heap Scan on ix
+            via_index             
+----------------------------------
+ Index Only Scan using ix_a on ix
 (1 row)
 
 SELECT via_index('SELECT a FROM ix WHERE a = 99');
@@ -100,9 +100,9 @@ SELECT via_index('SELECT a FROM ix WHERE a % 100 = 7 AND a > 1000');
 (1 row)
 
 SELECT via_index('SELECT count(*) FROM ix WHERE a < 2500');
-       via_index        
-------------------------
- Bitmap Heap Scan on ix
+            via_index             
+----------------------------------
+ Index Only Scan using ix_a on ix
 (1 row)
 
 -- a bitmap scan over many TID blocks, lossy where work_mem is small
@@ -177,9 +177,9 @@ SELECT via_index('SELECT count(*) FROM ix WHERE a BETWEEN 500 AND 600');
 REINDEX TABLE ix;
 VACUUM ix;
 SELECT via_index('SELECT a, b FROM ix WHERE a BETWEEN 100 AND 300');
-       via_index        
-------------------------
- Bitmap Heap Scan on ix
+          via_index          
+-----------------------------
+ Index Scan using ix_a on ix
 (1 row)
 
 -- the deletions folded into the parts: the rows found through the new versions' projections
@@ -190,9 +190,9 @@ SELECT ch.fold('ix') > 0 AS folded;
 (1 row)
 
 SELECT via_index('SELECT a, b FROM ix WHERE a BETWEEN 100 AND 300');
-       via_index        
-------------------------
- Bitmap Heap Scan on ix
+          via_index          
+-----------------------------
+ Index Scan using ix_a on ix
 (1 row)
 
 SELECT via_index('SELECT a, c FROM ix WHERE c @> ARRAY[5, 7]');
@@ -242,9 +242,9 @@ SET client_min_messages = warning;
 RESET max_parallel_maintenance_workers;
 RESET min_parallel_table_scan_size;
 SELECT via_index('SELECT a, b FROM ix WHERE a BETWEEN 100 AND 300');
-       via_index        
-------------------------
- Bitmap Heap Scan on ix
+           via_index           
+-------------------------------
+ Index Scan using ix_par on ix
 (1 row)
 
 DROP INDEX ix_par, ix_par_c;

@@ -127,6 +127,14 @@ CREATE FUNCTION ch.table_size(rel regclass) RETURNS bigint
 CREATE FUNCTION ch.engine_info(OUT version text, OUT threads integer, OUT functions integer)
 	AS 'MODULE_PATHNAME', 'ch_engine_info' LANGUAGE C STRICT VOLATILE;
 
+-- What this session's fetches of rows by their TIDs read (ch_table_engines.md
+-- §3, VC16): the rows read from a part, the columns decoded for them, those
+-- rows read of every column, the rows taken from a granule kept from a fetch
+-- before, and the row ids found among offsets located before.
+CREATE FUNCTION ch.fetch_stats(OUT fetches bigint, OUT columns bigint, OUT whole bigint,
+							   OUT kept bigint, OUT located bigint)
+	AS 'MODULE_PATHNAME', 'ch_fetch_stats' LANGUAGE C STRICT VOLATILE;
+
 -- The deletions every snapshot sees, folded into their parts (§2.10): each
 -- part holding their rows written again without them, their tombstones
 -- gone.  Returns the rows folded.

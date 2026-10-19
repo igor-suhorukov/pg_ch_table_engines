@@ -65,7 +65,14 @@ directories go.  The other engines' tables do not merge yet.
 
 Indexes.  btree, hash, GiST, GIN and SP-GiST: their entries are the rows'
 TIDs, and a row is found by its TID through the part's `_pg_rowid`
-projection; index, bitmap and index-only scans work.  Not yet: unique
+projection; index, bitmap and index-only scans work.  A fetch decodes a
+granule of each column it reads, and only the columns its scan's plan
+reads (`ch.enable_fetch_columns`) -- an index-only scan's none -- and an
+index scan's fetches keep the snapshot's parts and deletions, the row ids
+located and the last granule decoded (`ch.enable_fetch_cache`), so that a
+key's rows, together in a part, decode one; the planner prices an index
+path by what its fetches decode (`ch.fetch_cost` a row, `ch.fetch_value_cost`
+a value of a granule), and `ch.fetch_stats()` counts what they read.  Not yet: unique
 indexes and exclusion constraints, and so primary keys and ON CONFLICT's
 arbiters; CREATE INDEX CONCURRENTLY.  BRIN is refused: the parts keep min/max
 statistics of their own.
@@ -79,10 +86,13 @@ out are not read; `EXPLAIN` shows its columns and the quals it prunes by,
 [vexec](https://github.com/igor-suhorukov/pg_accel) preloaded, the tables have
 a batch source -- vexec's scans read ClickHouse's columns as they lie, prune
 as ChScan does, answer `count(*)` and the integers' `min` and `max` from the
-parts' statistics, pass parts a sort's bound rules out over, and hand a
+parts' statistics, pass parts a sort's bound rules out over, hand a
 `low_cardinality` column as its dictionary, which vexec evaluates its filters
-and expressions over once and groups by (`vexec.batch_dictionary`) -- and a
-batch sink, through which vexec's INSERT writes columns into a table.
+and expressions over once and groups by (`vexec.batch_dictionary`), hand a
+serial scan's rows in the key's order where the parts' ranges of its first
+column are apart, which vexec groups as they come (`vexec.enable_sorted_agg`),
+and fetch a sort's late columns alone, at their price -- and a batch sink,
+through which vexec's INSERT writes columns into a table.
 
 Loading.  Preloaded, the postmaster maps the engine library and calls
 nothing of it (`ch.engine_preload`), so that every process forked from it --

@@ -42,9 +42,19 @@
 #include "scan.h"
 #include "tombstones.h"
 
+/*
+ * An index scan's fetches (VC16): through the cache of the slot they fill,
+ * where fetch.c knows its columns, or a cache of the scan's own, of every
+ * column, made at its first fetch -- the snapshot's parts and deletions read
+ * once, and the rows of one key, adjacent in a part, a granule's read.
+ */
 typedef struct ChIndexFetch
 {
 	IndexFetchTableData base;
+	MemoryContext cxt;			/* where it began */
+	TupleTableSlot *slot;		/* the slot of the last fetch, and its cache */
+	ChFetchCache *cache;
+	ChFetchCache *own;			/* every column's, for a slot fetch.c does not know */
 } ChIndexFetch;
 
 struct IndexFetchTableData *
@@ -53,6 +63,7 @@ ch_index_fetch_begin(Relation rel, uint32 flags)
 	ChIndexFetch *f = palloc0(sizeof(ChIndexFetch));
 
 	f->base.rel = rel;
+	f->cxt = CurrentMemoryContext;
 	return &f->base;
 }
 
@@ -64,6 +75,10 @@ ch_index_fetch_reset(struct IndexFetchTableData *data)
 void
 ch_index_fetch_end(struct IndexFetchTableData *data)
 {
+	ChIndexFetch *f = (ChIndexFetch *) data;
+
+	if (f->own)
+		ch_fetch_cache_free(f->own);
 	pfree(data);
 }
 
@@ -91,13 +106,40 @@ bool
 ch_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid, Snapshot snapshot,
 					 TupleTableSlot *slot, bool *call_again, bool *all_dead)
 {
+	ChIndexFetch *f = (ChIndexFetch *) scan;
 	Relation	rel = scan->rel;
 	bool		found;
 
 	*call_again = false;			/* no chains: a TID is one row */
 	if (all_dead)
 		*all_dead = false;
-	found = ch_fetch_row(rel, tid, snapshot, slot);
+	/*
+	 * The planner's probe of an index's ends for a range's estimate
+	 * (selfuncs.c, get_actual_variable_endpoint(), the one fetch under a
+	 * non-vacuumable snapshot) asks only whether the row is there, its value
+	 * the index tuple's: no column read, where it would read a granule of
+	 * every one
+	 */
+	if (snapshot && snapshot->snapshot_type == SNAPSHOT_NON_VACUUMABLE &&
+		ch_fetch_cache_for(rel, slot) == NULL)
+	{
+		found = ch_fetch_row_columns(rel, tid, snapshot, slot, 0, NULL);
+		if (found)
+			pgstat_count_heap_fetch(rel);
+		return found;
+	}
+	if (f->slot != slot || f->cache == NULL)
+	{
+		f->slot = slot;
+		f->cache = ch_fetch_cache_for(rel, slot);
+		if (f->cache == NULL)
+		{
+			if (f->own == NULL)
+				f->own = ch_fetch_cache_create(f->cxt, rel, -1, NULL);
+			f->cache = f->own;
+		}
+	}
+	found = ch_fetch_row_cached(rel, tid, snapshot, slot, f->cache);
 	if (found)
 		pgstat_count_heap_fetch(rel);
 	else if (all_dead && snapshot && IsMVCCSnapshot(snapshot) && ItemPointerIsValid(tid))
@@ -111,7 +153,8 @@ ch_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapsho
 	TupleTableSlot *probe = MakeSingleTupleTableSlot(RelationGetDescr(rel), &ch_slot_ops);
 	bool		found;
 
-	found = ch_fetch_row(rel, &slot->tts_tid, snapshot, probe);
+	/* whether it is there, not its values: no column read */
+	found = ch_fetch_row_columns(rel, &slot->tts_tid, snapshot, probe, 0, NULL);
 	ExecDropSingleTupleTableSlot(probe);
 	return found;
 }
