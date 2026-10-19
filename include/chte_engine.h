@@ -156,8 +156,9 @@ typedef struct chte_part_info
 
 /*
  * Writing: rows of one or more batches become parts numbered block_number, one per
- * partition.  finish writes and syncs them under temporary names; commit gives them their
- * final names; abort (or close without commit) removes them.
+ * partition -- 0 numbers them later, by chte_write_block (VC18).  finish writes and syncs
+ * them under temporary names; commit gives them their final names; abort (or close without
+ * commit) removes them.
  */
 CHTE_API int			chte_write_begin(chte_table *table, uint64_t block_number, chte_writer **writer,
 							 chte_error *error);
@@ -167,6 +168,67 @@ CHTE_API int			chte_write_finish(chte_writer *writer, size_t *nparts, chte_error
 CHTE_API int			chte_write_part(chte_writer *writer, size_t i, chte_part_info *part, chte_error *error);
 CHTE_API int			chte_write_commit(chte_writer *writer, chte_error *error);
 CHTE_API void		chte_write_close(chte_writer *writer);
+
+/*
+ * A writer's rows from vexec's batches (ch_table_engines.md §3, VC18), each column read once
+ * into ClickHouse's own: a column of nrows rows, in table-definition order as chte_write_batch
+ * takes them, is fixed-width values `width` bytes wide, `stride` bytes apart -- 8-byte scaled
+ * integers narrowed where the column's Decimal is 4 bytes -- or a string's bytes and its
+ * nrows + 1 offsets into them, int32 (offsets32) or 64-bit (offsets64), from any start;
+ * validity a bit a row, 1 = a value, least significant first, or NULL for none.  A NULL row's
+ * value is the type's default, as chte_write_batch makes it.
+ */
+typedef struct chte_column_in
+{
+	const void *values;
+	const int32_t *offsets32;
+	const uint64_t *offsets64;
+	const uint64_t *validity;
+	uint32_t	width;
+	uint32_t	stride;
+} chte_column_in;
+
+CHTE_API int			chte_write_columns(chte_writer *writer, uint32_t nrows, const chte_column_in *columns,
+								   chte_error *error);
+
+/*
+ * The block number of a writer begun with 0, before chte_write_finish: a writer whose rows
+ * arrive before its parts are numbered (VC18).
+ */
+CHTE_API int			chte_write_block(chte_writer *writer, uint64_t block_number, chte_error *error);
+
+/*
+ * Room in a writer's columns for nrows rows, before its first: a string's bytes as many a row
+ * as the table's last part an insert made had -- the caller asks where more rows are coming,
+ * as when a part was made at its buffer's limit, so that ClickHouse's columns are not grown
+ * again and again as the batches arrive (VC18).
+ */
+CHTE_API int			chte_write_reserve(chte_writer *writer, uint64_t nrows, chte_error *error);
+
+/*
+ * Column i of a writer's rows so far, in chte_vector's layout, valid until its next write or
+ * this call again: a row not yet in a part, fetched by its TID (VC18).
+ */
+CHTE_API int			chte_write_vector(chte_writer *writer, uint32_t column, chte_vector *vector,
+								  chte_error *error);
+
+/*
+ * The pages store's parts written into memory, not temporary files (VC18): before
+ * chte_write_finish, then the files of part i, each its path below the part's directory, its
+ * bytes and size, valid until the writer is closed, for the caller to copy into its pages; a
+ * part in memory is never committed.  The six calls are optional: a library built before
+ * them lacks them.
+ */
+typedef struct chte_part_file
+{
+	const char *path;
+	const void *data;
+	uint64_t	size;
+} chte_part_file;
+
+CHTE_API int			chte_write_in_memory(chte_writer *writer, chte_error *error);
+CHTE_API int			chte_write_part_files(chte_writer *writer, size_t i, const chte_part_file **files,
+									  size_t *nfiles, chte_error *error);
 
 /*
  * Filters (ch_table_engines.md §2.8): conditions on a table's columns that
@@ -306,6 +368,22 @@ CHTE_API int			chte_read_keep_dictionaries(chte_reader *reader, const uint8_t *k
 										chte_error *error);
 CHTE_API int			chte_read_dictionary(chte_reader *reader, uint32_t column, chte_dictionary *dictionary,
 								 chte_error *error);
+
+/*
+ * Reading in steps (ch_table_engines.md §3, VC2): a reader of a part's columns as
+ * chte_read_begin opens one, each column of a step, steps[c] -- 0 the first, one byte a
+ * column, every step up to the greatest having one.  chte_read_next reads the first step's
+ * columns of the next granule, a granule a call, and chte_read_step a later step's columns
+ * of the granule it read last, once, before the next chte_read_next: a step not asked for
+ * leaves that granule's columns of it undecoded, as ClickHouse's PREWHERE leaves a granule
+ * no row of passed.  A column of a later step is read by chte_read_vector or
+ * chte_read_dictionary only once its step is; chte_read_retain keeps the steps read by
+ * then.  Both calls are optional: a library built before them lacks them.
+ */
+CHTE_API int			chte_read_begin_steps(chte_table *table, const char *part_name, const char *columns,
+									  const uint8_t *steps, const chte_mark_range *ranges, size_t nranges,
+									  chte_reader **reader, chte_error *error);
+CHTE_API int			chte_read_step(chte_reader *reader, uint32_t step, chte_error *error);
 
 /*
  * Rows by their row ids (Appendix E): the offsets in a part of the rows whose

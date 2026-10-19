@@ -4,7 +4,8 @@
  *	  The pages store (ch_table_engines.md §2.9): a committed part's files in
  *	  the relation's main fork, through the buffer manager, WAL-logged as
  *	  full-page images.  ClickHouse's writer writes a part as in the files
- *	  store; its files are then copied into pages, a file in consecutive
+ *	  store -- or into memory, an insert's, where the engine library can
+ *	  (VC18); its files are then copied into pages, a file in consecutive
  *	  pages, its bytes after each page's header, and their manifest kept in
  *	  the part's catalog row.  The engine library reads them back through
  *	  read_page, a page at a time, from shared buffers.  Replicas, base
@@ -322,29 +323,34 @@ take_pages(FreePages *fp, BlockNumber n)
 /*
  * Copies one file into pages of the relation from block first on: free pages
  * zeroed in shared buffers and written over, then new ones past the end.  The
- * caller holds the store's lock (store_lock()), so no one else extends the
- * relation meanwhile.
+ * file's bytes are read from path, or are mem's, a file of a part in memory
+ * (VC18).  The caller holds the store's lock (store_lock()), so no one else
+ * extends the relation meanwhile.
  */
 static void
-copy_file(Relation rel, const char *path, uint64 size, BlockNumber first, uint32 nblocks)
+copy_file(Relation rel, const char *path, const char *mem, uint64 size, BlockNumber first, uint32 nblocks)
 {
 	uint32		done = 0;
-	int			fd;
-	char	   *data;
+	int			fd = -1;
+	char	   *data = NULL;
 	bool		wal = RelationNeedsWAL(rel);
 
 	if (nblocks == 0)
 		return;
-	data = palloc(CH_PAGE_PAYLOAD * CH_PAGE_BATCH);
-	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", path)));
+	if (mem == NULL)
+	{
+		data = palloc(CH_PAGE_PAYLOAD * CH_PAGE_BATCH);
+		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m", path)));
+	}
 	while (done < nblocks)
 	{
 		Buffer		buffers[CH_PAGE_BATCH];
 		Page		pages[CH_PAGE_BATCH];
+		const char *bytes[CH_PAGE_BATCH];
 		Size		used[CH_PAGE_BATCH];
 		uint32		want = Min(nblocks - done, CH_PAGE_BATCH);
 		uint32		got;
@@ -354,13 +360,23 @@ copy_file(Relation rel, const char *path, uint64 size, BlockNumber first, uint32
 		for (uint32 i = 0; i < want; i++)
 		{
 			uint64		offset = (uint64) (done + i) * CH_PAGE_PAYLOAD;
-			ssize_t		n = pg_pread(fd, data + (Size) i * CH_PAGE_PAYLOAD, CH_PAGE_PAYLOAD, offset);
 
-			if (n < 0)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read file \"%s\": %m", path)));
-			used[i] = n;
+			if (mem != NULL)
+			{
+				bytes[i] = mem + offset;
+				used[i] = Min((uint64) CH_PAGE_PAYLOAD, size - offset);
+			}
+			else
+			{
+				ssize_t		n = pg_pread(fd, data + (Size) i * CH_PAGE_PAYLOAD, CH_PAGE_PAYLOAD, offset);
+
+				if (n < 0)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not read file \"%s\": %m", path)));
+				bytes[i] = data + (Size) i * CH_PAGE_PAYLOAD;
+				used[i] = n;
+			}
 		}
 		start = first + done;
 		if (start < RelationGetNumberOfBlocks(rel))
@@ -392,7 +408,7 @@ copy_file(Relation rel, const char *path, uint64 size, BlockNumber first, uint32
 		for (uint32 i = 0; i < got; i++)
 		{
 			PageInit(pages[i], BLCKSZ, 0);
-			memcpy((char *) pages[i] + SizeOfPageHeaderData, data + (Size) i * CH_PAGE_PAYLOAD, used[i]);
+			memcpy((char *) pages[i] + SizeOfPageHeaderData, bytes[i], used[i]);
 			((PageHeader) pages[i])->pd_lower = SizeOfPageHeaderData + used[i];
 			MarkBufferDirty(buffers[i]);
 		}
@@ -413,8 +429,10 @@ copy_file(Relation rel, const char *path, uint64 size, BlockNumber first, uint32
 		done += got;
 		CHECK_FOR_INTERRUPTS();
 	}
-	CloseTransientFile(fd);
-	pfree(data);
+	if (fd >= 0)
+		CloseTransientFile(fd);
+	if (data != NULL)
+		pfree(data);
 }
 
 static void
@@ -444,7 +462,7 @@ copy_tree(Relation rel, const char *dir, const char *prefix, ManifestBuf *m, Fre
 			uint32		nblocks = (uint32) ((st.st_size + CH_PAGE_PAYLOAD - 1) / CH_PAGE_PAYLOAD);
 			BlockNumber first = nblocks > 0 ? take_pages(fp, nblocks) : 0;
 
-			copy_file(rel, path, st.st_size, first, nblocks);
+			copy_file(rel, path, NULL, st.st_size, first, nblocks);
 			manifest_add(m, rel_name, st.st_size, first, nblocks);
 		}
 		pfree(rel_name);
@@ -501,5 +519,42 @@ ch_pages_store_part(Relation rel, ChTable *t, const char *part_dir, ChPart *part
 	}
 	PG_END_TRY();
 	pfree(dir);
+	return part->manifest;
+}
+
+/*
+ * ch_pages_store_part() for a part the engine library wrote into memory
+ * (VC18): its files, by their paths below the part's directory, copied into
+ * pages from there, with no temporary file.
+ */
+bytea *
+ch_pages_store_part_files(Relation rel, ChTable *t, const chte_part_file *files, size_t nfiles, ChPart *part,
+						  CommandId cid)
+{
+	ManifestBuf m;
+	FreePages	fp;
+
+	initStringInfo(&m.data);
+	m.nfiles = 0;
+	store_lock(rel);
+	PG_TRY();
+	{
+		free_pages(rel, t, &fp);
+		for (size_t i = 0; i < nfiles; i++)
+		{
+			uint32		nblocks = (uint32) ((files[i].size + CH_PAGE_PAYLOAD - 1) / CH_PAGE_PAYLOAD);
+			BlockNumber first = nblocks > 0 ? take_pages(&fp, nblocks) : 0;
+
+			copy_file(rel, files[i].path, files[i].data, files[i].size, first, nblocks);
+			manifest_add(&m, files[i].path, files[i].size, first, nblocks);
+		}
+		part->manifest = manifest_finish(&m);
+		ch_part_insert(&t->storage, part, cid);
+	}
+	PG_FINALLY();
+	{
+		store_unlock(rel);
+	}
+	PG_END_TRY();
 	return part->manifest;
 }

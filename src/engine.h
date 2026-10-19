@@ -61,6 +61,17 @@ typedef struct ChEngine
 	/* optional (VC12) */
 	int			(*register_all_functions) (chte_error *);
 	int			(*function_count) (void);
+	/* optional (VC2) */
+	int			(*read_begin_steps) (chte_table *, const char *, const char *, const uint8_t *,
+									 const chte_mark_range *, size_t, chte_reader **, chte_error *);
+	int			(*read_step) (chte_reader *, uint32_t, chte_error *);
+	/* optional (VC18) */
+	int			(*write_columns) (chte_writer *, uint32_t, const chte_column_in *, chte_error *);
+	int			(*write_block) (chte_writer *, uint64_t, chte_error *);
+	int			(*write_reserve) (chte_writer *, uint64_t, chte_error *);
+	int			(*write_vector) (chte_writer *, uint32_t, chte_vector *, chte_error *);
+	int			(*write_in_memory) (chte_writer *, chte_error *);
+	int			(*write_part_files) (chte_writer *, size_t, const chte_part_file **, size_t *, chte_error *);
 } ChEngine;
 
 /* GUCs */

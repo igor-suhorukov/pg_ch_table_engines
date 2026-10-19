@@ -14,15 +14,19 @@
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <Storages/MarkCache.h>
 #include <Storages/MergeTree/MarkRange.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Storages/MergeTree/MergeTreeReadTask.h>
+#include <Storages/MergeTree/MergeTreeReadersChain.h>
 #include <Storages/MergeTree/MergedBlockOutputStream.h>
 
 #include <cstring>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -60,6 +64,30 @@ public:
     void readPage(UInt32 block, char * dst) const;
     UInt32 pagePayload() const { return ops.page_payload; }
 
+    /// VC18: while on, a part directory created -- a tmp_insert_ one, an insert's -- and everything
+    /// below it are kept in memory, not in the files of the disk's directory: the parts the caller
+    /// copies into pages and never commits.  A part in memory goes as its directory is removed.
+    void setMemoryWrites(bool on) { memory_writes = on; }
+    /// The files below a directory in memory, by their paths below it, in their paths' order.
+    std::vector<std::pair<String, std::shared_ptr<const std::string>>> memoryFiles(const String & dir) const;
+
+    void createDirectory(const String & path) override;
+    void createDirectories(const String & path) override;
+    void moveDirectory(const String & from_path, const String & to_path) override;
+    void createFile(const String & path) override;
+    void moveFile(const String & from_path, const String & to_path) override;
+    void replaceFile(const String & from_path, const String & to_path) override;
+    std::unique_ptr<WriteBufferFromFileBase> writeFile(const String & path, size_t buf_size, WriteMode mode,
+                                                       const WriteSettings & settings) override;
+    void removeFile(const String & path) override;
+    void removeFileIfExists(const String & path) override;
+    void removeDirectory(const String & path) override;
+    void removeDirectoryIfExists(const String & path) override;
+    void removeRecursive(const String & path) override;
+    void setLastModified(const String & path, const Poco::Timestamp & timestamp) override;
+    void setReadOnly(const String & path) override;
+    SyncGuardPtr getDirectorySyncGuard(const String & path) const override;
+
     bool existsFile(const String & path) const override;
     bool existsDirectory(const String & path) const override;
     bool existsFileOrDirectory(const String & path) const override;
@@ -76,11 +104,20 @@ private:
     const File * findFile(const String & path) const;
     /// The entries of a directory of a part in pages: names, a trailing '/' for a subdirectory.
     std::vector<String> entries(const String & dir) const;
+    /// VC18: whether a path is a directory in memory or below one; the entries of one
+    bool inMemory(const String & path) const;
+    String memoryKey(const String & path) const;
+    std::vector<String> memoryEntries(const String & dir) const;
 
     chte_pages_ops ops;
     /// full relative path of each file of the parts in pages, and their directories
     std::map<String, File> files;
     std::set<String> dirs;
+
+    bool memory_writes = false;
+    mutable std::mutex memory_mutex;
+    std::set<String> memory_dirs;
+    std::map<String, std::shared_ptr<std::string>> memory_files;
 };
 
 struct Engine
@@ -256,6 +293,20 @@ std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData:
 /// (MergeTreeDataPartWriterCompact.cpp:514-521).
 std::vector<std::optional<MarkRanges>> markRuns(const std::optional<MarkRanges> & mark_ranges);
 
+/// One step of a reader in steps (chte_read_begin_steps, VC2): a reader of its columns over the
+/// reader's granules, and the chain that reads a granule of them where the step is asked for.
+struct ReadStep
+{
+    Names names;
+    std::vector<size_t> columns;    /// their places among the reader's columns
+    MergeTreeReadTaskInfoPtr info;
+    MergeTreeReadTask::Readers readers;
+    std::optional<MergeTreeReadersChain> chain;
+    /// the granule the chain's stream stands at, past one it read last, where it reads on without a
+    /// seek; none: the next read seeks
+    std::optional<size_t> next_mark;
+};
+
 /// The writer's rows as parts, one a partition, under temporary names (chte_write_finish).
 void writeParts(chte_writer & writer, ContextPtr context);
 /// A part's description for the caller, its directory as it is now.
@@ -281,6 +332,17 @@ struct chte_writer
     std::vector<DB::MergeTreeTemporaryPartPtr> parts;
     bool finished = false;
     bool committed = false;
+
+    /// chte_write_vector: a LowCardinality column's values, made full, and the rows it was made of
+    std::vector<std::pair<DB::ColumnPtr, size_t>> full_columns;
+    /// chte_write_in_memory (VC18): the parts written into memory, and each one's files
+    bool in_memory = false;
+    struct PartFiles
+    {
+        std::vector<std::pair<std::string, std::shared_ptr<const std::string>>> files;
+        std::vector<chte_part_file> listed;
+    };
+    std::vector<PartFiles> part_files;
 };
 
 struct chte_reader
@@ -311,6 +373,20 @@ struct chte_reader
     };
     std::vector<Dictionary> dictionaries;
 
+    /// chte_read_begin_steps (VC2): the steps, the first read by chte_read_next; the granules to read,
+    /// ranges of marks in order, and the place of the next; the granule read last, its rows, and
+    /// whether each step of it is read
+    std::vector<chte::ReadStep> steps;
+    DB::MarkRanges step_ranges;
+    size_t range_at = 0;
+    size_t mark_at = 0;
+    std::optional<size_t> granule;
+    size_t granule_rows = 0;
+    size_t granule_run_end = 0;
+    std::vector<uint8_t> step_read;
+    DB::MarkCachePtr mark_cache;
+    DB::ReadStepPerformanceCountersPtr counters;
+
     /// The next block of the runs, the next run's source opened when one is done: false at the end
     bool pull(DB::Block & block);
 };
@@ -322,4 +398,7 @@ struct chte_table
     DB::ContextMutablePtr context;
     /// what a call's result points into, until the next such call
     DB::Columns scratch;
+    /// the last part an insert's writer made: per column, its bytes a row, a string's chars
+    /// alone (chte_write_reserve, VC18)
+    std::vector<double> last_bytes_per_row;
 };

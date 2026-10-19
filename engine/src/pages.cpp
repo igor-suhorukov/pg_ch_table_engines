@@ -2,7 +2,9 @@
  * The pages store's disk (ch_table_engines.md §2.9): what is being written is
  * a DiskLocal's, as in the files store; the files of committed parts are in
  * the relation's pages, found by their manifests and read through the
- * caller's read_page, a page at a time, on the calling thread.
+ * caller's read_page, a page at a time, on the calling thread.  An insert's
+ * part may instead be written into memory (VC18): its directory and files
+ * kept here, for the caller to copy into pages without temporary files.
  */
 #include "internal.h"
 
@@ -11,6 +13,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadPipeline.h>
+#include <IO/WriteBufferFromFileBase.h>
 
 #include <filesystem>
 
@@ -112,6 +115,66 @@ private:
     UInt64 file_offset = 0;
 };
 
+/// A file of a part in memory, being written (VC18)
+class WriteBufferToMemory final : public WriteBufferFromFileBase
+{
+public:
+    WriteBufferToMemory(String name_, std::shared_ptr<std::string> data_, size_t buf_size)
+        : WriteBufferFromFileBase(std::max<size_t>(std::min<size_t>(buf_size, DBMS_DEFAULT_BUFFER_SIZE), 4096), nullptr, 0)
+        , name(std::move(name_))
+        , data(std::move(data_))
+    {
+    }
+
+    void sync() override { next(); }
+    std::string getFileName() const override { return name; }
+
+private:
+    void nextImpl() override
+    {
+        if (offset() > 0)
+            data->append(working_buffer.begin(), offset());
+    }
+
+    String name;
+    std::shared_ptr<std::string> data;
+};
+
+/// A file of a part in memory, read back
+class ReadBufferFromMemoryFile final : public ReadBufferFromFileBase
+{
+public:
+    ReadBufferFromMemoryFile(String name_, std::shared_ptr<const std::string> data_)
+        : ReadBufferFromFileBase(0, nullptr, 0, data_->size())
+        , name(std::move(name_))
+        , data(std::move(data_))
+    {
+        char * begin = const_cast<char *>(data->data());
+        working_buffer = Buffer(begin, begin + data->size());
+        pos = working_buffer.begin();
+    }
+
+    std::string getFileName() const override { return name; }
+    off_t getPosition() override { return static_cast<off_t>(pos - data->data()); }
+    size_t getFileOffsetOfBufferEnd() const override { return data->size(); }
+
+    off_t seek(off_t off, int whence) override
+    {
+        if (whence != SEEK_SET || off < 0 || static_cast<size_t>(off) > data->size())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "seeking {} to {}", name, off);
+        char * begin = const_cast<char *>(data->data());
+        working_buffer = Buffer(begin, begin + data->size());
+        pos = begin + off;
+        return off;
+    }
+
+private:
+    bool nextImpl() override { return false; }
+
+    String name;
+    std::shared_ptr<const std::string> data;
+};
+
 class NamesIterator final : public IDirectoryIterator
 {
 public:
@@ -199,11 +262,21 @@ std::vector<String> PagesDisk::entries(const String & dir) const
 
 bool PagesDisk::existsFile(const String & path) const
 {
+    if (inMemory(path))
+    {
+        std::lock_guard lock(memory_mutex);
+        return memory_files.contains(memoryKey(path));
+    }
     return findFile(path) != nullptr || DiskLocal::existsFile(path);
 }
 
 bool PagesDisk::existsDirectory(const String & path) const
 {
+    if (inMemory(path))
+    {
+        std::lock_guard lock(memory_mutex);
+        return memory_dirs.contains(memoryKey(path));
+    }
     return dirs.contains(normalize(path)) || DiskLocal::existsDirectory(path);
 }
 
@@ -214,6 +287,14 @@ bool PagesDisk::existsFileOrDirectory(const String & path) const
 
 size_t PagesDisk::getFileSize(const String & path) const
 {
+    if (inMemory(path))
+    {
+        std::lock_guard lock(memory_mutex);
+        auto it = memory_files.find(memoryKey(path));
+        if (it == memory_files.end())
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "no file {} in memory", path);
+        return it->second->size();
+    }
     if (const auto * f = findFile(path))
         return f->size;
     return DiskLocal::getFileSize(path);
@@ -221,6 +302,8 @@ size_t PagesDisk::getFileSize(const String & path) const
 
 DirectoryIteratorPtr PagesDisk::iterateDirectory(const String & path) const
 {
+    if (inMemory(path))
+        return std::make_unique<NamesIterator>(path, memoryEntries(path));
     if (dirs.contains(normalize(path)))
         return std::make_unique<NamesIterator>(path, entries(path));
     return DiskLocal::iterateDirectory(path);
@@ -228,10 +311,10 @@ DirectoryIteratorPtr PagesDisk::iterateDirectory(const String & path) const
 
 void PagesDisk::listFiles(const String & path, std::vector<String> & file_names) const
 {
-    if (dirs.contains(normalize(path)))
+    if (inMemory(path) || dirs.contains(normalize(path)))
     {
         file_names.clear();
-        for (auto & n : entries(path))
+        for (auto & n : inMemory(path) ? memoryEntries(path) : entries(path))
             file_names.push_back(n.back() == '/' ? n.substr(0, n.size() - 1) : n);
         return;
     }
@@ -240,6 +323,8 @@ void PagesDisk::listFiles(const String & path, std::vector<String> & file_names)
 
 Poco::Timestamp PagesDisk::getLastModified(const String & path) const
 {
+    if (inMemory(path))
+        return Poco::Timestamp();
     if (!hasLocal(path) && (findFile(path) || dirs.contains(normalize(path))))
         return Poco::Timestamp::fromEpochTime(0);
     return DiskLocal::getLastModified(path);
@@ -247,6 +332,8 @@ Poco::Timestamp PagesDisk::getLastModified(const String & path) const
 
 time_t PagesDisk::getLastChanged(const String & path) const
 {
+    if (inMemory(path))
+        return time(nullptr);
     if (!hasLocal(path) && (findFile(path) || dirs.contains(normalize(path))))
         return 0;
     return DiskLocal::getLastChanged(path);
@@ -255,6 +342,26 @@ time_t PagesDisk::getLastChanged(const String & path) const
 void PagesDisk::prepareRead(const String & path, const ReadSettings & settings, std::optional<size_t> read_hint,
                             ReadPipeline & pipeline) const
 {
+    if (inMemory(path))
+    {
+        String name = memoryKey(path);
+        std::shared_ptr<const std::string> data;
+        {
+            std::lock_guard lock(memory_mutex);
+            auto it = memory_files.find(name);
+            if (it == memory_files.end())
+                throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "no file {} in memory", path);
+            data = it->second;
+        }
+        StoredObject object(name, name, data->size());
+        pipeline.setSource(
+            [name, data](const StoredObject &, const ReadSettings &, bool, bool) -> std::unique_ptr<ReadBufferFromFileBase>
+            {
+                return std::make_unique<ReadBufferFromMemoryFile>(name, data);
+            },
+            StoredObjects{object}, settings);
+        return;
+    }
     const File * f = findFile(path);
     if (f == nullptr)
     {
@@ -270,6 +377,244 @@ void PagesDisk::prepareRead(const String & path, const ReadSettings & settings, 
             return std::make_unique<ReadBufferFromPages>(*this, name, file, s.local_fs_settings.buffer_size);
         },
         StoredObjects{object}, settings);
+}
+
+/* ---- parts in memory (VC18) ---- */
+
+String PagesDisk::memoryKey(const String & path) const
+{
+    /// a path of the disk's, relative, or absolute below its root, as a part's full path is
+    const String & root = getPath();
+    if (path.starts_with(root))
+        return normalize(path.substr(root.size()));
+    return normalize(path);
+}
+
+bool PagesDisk::inMemory(const String & path) const
+{
+    std::lock_guard lock(memory_mutex);
+    if (memory_dirs.empty())
+        return false;
+    String p = memoryKey(path);
+    for (fs::path d = p; !d.empty(); d = d.parent_path())
+    {
+        if (memory_dirs.contains(d.string()))
+            return true;
+        if (d == d.parent_path())
+            break;
+    }
+    return false;
+}
+
+std::vector<String> PagesDisk::memoryEntries(const String & dir) const
+{
+    std::lock_guard lock(memory_mutex);
+    String prefix = memoryKey(dir) + "/";
+    std::set<String> names;
+    for (auto it = memory_files.lower_bound(prefix); it != memory_files.end() && it->first.starts_with(prefix); ++it)
+    {
+        String rest = it->first.substr(prefix.size());
+        auto slash = rest.find('/');
+        names.insert(slash == String::npos ? rest : rest.substr(0, slash + 1));
+    }
+    for (auto it = memory_dirs.lower_bound(prefix); it != memory_dirs.end() && it->starts_with(prefix); ++it)
+    {
+        String rest = it->substr(prefix.size());
+        if (!rest.empty() && rest.find('/') == String::npos)
+            names.insert(rest + "/");
+    }
+    return {names.begin(), names.end()};
+}
+
+std::vector<std::pair<String, std::shared_ptr<const std::string>>> PagesDisk::memoryFiles(const String & dir) const
+{
+    std::lock_guard lock(memory_mutex);
+    String prefix = memoryKey(dir) + "/";
+    std::vector<std::pair<String, std::shared_ptr<const std::string>>> out;
+    for (auto it = memory_files.lower_bound(prefix); it != memory_files.end() && it->first.starts_with(prefix); ++it)
+        out.emplace_back(it->first.substr(prefix.size()), it->second);
+    return out;
+}
+
+void PagesDisk::createDirectory(const String & path)
+{
+    createDirectories(path);
+}
+
+void PagesDisk::createDirectories(const String & path)
+{
+    String p = memoryKey(path);
+    if (inMemory(p) || (memory_writes && fs::path(p).filename().string().starts_with("tmp_insert_")))
+    {
+        std::lock_guard lock(memory_mutex);
+        memory_dirs.insert(p);
+        return;
+    }
+    DiskLocal::createDirectories(path);
+}
+
+void PagesDisk::moveDirectory(const String & from_path, const String & to_path)
+{
+    if (!inMemory(from_path))
+    {
+        DiskLocal::moveDirectory(from_path, to_path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    String from = memoryKey(from_path);
+    String to = memoryKey(to_path);
+    std::set<String> new_dirs;
+    for (auto it = memory_dirs.begin(); it != memory_dirs.end();)
+        if (*it == from || it->starts_with(from + "/"))
+        {
+            new_dirs.insert(to + it->substr(from.size()));
+            it = memory_dirs.erase(it);
+        }
+        else
+            ++it;
+    memory_dirs.insert(new_dirs.begin(), new_dirs.end());
+    std::map<String, std::shared_ptr<std::string>> moved;
+    for (auto it = memory_files.lower_bound(from + "/"); it != memory_files.end() && it->first.starts_with(from + "/");)
+    {
+        moved[to + it->first.substr(from.size())] = it->second;
+        it = memory_files.erase(it);
+    }
+    memory_files.insert(moved.begin(), moved.end());
+}
+
+void PagesDisk::createFile(const String & path)
+{
+    if (!inMemory(path))
+    {
+        DiskLocal::createFile(path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    memory_files.try_emplace(memoryKey(path), std::make_shared<std::string>());
+}
+
+void PagesDisk::moveFile(const String & from_path, const String & to_path)
+{
+    if (!inMemory(from_path))
+    {
+        DiskLocal::moveFile(from_path, to_path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    auto node = memory_files.extract(memoryKey(from_path));
+    if (node.empty())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "no file {} in memory", from_path);
+    node.key() = memoryKey(to_path);
+    memory_files.insert_or_assign(node.key(), node.mapped());
+}
+
+void PagesDisk::replaceFile(const String & from_path, const String & to_path)
+{
+    moveFile(from_path, to_path);
+}
+
+std::unique_ptr<WriteBufferFromFileBase> PagesDisk::writeFile(const String & path, size_t buf_size, WriteMode mode,
+                                                              const WriteSettings & settings)
+{
+    if (!inMemory(path))
+        return DiskLocal::writeFile(path, buf_size, mode, settings);
+    std::shared_ptr<std::string> data;
+    {
+        std::lock_guard lock(memory_mutex);
+        auto & slot = memory_files[memoryKey(path)];
+        if (!slot)
+            slot = std::make_shared<std::string>();
+        else if (mode == WriteMode::Rewrite)
+        {
+            /// a new file in its place: one handed out before keeps its bytes
+            slot = std::make_shared<std::string>();
+        }
+        data = slot;
+    }
+    return std::make_unique<WriteBufferToMemory>(path, data, buf_size);
+}
+
+void PagesDisk::removeFile(const String & path)
+{
+    if (!inMemory(path))
+    {
+        DiskLocal::removeFile(path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    if (memory_files.erase(memoryKey(path)) == 0)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "no file {} in memory", path);
+}
+
+void PagesDisk::removeFileIfExists(const String & path)
+{
+    if (!inMemory(path))
+    {
+        DiskLocal::removeFileIfExists(path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    memory_files.erase(memoryKey(path));
+}
+
+void PagesDisk::removeDirectory(const String & path)
+{
+    if (!inMemory(path))
+    {
+        DiskLocal::removeDirectory(path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    memory_dirs.erase(memoryKey(path));
+}
+
+void PagesDisk::removeDirectoryIfExists(const String & path)
+{
+    if (!inMemory(path))
+    {
+        DiskLocal::removeDirectoryIfExists(path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    memory_dirs.erase(memoryKey(path));
+}
+
+void PagesDisk::removeRecursive(const String & path)
+{
+    if (!inMemory(path))
+    {
+        DiskLocal::removeRecursive(path);
+        return;
+    }
+    std::lock_guard lock(memory_mutex);
+    String p = memoryKey(path);
+    memory_files.erase(p);
+    for (auto it = memory_files.lower_bound(p + "/"); it != memory_files.end() && it->first.starts_with(p + "/");)
+        it = memory_files.erase(it);
+    for (auto it = memory_dirs.begin(); it != memory_dirs.end();)
+        if (*it == p || it->starts_with(p + "/"))
+            it = memory_dirs.erase(it);
+        else
+            ++it;
+}
+
+void PagesDisk::setLastModified(const String & path, const Poco::Timestamp & timestamp)
+{
+    if (!inMemory(path))
+        DiskLocal::setLastModified(path, timestamp);
+}
+
+void PagesDisk::setReadOnly(const String & path)
+{
+    if (!inMemory(path))
+        DiskLocal::setReadOnly(path);
+}
+
+SyncGuardPtr PagesDisk::getDirectorySyncGuard(const String & path) const
+{
+    if (inMemory(path))
+        return nullptr;
+    return DiskLocal::getDirectorySyncGuard(path);
 }
 
 }

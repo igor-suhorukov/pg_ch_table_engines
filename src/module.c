@@ -29,6 +29,8 @@ int			ch_insert_buffer_rows = 1048576;
 int			ch_insert_buffer_bytes = 256 * 1024;	/* kB */
 int			ch_default_storage = CH_STORAGE_PAGES;
 bool		ch_enable_fetch_columns = true;
+bool		ch_enable_sink_columns = true;
+bool		ch_enable_memory_parts = true;
 bool		ch_enable_fetch_cache = true;
 double		ch_fetch_cost = 55.0;
 double		ch_fetch_value_cost = 0.0025;
@@ -203,6 +205,22 @@ _PG_init(void)
 							 "Off, a fetch decodes a granule of every column of the table, whatever the query "
 							 "reads of it.",
 							 &ch_enable_fetch_columns,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_sink_columns",
+							 "Whether vexec's sink fills ClickHouse's columns from its batches directly.",
+							 "Off, a batch's columns are copied into the write buffer's, and from them into "
+							 "ClickHouse's as the part is made, as rows are.",
+							 &ch_enable_sink_columns,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_memory_parts",
+							 "Whether a part of the pages store is written into memory, then into its pages.",
+							 "Off, ClickHouse writes it into temporary files in the table's directory, which "
+							 "are then copied into its pages and removed.",
+							 &ch_enable_memory_parts,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

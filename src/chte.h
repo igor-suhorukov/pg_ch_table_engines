@@ -88,6 +88,8 @@ typedef struct ChStorageId
 /* module.c */
 extern bool ch_enable_chscan;
 extern bool ch_enable_fetch_columns;
+extern bool ch_enable_sink_columns;
+extern bool ch_enable_memory_parts;
 extern bool ch_enable_fetch_cache;
 extern double ch_fetch_cost;
 extern double ch_fetch_value_cost;
@@ -237,6 +239,9 @@ extern Size ch_builder_bytes(ChVectorBuilder *b);
 extern chte_vector *ch_builder_vectors(ChVectorBuilder *b);
 extern uint64 ch_builder_rowid(ChVectorBuilder *b, uint32 row);
 extern bool ch_builder_fetch(ChVectorBuilder *b, uint32 row, TupleTableSlot *slot);
+extern bool ch_builder_fetch_vectors(ChVectorBuilder *b, const chte_vector *vectors, uint32 row,
+									 TupleTableSlot *slot);
+extern int	ch_builder_ncolumns(ChVectorBuilder *b);
 extern void ch_builder_reset(ChVectorBuilder *b);
 extern uint64 ch_dictionary_index(const chte_dictionary *d, uint32 row);
 extern void ch_dictionary_to_datum(const ChColumn *col, const chte_dictionary *d, uint32 row,
@@ -246,13 +251,15 @@ extern void ch_vector_to_datum(const ChColumn *col, const chte_vector *v, uint32
 struct VexecColumn;
 extern void ch_builder_add_columns(ChVectorBuilder *b, const struct VexecColumn *columns, uint32 nrows,
 								   const uint64 *rowids);
+extern Size ch_builder_columns_in(ChVectorBuilder *b, const struct VexecColumn *columns, uint32 nrows,
+								  const uint64 *rowids, MemoryContext cxt, chte_column_in *out);
 
 /* buffer.c: the write buffer (§2.7) */
 extern void ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid);
 extern uint64 ch_buffer_reserve_rowid(Relation rel, CommandId cid);
 extern void ch_buffer_insert_rowid(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid);
-extern ChVectorBuilder *ch_buffer_batch_begin(Relation rel, CommandId cid, uint32 nrows, uint64 *rowids);
-extern void ch_buffer_batch_done(Relation rel);
+extern void ch_buffer_put_columns(Relation rel, CommandId cid, const struct VexecColumn *columns, uint32 nrows,
+								  uint64 *rowids);
 extern void ch_buffer_flush_relation(Relation rel);
 extern void ch_buffer_flush_for_scan(Relation rel, Snapshot snapshot);
 extern void ch_buffer_flush_all(void);
@@ -278,6 +285,8 @@ extern int	ch_store_sweep(Relation rel, const ChStorageId *id);
 extern void ch_pages_ops(ChTable *t, chte_pages_ops *ops);
 extern void ch_pages_attach(ChTable *t, const ChPart *part);
 extern bytea *ch_pages_store_part(Relation rel, ChTable *t, const char *part_dir, ChPart *part, CommandId cid);
+extern bytea *ch_pages_store_part_files(Relation rel, ChTable *t, const chte_part_file *files, size_t nfiles,
+										ChPart *part, CommandId cid);
 extern void ch_pages_raise_pending(void);
 
 /* scan.c */
