@@ -72,6 +72,13 @@ typedef struct ChEngine
 	int			(*write_vector) (chte_writer *, uint32_t, chte_vector *, chte_error *);
 	int			(*write_in_memory) (chte_writer *, chte_error *);
 	int			(*write_part_files) (chte_writer *, size_t, const chte_part_file **, size_t *, chte_error *);
+	/* optional (VC20's B6, B7) */
+	int			(*write_part_summary) (chte_writer *, size_t, const void **, size_t *, chte_error *);
+	int			(*summary_column_bytes) (chte_table *, const char *, const void *, size_t, const char *,
+										 uint64_t *, uint64_t *, int *, chte_error *);
+	int			(*summary_stats) (chte_table *, const char *, const void *, size_t, const char *,
+								  chte_column_stats *, int *, chte_error *);
+	int			(*filter_summary_select) (chte_filter *, const char *, const void *, size_t, int *, chte_error *);
 } ChEngine;
 
 /* GUCs */

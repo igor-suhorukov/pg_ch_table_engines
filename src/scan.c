@@ -442,9 +442,29 @@ claim_one_unit(ChScanDesc scan)
 	scan->selected = false;
 	scan->counts.units++;
 	unit_deletions(scan);
-	if (scan->table->options.storage == CH_STORAGE_PAGES)
-		ch_pages_attach(scan->table, scan->part);
 	return true;
+}
+
+/*
+ * Whether the filter rules the claimed unit's part out by the part's summary
+ * (VC20's B7), as chte_part_select() would by its statistics -- the part
+ * then neither attached nor loaded.
+ */
+static bool
+summary_rules_out(ChScanDesc scan)
+{
+	const ChEngine *eng = ch_engine();
+	bytea	   *summary = NULL;
+	int			verdict;
+
+	if (scan->filter == NULL || !ch_enable_summary_pruning || eng->filter_summary_select == NULL)
+		return false;
+	if (ch_enable_part_summaries)
+		summary = ch_part_summary(scan->part);
+	CH_CALL("analyzing a part",
+			eng->filter_summary_select(scan->filter, scan->part->name, summary ? VARDATA_ANY(summary) : NULL,
+									   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
+	return verdict == CHTE_SELECT_NONE;
 }
 
 /* The claimed unit's granules the filter keeps, and their rows */
@@ -465,6 +485,19 @@ select_unit(ChScanDesc scan)
 		scan->selected = true;
 		return;
 	}
+	if (summary_rules_out(scan))
+	{
+		/* none of its granules, counted as chte_part_select()'s none would be below */
+		scan->nranges = 0;
+		scan->unit_rows = 0;
+		scan->counts.marks += (scan->unit_end ? scan->unit_end : (uint32) scan->part->marks) - scan->unit_begin;
+		if (scan->unit_whole || scan->unit_begin == 0)
+			scan->counts.parts_pruned++;
+		scan->selected = true;
+		return;
+	}
+	if (scan->table->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(scan->table, scan->part);
 	for (;;)
 	{
 		size_t		n;
@@ -523,6 +556,8 @@ begin_reader(ChScanDesc scan)
 		columns = scan->columns_rowid;
 		scan->rowid_col = scan->ncols;
 	}
+	if (scan->table->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(scan->table, scan->part);
 	scan->reader_owner = ch_handle_reserve();
 	if (scan->nsteps > 0)
 	{
@@ -2289,19 +2324,38 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		if (filter)
 			ch_handle_opened(owner, CH_HANDLE_FILTER, filter);
 	}
+	/*
+	 * Each part's rows the quals keep and its needed columns' bytes, from its
+	 * summary where it has one (VC20's B6, B7), else from the part itself,
+	 * loaded -- and, in the pages store, attached -- only then.
+	 */
 	foreach(lc, parts)
 	{
 		ChPart	   *p = lfirst(lc);
 		uint64		kept = (uint64) p->rows;
+		bytea	   *summary = NULL;
+		int			verdict = CHTE_SELECT_RANGES;
+		int			found = 0;
 
-		if (t->options.storage == CH_STORAGE_PAGES)
-			ch_pages_attach(t, p);
+		if (ch_enable_part_summaries && eng->summary_column_bytes != NULL)
+			summary = ch_part_summary(p);
 		if (filter)
 		{
-			size_t		nranges;
+			if (ch_enable_summary_pruning && eng->filter_summary_select != NULL)
+				CH_CALL("analyzing a part",
+						eng->filter_summary_select(filter, p->name, summary ? VARDATA_ANY(summary) : NULL,
+												   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
+			if (verdict == CHTE_SELECT_NONE)
+				kept = 0;
+			else if (verdict == CHTE_SELECT_RANGES)
+			{
+				size_t		nranges;
 
-			CH_CALL("analyzing a part",
-					eng->part_select(t->handle, p->name, filter, 0, 0, NULL, 0, &nranges, &kept, CH_ERR));
+				if (t->options.storage == CH_STORAGE_PAGES)
+					ch_pages_attach(t, p);
+				CH_CALL("analyzing a part",
+						eng->part_select(t->handle, p->name, filter, 0, 0, NULL, 0, &nranges, &kept, CH_ERR));
+			}
 		}
 		*rows += kept;
 		if (names.len > 0 && kept > 0 && p->rows > 0)
@@ -2309,8 +2363,17 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 			uint64		compressed;
 			uint64		uncompressed;
 
-			CH_CALL("sizing a part's columns",
-					eng->part_column_bytes(t->handle, p->name, names.data, &compressed, &uncompressed, CH_ERR));
+			if (summary)
+				CH_CALL("sizing a part's columns",
+						eng->summary_column_bytes(t->handle, p->name, VARDATA_ANY(summary), VARSIZE_ANY_EXHDR(summary),
+												  names.data, &compressed, &uncompressed, &found, CH_ERR));
+			if (!found)
+			{
+				if (t->options.storage == CH_STORAGE_PAGES)
+					ch_pages_attach(t, p);
+				CH_CALL("sizing a part's columns",
+						eng->part_column_bytes(t->handle, p->name, names.data, &compressed, &uncompressed, CH_ERR));
+			}
 			*bytes += (double) compressed * kept / p->rows;
 			if (raw)
 				*raw += (double) uncompressed * kept / p->rows;

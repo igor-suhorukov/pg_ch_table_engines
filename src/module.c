@@ -32,6 +32,8 @@ bool		ch_enable_fetch_columns = true;
 bool		ch_enable_sink_columns = true;
 bool		ch_enable_memory_parts = true;
 bool		ch_enable_fetch_cache = true;
+bool		ch_enable_part_summaries = true;
+bool		ch_enable_summary_pruning = true;
 double		ch_fetch_cost = 55.0;
 double		ch_fetch_value_cost = 0.0025;
 bool		ch_preloaded = false;
@@ -229,6 +231,23 @@ _PG_init(void)
 							 "located row ids and the last granule read.",
 							 NULL,
 							 &ch_enable_fetch_cache,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_part_summaries",
+							 "Whether the planner and a scan take a part's columns' sizes and statistics from "
+							 "its summary in ch.parts.",
+							 "Off, a part is loaded through ClickHouse, in each process, the first time they are "
+							 "asked of it; its summary is written either way.",
+							 &ch_enable_part_summaries,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_summary_pruning",
+							 "Whether the planner asks a filter what a part's summary rules out before it "
+							 "loads the part to select its granules.",
+							 "Off, the estimate of a scan with quals loads every part.",
+							 &ch_enable_summary_pruning,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

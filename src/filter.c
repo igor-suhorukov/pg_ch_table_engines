@@ -560,15 +560,33 @@ ch_filter_make(ChTable *t, List *quals)
 	return filter;
 }
 
+/*
+ * A part's statistics of a column: its summary's (VC20's B6) where it has
+ * one, else the part's, loaded.  The part's summary is read into it once
+ * (ch_part_summary()), its list's own copy of the part's row.
+ */
 static bool
 part_stats(ChTable *t, const ChPart *part, AttrNumber attnum, chte_column_stats *st)
 {
+	const ChEngine *eng = ch_engine();
 	char		name[16];
+	int			found = 0;
 
 	snprintf(name, sizeof(name), "c%d", attnum);
-	if (t->options.storage == CH_STORAGE_PAGES)
-		ch_pages_attach(t, part);
-	CH_CALL("reading a part's statistics", ch_engine()->part_stats(t->handle, part->name, name, st, CH_ERR));
+	if (ch_enable_part_summaries && eng->summary_stats != NULL && part->summary != NULL)
+	{
+		bytea	   *summary = ch_part_summary((ChPart *) part);
+
+		CH_CALL("reading a part's statistics",
+				eng->summary_stats(t->handle, part->name, VARDATA_ANY(summary), VARSIZE_ANY_EXHDR(summary), name,
+								   st, &found, CH_ERR));
+	}
+	if (!found)
+	{
+		if (t->options.storage == CH_STORAGE_PAGES)
+			ch_pages_attach(t, part);
+		CH_CALL("reading a part's statistics", eng->part_stats(t->handle, part->name, name, st, CH_ERR));
+	}
 	return st->has_stats && st->has_null_count;
 }
 

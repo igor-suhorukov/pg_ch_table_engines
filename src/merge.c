@@ -121,6 +121,7 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 	const char **names = palloc(sizeof(char *) * n);
 	int		   *from = palloc(sizeof(int) * n);	/* the chosen part each input is of */
 	chte_part_info *local = palloc0(sizeof(chte_part_info) * n);	/* an input's folded part, its name "" if none */
+	bytea	  **local_summary = palloc0(sizeof(bytea *) * n);	/* and its summary */
 	int			ninputs = 0;
 	uint64	   *folded = NULL;
 	int			nfolded = 0;
@@ -159,6 +160,7 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 		if (nparts > 0)
 		{
 			CH_CALL("folding a part's deletions out", eng->write_part(writer, 0, &local[ninputs], CH_ERR));
+			local_summary[ninputs] = ch_part_summary_written(writer, 0);
 			CH_CALL("folding a part's deletions out", eng->write_commit(writer, CH_ERR));
 			from[ninputs] = i;
 			names[ninputs] = local[ninputs].name;
@@ -194,6 +196,7 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 		next.marks = (int32) info.marks;
 		next.manifest = NULL;
 		next.created = 0;
+		next.summary = ch_part_summary_written(writer, 0);
 		store_part(rel, t, info.temp_dir, &next);
 		/* a part of the pages store is in pages now: its directory goes, uncommitted */
 		if (t->options.storage != CH_STORAGE_PAGES)
@@ -213,6 +216,7 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 		next.marks = (int32) local[0].marks;
 		next.manifest = NULL;
 		next.created = 0;
+		next.summary = local_summary[0];
 		store_part(rel, t, local[0].name, &next);
 		/* the files store's part stays where it is, its directory the part's */
 		keep_local = t->options.storage != CH_STORAGE_PAGES;
