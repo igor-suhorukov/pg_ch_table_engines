@@ -60,6 +60,7 @@ extern void ch_scan_set_columns(TableScanDesc scan, int n, const AttrNumber *att
 
 /* Before the first batch: quals to prune by (filter.c); false when none could be */
 extern bool ch_scan_set_filter(TableScanDesc scan, List *quals);
+extern void ch_scan_set_join_keys(TableScanDesc scan, int nkeys, const ScanKeyData *keys);
 
 extern bool ch_scan_set_dictionaries(TableScanDesc scan, const bool *keep);
 
@@ -97,6 +98,7 @@ extern void ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber
 
 /* filter.c: ANDed quals over a table's Vars as a filter of the library's, or NULL */
 extern chte_filter *ch_filter_make(ChTable *t, List *quals);
+extern chte_filter *ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys);
 extern List *ch_filter_quals(ChTable *t, List *quals);
 
 /*

@@ -5,7 +5,17 @@
  *	  (ch_table_engines.md §2.8, "Key conditions"): `column op constant`
  *	  under a type whose order in ClickHouse is PostgreSQL's btree order
  *	  (§2.5), `= ANY (array)`, `IS [NOT] NULL`, a bool column, and AND and
- *	  OR of them.
+ *	  OR of them; and ANDed with them, a hash join's keys vexec lends its
+ *	  source (ch_table_engines.md §3, VC3; vexec_source.h, set_join_keys) --
+ *	  an integer column's `>=` and `<=` the inner keys' least and greatest,
+ *	  and `= ANY` their values -- as scan keys.  The values only where the
+ *	  column is one of the primary key's, which passes granules over by
+ *	  them, and as at most CH_JOIN_KEY_RANGES ranges, the smallest gaps
+ *	  between them closed: ClickHouse's analysis of a filter checks each of
+ *	  its comparisons for every range of granules it looks at, so that 900
+ *	  values made it a third of a parallel scan's time where they pruned
+ *	  nothing.  A column of no part of the key prunes parts by the least and
+ *	  greatest alone.
  *
  *	  A filter only prunes: the executor evaluates every qual on what is
  *	  read.  So a qual is translated into a condition it implies -- itself,
@@ -38,6 +48,7 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "access/skey.h"
 #include "access/stratnum.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
@@ -50,11 +61,13 @@
 #include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/pg_locale.h"
+#include "utils/varlena.h"
 
 #include "chte.h"
 #include "scan.h"
 
 #define CH_FILTER_MAX_VALUES 1024
+#define CH_JOIN_KEY_RANGES 32
 
 /* A filter's nodes, in prefix order, and the values they point at */
 typedef struct Leaf
@@ -498,6 +511,187 @@ translate_qual(ChTable *t, Node *node)
 	return translate_bool_var(t, node, true);
 }
 
+/* Whether attnum is one of the table's primary key's columns -- its order's where it names none apart */
+static bool
+key_column(ChTable *t, AttrNumber attnum)
+{
+	const char *keys = t->options.primary_key ? t->options.primary_key : t->options.order_by;
+	char	   *copy;
+	List	   *names;
+	ListCell   *lc;
+	bool		found = false;
+
+	if (keys == NULL)
+		return false;
+	copy = pstrdup(keys);
+	if (SplitIdentifierString(copy, ',', &names))
+		foreach(lc, names)
+			if (get_attnum(t->relid, lfirst(lc)) == attnum)
+			{
+				found = true;
+				break;
+			}
+	list_free(names);
+	pfree(copy);
+	return found;
+}
+
+static int
+int64_cmp(const void *a, const void *b)
+{
+	int64		x = *(const int64 *) a;
+	int64		y = *(const int64 *) b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* A gap between two values: the index of the first, and the distance to the next */
+typedef struct Gap
+{
+	int			at;
+	uint64		size;
+} Gap;
+
+static int
+gap_cmp(const void *a, const void *b)
+{
+	const Gap  *x = a;
+	const Gap  *y = b;
+
+	if (x->size != y->size)
+		return x->size > y->size ? -1 : 1;
+	return x->at - y->at;
+}
+
+static Datum
+int_datum(Oid type, int64 v)
+{
+	return type == INT2OID ? Int16GetDatum((int16) v) :
+		type == INT4OID ? Int32GetDatum((int32) v) : Int64GetDatum(v);
+}
+
+/*
+ * VC3: a join's values of a key column as at most CH_JOIN_KEY_RANGES ranges
+ * -- runs of consecutive values each one, then the largest gaps kept apart
+ * and the others closed -- ORed: a range of one value its equality, any
+ * other `>=` its least AND `<=` its greatest.  NIL where one range holds
+ * them all, which the keys' least and greatest already say, or a value the
+ * column cannot hold.
+ */
+static List *
+values_as_ranges(const ChColumn *col, Oid basetype, AttrNumber attnum, Oid type, int64 *v, int n)
+{
+	Gap		   *gaps = palloc(sizeof(Gap) * Max(n, 1));
+	bool	   *cut = palloc0(sizeof(bool) * Max(n, 1));
+	int			ngaps = 0;
+	int			nranges;
+	List	   *out = NIL;
+	int			lo = 0;
+
+	qsort(v, n, sizeof(int64), int64_cmp);
+	for (int i = 0; i + 1 < n; i++)
+		if ((uint64) v[i + 1] - (uint64) v[i] > 1)
+		{
+			gaps[ngaps].at = i;
+			gaps[ngaps++].size = (uint64) v[i + 1] - (uint64) v[i];
+		}
+	if (ngaps > CH_JOIN_KEY_RANGES - 1)
+	{
+		qsort(gaps, ngaps, sizeof(Gap), gap_cmp);
+		ngaps = CH_JOIN_KEY_RANGES - 1;
+	}
+	if (ngaps == 0)
+		return NIL;
+	for (int g = 0; g < ngaps; g++)
+		cut[gaps[g].at] = true;
+	nranges = ngaps + 1;
+	out = list_make1(make_bool_node(CHTE_FILTER_OR, nranges));
+	for (int i = 0; i < n; i++)
+	{
+		Leaf	   *a;
+		Leaf	   *b;
+
+		if (i + 1 < n && !cut[i])
+			continue;
+		/* a range: values [lo, i] */
+		if (v[lo] == v[i])
+		{
+			a = make_leaf(CHTE_FILTER_EQ, attnum);
+			if (!add_value(a, col, basetype, int_datum(type, v[i]), type))
+				return NIL;
+			out = lappend(out, a);
+		}
+		else
+		{
+			a = make_leaf(CHTE_FILTER_GE, attnum);
+			b = make_leaf(CHTE_FILTER_LE, attnum);
+			if (!add_value(a, col, basetype, int_datum(type, v[lo]), type) ||
+				!add_value(b, col, basetype, int_datum(type, v[i]), type))
+				return NIL;
+			out = lappend(out, make_bool_node(CHTE_FILTER_AND, 2));
+			out = lappend(out, a);
+			out = lappend(out, b);
+		}
+		lo = i + 1;
+	}
+	return out;
+}
+
+/*
+ * A hash join's key, as vexec lends it (VC3): `column >= v`, `column <= v` or
+ * `column = ANY (array)`, of an integer column, as its filter -- the values
+ * as ranges of a key column alone; NIL where it is of another form, or
+ * values of another column or more than an IN list takes.
+ */
+static List *
+translate_key(ChTable *t, const ScanKeyData *key)
+{
+	const ChColumn *col;
+	Oid			basetype;
+	Leaf	   *leaf;
+
+	if (key->sk_attno < 1 || key->sk_attno > t->natts || (key->sk_flags & SK_ISNULL))
+		return NIL;
+	col = &t->columns[key->sk_attno - 1];
+	if (!filterable_type(col, &basetype) || !is_int_type(basetype) || !is_int_type(key->sk_subtype))
+		return NIL;
+	if (key->sk_flags & SK_SEARCHARRAY)
+	{
+		ArrayType  *array = DatumGetArrayTypeP(key->sk_argument);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+
+		int16		typlen;
+		bool		typbyval;
+		char		typalign;
+
+		if (key->sk_strategy != BTEqualStrategyNumber || ARR_ELEMTYPE(array) != key->sk_subtype)
+			return NIL;
+		get_typlenbyvalalign(key->sk_subtype, &typlen, &typbyval, &typalign);
+		deconstruct_array(array, key->sk_subtype, typlen, typbyval, typalign, &elems, &nulls, &nelems);
+		if (nelems == 0 || nelems > CH_FILTER_MAX_VALUES || !key_column(t, key->sk_attno))
+			return NIL;
+		{
+			int64	   *v = palloc(sizeof(int64) * nelems);
+			int			n = 0;
+
+			for (int i = 0; i < nelems; i++)
+				if (!nulls[i])
+					v[n++] = key->sk_subtype == INT2OID ? DatumGetInt16(elems[i]) :
+						key->sk_subtype == INT4OID ? DatumGetInt32(elems[i]) : DatumGetInt64(elems[i]);
+			return values_as_ranges(col, basetype, key->sk_attno, key->sk_subtype, v, n);
+		}
+	}
+	if (key->sk_strategy != BTGreaterEqualStrategyNumber && key->sk_strategy != BTLessEqualStrategyNumber)
+		return NIL;
+	leaf = make_leaf(key->sk_strategy == BTGreaterEqualStrategyNumber ? CHTE_FILTER_GE : CHTE_FILTER_LE,
+					 key->sk_attno);
+	if (!add_value(leaf, col, basetype, key->sk_argument, key->sk_subtype))
+		return NIL;
+	return list_make1(leaf);
+}
+
 /* The quals of a list a filter is made from */
 List *
 ch_filter_quals(ChTable *t, List *quals)
@@ -514,6 +708,13 @@ ch_filter_quals(ChTable *t, List *quals)
 chte_filter *
 ch_filter_make(ChTable *t, List *quals)
 {
+	return ch_filter_make_keys(t, quals, 0, NULL);
+}
+
+/* The quals' filter, ANDed with a hash join's keys (VC3) */
+chte_filter *
+ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys)
+{
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext, "ch filter", ALLOCSET_SMALL_SIZES);
 	MemoryContext old = MemoryContextSwitchTo(cxt);
 	List	   *nodes = NIL;
@@ -526,6 +727,16 @@ ch_filter_make(ChTable *t, List *quals)
 	foreach(lc, quals)
 	{
 		List	   *q = translate_qual(t, lfirst(lc));
+
+		if (q != NIL)
+		{
+			nodes = list_concat(nodes, q);
+			nquals++;
+		}
+	}
+	for (int k = 0; k < nkeys; k++)
+	{
+		List	   *q = translate_key(t, &keys[k]);
 
 		if (q != NIL)
 		{

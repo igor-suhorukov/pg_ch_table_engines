@@ -68,6 +68,7 @@
 #include "port/atomics.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -123,6 +124,11 @@ typedef struct ChScanDescData
 	bool		all_columns;	/* every column and the row id, as getnextslot reads */
 	chte_filter *filter;		/* NULL: every granule */
 	ResourceOwner filter_owner;
+	List	   *filter_quals;	/* the quals it was made of */
+	int			njoin_keys;		/* VC3: a hash join's keys, ANDed with them */
+	ScanKeyData *join_keys;
+	MemoryContext join_cxt;
+	bool		filter_stale;	/* made anew before the next unit is claimed */
 	ChUnitCheck unit_check;		/* NULL: every unit is read */
 	void	   *unit_check_arg;
 
@@ -365,6 +371,7 @@ setup_units(ChScanDesc scan)
 }
 
 static bool claim_one_unit(ChScanDesc scan);
+static void refresh_filter(ChScanDesc scan);
 
 /* Takes the next unit the scan's unit check keeps, passing over the others: false at the end */
 static bool
@@ -543,6 +550,32 @@ select_unit(ChScanDesc scan)
 	scan->selected = true;
 }
 
+/*
+ * VC3: the filter made again of the quals and the join's keys given since,
+ * for the units claimed from now on
+ */
+static void
+refresh_filter(ChScanDesc scan)
+{
+	MemoryContext old;
+
+	if (!scan->filter_stale)
+		return;
+	scan->filter_stale = false;
+	if (scan->filter)
+	{
+		ch_handle_closing(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
+		ch_engine()->filter_free(scan->filter);
+		scan->filter = NULL;
+	}
+	old = MemoryContextSwitchTo(scan->scan_cxt);
+	scan->filter_owner = ch_handle_reserve();
+	scan->filter = ch_filter_make_keys(scan->table, scan->filter_quals, scan->njoin_keys, scan->join_keys);
+	if (scan->filter)
+		ch_handle_opened(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
+	MemoryContextSwitchTo(old);
+}
+
 static void
 begin_reader(ChScanDesc scan)
 {
@@ -659,8 +692,12 @@ next_batch(ChScanDesc scan)
 			}
 			return true;
 		}
-		if (scan->part == NULL && !claim_unit(scan))
-			return false;
+		if (scan->part == NULL)
+		{
+			refresh_filter(scan);
+			if (!claim_unit(scan))
+				return false;
+		}
 		select_unit(scan);
 		if (scan->unit_rows == 0)
 		{
@@ -1060,11 +1097,50 @@ ch_scan_set_filter(TableScanDesc sscan, List *quals)
 	ChScanDesc	scan = (ChScanDesc) sscan;
 
 	Assert(scan->part == NULL && scan->filter == NULL);
+	scan->filter_quals = list_copy(quals);
 	scan->filter_owner = ch_handle_reserve();
 	scan->filter = ch_filter_make(scan->table, quals);
 	if (scan->filter)
 		ch_handle_opened(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
 	return scan->filter != NULL;
+}
+
+/*
+ * VC3: a hash join's keys, lent to the scan on its outer side (vexec's
+ * set_join_keys()), ANDed with the quals into the filter the units claimed
+ * from now on are selected by -- replacing the last given, none where nkeys
+ * is 0 -- so that ClickHouse's analysis passes over the parts and granules
+ * no inner row meets: by the parts' summaries and statistics, and by the
+ * primary key where the keys' column leads it.  A unit claimed before keeps
+ * its granules.
+ */
+void
+ch_scan_set_join_keys(TableScanDesc sscan, int nkeys, const ScanKeyData *keys)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	MemoryContext old;
+
+	if (nkeys <= 0 && scan->njoin_keys == 0)
+		return;
+	if (scan->join_cxt == NULL)
+		scan->join_cxt = AllocSetContextCreate(scan->scan_cxt, "ch join keys", ALLOCSET_SMALL_SIZES);
+	MemoryContextReset(scan->join_cxt);
+	scan->join_keys = NULL;
+	scan->njoin_keys = 0;
+	if (nkeys > 0)
+	{
+		old = MemoryContextSwitchTo(scan->join_cxt);
+		scan->join_keys = palloc(sizeof(ScanKeyData) * nkeys);
+		for (int k = 0; k < nkeys; k++)
+		{
+			scan->join_keys[k] = keys[k];
+			if (keys[k].sk_flags & SK_SEARCHARRAY)
+				scan->join_keys[k].sk_argument = PointerGetDatum(DatumGetArrayTypePCopy(keys[k].sk_argument));
+		}
+		scan->njoin_keys = nkeys;
+		MemoryContextSwitchTo(old);
+	}
+	scan->filter_stale = true;
 }
 
 /*
@@ -1198,8 +1274,12 @@ ch_scan_claim_unit(TableScanDesc sscan, ChScanUnit *unit)
 
 	if (scan->reader || scan->count_left > 0)
 		return false;			/* inside a unit: its batches come first */
-	if (scan->part == NULL && !claim_unit(scan))
-		return false;
+	if (scan->part == NULL)
+	{
+		refresh_filter(scan);
+		if (!claim_unit(scan))
+			return false;
+	}
 	select_unit(scan);
 	unit->part = scan->part;
 	unit->whole = scan->unit_whole && scan->filter == NULL;
