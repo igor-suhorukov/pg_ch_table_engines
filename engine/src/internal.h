@@ -29,6 +29,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 namespace DB::ErrorCodes
 {
@@ -200,6 +201,21 @@ int guarded(chte_error * error, F && f) noexcept
     }
 }
 
+/// A part's summary (chte_write_part_summary, VC20's B6): each of its columns' bytes, as columnSize()
+/// adds them up, and the estimate of the column's statistics, where it has statistics.
+struct PartSummary
+{
+    std::unordered_map<String, ColumnSize> sizes;
+    Estimates estimates;
+};
+
+/// A column's bytes in a part, from its checksums where it is a wide part's (VC20's A3).
+ColumnSize columnSize(const IMergeTreeDataPart & part, const String & name);
+/// A part's summary in the library's own bytes, which the caller keeps with the part.
+String summarizePart(const IMergeTreeDataPart & part);
+/// The summary those bytes hold; nullptr where they are of another format.
+std::shared_ptr<const PartSummary> parseSummary(const void * data, size_t size);
+
 /// A MergeTree table whose parts PostgreSQL keeps track of.  MergeTreeData's own part set
 /// stays empty: parts are built from their directories when a call needs them.
 class PgMergeTree final : public MergeTreeData
@@ -249,6 +265,9 @@ public:
     /// A part's bytes of the named columns, each column's worked out once (VC20), where a part's first
     /// getColumnSize() works out every column's (calculateColumnsSizesOnDisk).
     ColumnSize columnsSize(const String & part_name, const Names & columns) const;
+    /// A part's summary, the caller's bytes of it parsed once a part (VC20's B6); nullptr where they are
+    /// of another format.
+    std::shared_ptr<const PartSummary> partSummary(const String & part_name, const void * data, size_t size) const;
 
     MergeTreeDataWriter writer;
     MergeTreeDataMergerMutator merger;
@@ -295,6 +314,8 @@ private:
     mutable StorageMetadataPtr without_projections_of;
     /// per part, each column's statistics asked for so far: nullopt where it has none
     mutable std::map<String, std::map<String, std::optional<Estimate>>> estimates;
+    /// per part, its summary parsed, and the size of the bytes it was parsed from
+    mutable std::map<String, std::pair<size_t, std::shared_ptr<const PartSummary>>> summaries;
 };
 
 /// The names of a comma-separated list; throws when there is none.
@@ -370,6 +391,8 @@ struct chte_writer
         std::vector<chte_part_file> listed;
     };
     std::vector<PartFiles> part_files;
+    /// chte_write_part_summary (VC20's B6): each part's summary, made as it is first asked for
+    std::map<size_t, std::string> summaries;
 };
 
 struct chte_reader

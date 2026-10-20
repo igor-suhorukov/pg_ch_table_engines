@@ -68,7 +68,7 @@
 #define Anum_tables_plain 10
 
 /* ch.parts's columns */
-#define Natts_parts 12
+#define Natts_parts 13
 #define Anum_parts_tablespace 1
 #define Anum_parts_relfilenumber 2
 #define Anum_parts_backend 3
@@ -81,6 +81,7 @@
 #define Anum_parts_marks 10
 #define Anum_parts_manifest 11
 #define Anum_parts_created 12
+#define Anum_parts_summary 13
 
 static bool
 twin(const ChStorageId *id)
@@ -255,6 +256,22 @@ parts_visible(const ChStorageId *id, Snapshot snapshot, bool keep_toasted)
 		else
 			p->manifest = DatumGetByteaPCopy(values[Anum_parts_manifest - 1]);
 		p->created = DatumGetTimestampTz(values[Anum_parts_created - 1]);
+		/* a catalog made before the column was: no part has a summary */
+		if (RelationGetDescr(catalog)->natts < Anum_parts_summary || nulls[Anum_parts_summary - 1])
+			p->summary = NULL;
+		else
+		{
+			struct varlena *value = (struct varlena *) DatumGetPointer(values[Anum_parts_summary - 1]);
+
+			/* as stored -- compressed, or a TOAST pointer an MVCC snapshot keeps -- until read */
+			if (VARATT_IS_EXTERNAL_ONDISK(value) && !keep_toasted)
+				p->summary = (bytea *) detoast_attr(value);
+			else
+			{
+				p->summary = palloc(VARSIZE_ANY(value));
+				memcpy(p->summary, value, VARSIZE_ANY(value));
+			}
+		}
 		parts = lappend(parts, p);
 	}
 	systable_endscan(scan);
@@ -283,6 +300,58 @@ ch_part_manifest(const ChPart *part)
 	if (part->manifest == NULL || !VARATT_IS_EXTERNAL_ONDISK(part->manifest))
 		return part->manifest;
 	return (bytea *) detoast_attr((struct varlena *) part->manifest);
+}
+
+/*
+ * A part's summary (VC20's B6), decompressed or fetched from TOAST the first
+ * time it is read and kept so in the part, in the part's memory context;
+ * NULL where its row has none.
+ */
+bytea *
+ch_part_summary(ChPart *part)
+{
+	if (part->summary != NULL && VARATT_IS_EXTENDED(part->summary))
+	{
+		MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(part));
+		bytea	   *plain = (bytea *) detoast_attr((struct varlena *) part->summary);
+
+		MemoryContextSwitchTo(old);
+		if (plain != part->summary)
+			pfree(part->summary);
+		part->summary = plain;
+	}
+	return part->summary;
+}
+
+/*
+ * The rows and bytes of the parts of a storage a snapshot sees, summed from
+ * those two columns of their rows alone, no manifest or summary copied or
+ * fetched from TOAST (VC20's B8): the planner's size of the relation, at
+ * every query.
+ */
+void
+ch_parts_totals(const ChStorageId *id, Snapshot snapshot, double *rows, uint64 *bytes)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+	int			nkeys;
+
+	*rows = 0;
+	*bytes = 0;
+	catalog = open_catalog("parts", id, AccessShareLock);
+	nkeys = storage_keys(id, keys);
+	scan = systable_beginscan(catalog, catalog_index(catalog), true, snapshot, nkeys, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+
+		*rows += DatumGetInt64(heap_getattr(tuple, Anum_parts_rows, RelationGetDescr(catalog), &isnull));
+		*bytes += DatumGetInt64(heap_getattr(tuple, Anum_parts_bytes, RelationGetDescr(catalog), &isnull));
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
 }
 
 /*
@@ -456,10 +525,37 @@ ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid)
 	else
 		nulls[Anum_parts_manifest - 1] = true;
 	values[Anum_parts_created - 1] = TimestampTzGetDatum(part->created ? part->created : GetCurrentTimestamp());
+	if (part->summary)
+		values[Anum_parts_summary - 1] = PointerGetDatum(part->summary);
+	else
+		nulls[Anum_parts_summary - 1] = true;
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	insert_with_cid(catalog, tuple, cid);
 	heap_freetuple(tuple);
 	table_close(catalog, RowExclusiveLock);
+}
+
+/*
+ * A writer's part i's summary for its row (VC20's B6), the library's bytes
+ * of its columns' sizes and statistics; NULL where the library keeps none.
+ */
+bytea *
+ch_part_summary_written(chte_writer *writer, size_t i)
+{
+	const ChEngine *eng = ch_engine();
+	const void *data;
+	size_t		size;
+	bytea	   *summary;
+
+	if (eng->write_part_summary == NULL)
+		return NULL;
+	CH_CALL("summarizing a part", eng->write_part_summary(writer, i, &data, &size, CH_ERR));
+	if (size == 0)
+		return NULL;
+	summary = palloc(VARHDRSZ + size);
+	SET_VARSIZE(summary, VARHDRSZ + size);
+	memcpy(VARDATA(summary), data, size);
+	return summary;
 }
 
 /* Deletes a part's row (its next version replacing it: tombstones folded into it) */

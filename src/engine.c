@@ -274,6 +274,22 @@ ch_engine(void)
 		engine.write_in_memory = NULL;
 		engine.write_part_files = NULL;
 	}
+	/*
+	 * optional: a library built before VC20's B6 keeps no part's summary, and
+	 * every part is loaded where its sizes and statistics are asked
+	 */
+	*(void **) &engine.write_part_summary = dlsym(handle, "chte_write_part_summary");
+	*(void **) &engine.summary_column_bytes = dlsym(handle, "chte_summary_column_bytes");
+	*(void **) &engine.summary_stats = dlsym(handle, "chte_summary_stats");
+	*(void **) &engine.filter_summary_select = dlsym(handle, "chte_filter_summary_select");
+	if (engine.write_part_summary == NULL || engine.summary_column_bytes == NULL ||
+		engine.summary_stats == NULL || engine.filter_summary_select == NULL)
+	{
+		engine.write_part_summary = NULL;
+		engine.summary_column_bytes = NULL;
+		engine.summary_stats = NULL;
+		engine.filter_summary_select = NULL;
+	}
 
 	memset(&options, 0, sizeof(options));
 	options.abi_version = CHTE_ABI_VERSION;

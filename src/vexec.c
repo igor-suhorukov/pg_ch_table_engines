@@ -58,7 +58,12 @@
  *	  VEXEC_SRC_STEPS (minor 5, VC2) reads its first step's columns with
  *	  each granule and a later step's only where next_rest() asks for it,
  *	  the engine library leaving the granules no batch asked it for
- *	  undecoded (scan.c).
+ *	  undecoded (scan.c).  set_join_keys() (minor 6, VC3) takes a hash
+ *	  join's inner keys -- their range, and their values where they are
+ *	  few -- into the scan's filter, ANDed with its quals, for the units it
+ *	  claims from then on (filter.c), so that the parts' summaries and
+ *	  statistics and the primary key pass over the parts and granules no
+ *	  inner row meets.
  *
  *	  The sink.  VecInsert's batches go into the write buffer (buffer.c) by
  *	  column -- straight into the engine library's writer where it takes
@@ -1023,6 +1028,8 @@ src_rescan(void *arg)
 	st->pos = 0;
 	st->nbound_keys = 0;
 	ch_scan_set_unit_check(st->scan, st->nspec_keys > 0 ? unit_within_keys : NULL, st);
+	/* and the join's keys (VC3) */
+	ch_scan_set_join_keys(st->scan, 0, NULL);
 }
 
 /* Before table_endscan() */
@@ -1264,6 +1271,15 @@ src_set_keys(void *arg, int nkeys, const ScanKeyData *keys)
 	MemoryContextSwitchTo(old);
 }
 
+/* A hash join's keys, lent to the scan on its outer side (minor 6, VC3) */
+static void
+src_set_join_keys(void *arg, int nkeys, const ScanKeyData *keys)
+{
+	SrcState   *st = arg;
+
+	ch_scan_set_join_keys(st->scan, nkeys, keys);
+}
+
 /* ---- the sink ---- */
 
 typedef struct SinkState
@@ -1388,6 +1404,7 @@ ch_vexec_register(void)
 		r->fetch_columns = src_fetch_columns;
 		r->ordering = src_ordering;
 		r->next_rest = src_next_rest;
+		r->set_join_keys = src_set_join_keys;
 		vexec_register_source(r);
 
 		memset(s, 0, sizeof(VexecSinkRoutine));

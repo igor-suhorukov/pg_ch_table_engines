@@ -68,6 +68,7 @@
 #include "port/atomics.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -123,6 +124,11 @@ typedef struct ChScanDescData
 	bool		all_columns;	/* every column and the row id, as getnextslot reads */
 	chte_filter *filter;		/* NULL: every granule */
 	ResourceOwner filter_owner;
+	List	   *filter_quals;	/* the quals it was made of */
+	int			njoin_keys;		/* VC3: a hash join's keys, ANDed with them */
+	ScanKeyData *join_keys;
+	MemoryContext join_cxt;
+	bool		filter_stale;	/* made anew before the next unit is claimed */
 	ChUnitCheck unit_check;		/* NULL: every unit is read */
 	void	   *unit_check_arg;
 
@@ -365,6 +371,7 @@ setup_units(ChScanDesc scan)
 }
 
 static bool claim_one_unit(ChScanDesc scan);
+static void refresh_filter(ChScanDesc scan);
 
 /* Takes the next unit the scan's unit check keeps, passing over the others: false at the end */
 static bool
@@ -442,9 +449,29 @@ claim_one_unit(ChScanDesc scan)
 	scan->selected = false;
 	scan->counts.units++;
 	unit_deletions(scan);
-	if (scan->table->options.storage == CH_STORAGE_PAGES)
-		ch_pages_attach(scan->table, scan->part);
 	return true;
+}
+
+/*
+ * Whether the filter rules the claimed unit's part out by the part's summary
+ * (VC20's B7), as chte_part_select() would by its statistics -- the part
+ * then neither attached nor loaded.
+ */
+static bool
+summary_rules_out(ChScanDesc scan)
+{
+	const ChEngine *eng = ch_engine();
+	bytea	   *summary = NULL;
+	int			verdict;
+
+	if (scan->filter == NULL || !ch_enable_summary_pruning || eng->filter_summary_select == NULL)
+		return false;
+	if (ch_enable_part_summaries)
+		summary = ch_part_summary(scan->part);
+	CH_CALL("analyzing a part",
+			eng->filter_summary_select(scan->filter, scan->part->name, summary ? VARDATA_ANY(summary) : NULL,
+									   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
+	return verdict == CHTE_SELECT_NONE;
 }
 
 /* The claimed unit's granules the filter keeps, and their rows */
@@ -465,6 +492,19 @@ select_unit(ChScanDesc scan)
 		scan->selected = true;
 		return;
 	}
+	if (summary_rules_out(scan))
+	{
+		/* none of its granules, counted as chte_part_select()'s none would be below */
+		scan->nranges = 0;
+		scan->unit_rows = 0;
+		scan->counts.marks += (scan->unit_end ? scan->unit_end : (uint32) scan->part->marks) - scan->unit_begin;
+		if (scan->unit_whole || scan->unit_begin == 0)
+			scan->counts.parts_pruned++;
+		scan->selected = true;
+		return;
+	}
+	if (scan->table->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(scan->table, scan->part);
 	for (;;)
 	{
 		size_t		n;
@@ -510,6 +550,32 @@ select_unit(ChScanDesc scan)
 	scan->selected = true;
 }
 
+/*
+ * VC3: the filter made again of the quals and the join's keys given since,
+ * for the units claimed from now on
+ */
+static void
+refresh_filter(ChScanDesc scan)
+{
+	MemoryContext old;
+
+	if (!scan->filter_stale)
+		return;
+	scan->filter_stale = false;
+	if (scan->filter)
+	{
+		ch_handle_closing(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
+		ch_engine()->filter_free(scan->filter);
+		scan->filter = NULL;
+	}
+	old = MemoryContextSwitchTo(scan->scan_cxt);
+	scan->filter_owner = ch_handle_reserve();
+	scan->filter = ch_filter_make_keys(scan->table, scan->filter_quals, scan->njoin_keys, scan->join_keys);
+	if (scan->filter)
+		ch_handle_opened(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
+	MemoryContextSwitchTo(old);
+}
+
 static void
 begin_reader(ChScanDesc scan)
 {
@@ -523,6 +589,8 @@ begin_reader(ChScanDesc scan)
 		columns = scan->columns_rowid;
 		scan->rowid_col = scan->ncols;
 	}
+	if (scan->table->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(scan->table, scan->part);
 	scan->reader_owner = ch_handle_reserve();
 	if (scan->nsteps > 0)
 	{
@@ -624,8 +692,12 @@ next_batch(ChScanDesc scan)
 			}
 			return true;
 		}
-		if (scan->part == NULL && !claim_unit(scan))
-			return false;
+		if (scan->part == NULL)
+		{
+			refresh_filter(scan);
+			if (!claim_unit(scan))
+				return false;
+		}
 		select_unit(scan);
 		if (scan->unit_rows == 0)
 		{
@@ -1025,11 +1097,50 @@ ch_scan_set_filter(TableScanDesc sscan, List *quals)
 	ChScanDesc	scan = (ChScanDesc) sscan;
 
 	Assert(scan->part == NULL && scan->filter == NULL);
+	scan->filter_quals = list_copy(quals);
 	scan->filter_owner = ch_handle_reserve();
 	scan->filter = ch_filter_make(scan->table, quals);
 	if (scan->filter)
 		ch_handle_opened(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
 	return scan->filter != NULL;
+}
+
+/*
+ * VC3: a hash join's keys, lent to the scan on its outer side (vexec's
+ * set_join_keys()), ANDed with the quals into the filter the units claimed
+ * from now on are selected by -- replacing the last given, none where nkeys
+ * is 0 -- so that ClickHouse's analysis passes over the parts and granules
+ * no inner row meets: by the parts' summaries and statistics, and by the
+ * primary key where the keys' column leads it.  A unit claimed before keeps
+ * its granules.
+ */
+void
+ch_scan_set_join_keys(TableScanDesc sscan, int nkeys, const ScanKeyData *keys)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	MemoryContext old;
+
+	if (nkeys <= 0 && scan->njoin_keys == 0)
+		return;
+	if (scan->join_cxt == NULL)
+		scan->join_cxt = AllocSetContextCreate(scan->scan_cxt, "ch join keys", ALLOCSET_SMALL_SIZES);
+	MemoryContextReset(scan->join_cxt);
+	scan->join_keys = NULL;
+	scan->njoin_keys = 0;
+	if (nkeys > 0)
+	{
+		old = MemoryContextSwitchTo(scan->join_cxt);
+		scan->join_keys = palloc(sizeof(ScanKeyData) * nkeys);
+		for (int k = 0; k < nkeys; k++)
+		{
+			scan->join_keys[k] = keys[k];
+			if (keys[k].sk_flags & SK_SEARCHARRAY)
+				scan->join_keys[k].sk_argument = PointerGetDatum(DatumGetArrayTypePCopy(keys[k].sk_argument));
+		}
+		scan->njoin_keys = nkeys;
+		MemoryContextSwitchTo(old);
+	}
+	scan->filter_stale = true;
 }
 
 /*
@@ -1163,8 +1274,12 @@ ch_scan_claim_unit(TableScanDesc sscan, ChScanUnit *unit)
 
 	if (scan->reader || scan->count_left > 0)
 		return false;			/* inside a unit: its batches come first */
-	if (scan->part == NULL && !claim_unit(scan))
-		return false;
+	if (scan->part == NULL)
+	{
+		refresh_filter(scan);
+		if (!claim_unit(scan))
+			return false;
+	}
 	select_unit(scan);
 	unit->part = scan->part;
 	unit->whole = scan->unit_whole && scan->filter == NULL;
@@ -2289,19 +2404,38 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		if (filter)
 			ch_handle_opened(owner, CH_HANDLE_FILTER, filter);
 	}
+	/*
+	 * Each part's rows the quals keep and its needed columns' bytes, from its
+	 * summary where it has one (VC20's B6, B7), else from the part itself,
+	 * loaded -- and, in the pages store, attached -- only then.
+	 */
 	foreach(lc, parts)
 	{
 		ChPart	   *p = lfirst(lc);
 		uint64		kept = (uint64) p->rows;
+		bytea	   *summary = NULL;
+		int			verdict = CHTE_SELECT_RANGES;
+		int			found = 0;
 
-		if (t->options.storage == CH_STORAGE_PAGES)
-			ch_pages_attach(t, p);
+		if (ch_enable_part_summaries && eng->summary_column_bytes != NULL)
+			summary = ch_part_summary(p);
 		if (filter)
 		{
-			size_t		nranges;
+			if (ch_enable_summary_pruning && eng->filter_summary_select != NULL)
+				CH_CALL("analyzing a part",
+						eng->filter_summary_select(filter, p->name, summary ? VARDATA_ANY(summary) : NULL,
+												   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
+			if (verdict == CHTE_SELECT_NONE)
+				kept = 0;
+			else if (verdict == CHTE_SELECT_RANGES)
+			{
+				size_t		nranges;
 
-			CH_CALL("analyzing a part",
-					eng->part_select(t->handle, p->name, filter, 0, 0, NULL, 0, &nranges, &kept, CH_ERR));
+				if (t->options.storage == CH_STORAGE_PAGES)
+					ch_pages_attach(t, p);
+				CH_CALL("analyzing a part",
+						eng->part_select(t->handle, p->name, filter, 0, 0, NULL, 0, &nranges, &kept, CH_ERR));
+			}
 		}
 		*rows += kept;
 		if (names.len > 0 && kept > 0 && p->rows > 0)
@@ -2309,8 +2443,17 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 			uint64		compressed;
 			uint64		uncompressed;
 
-			CH_CALL("sizing a part's columns",
-					eng->part_column_bytes(t->handle, p->name, names.data, &compressed, &uncompressed, CH_ERR));
+			if (summary)
+				CH_CALL("sizing a part's columns",
+						eng->summary_column_bytes(t->handle, p->name, VARDATA_ANY(summary), VARSIZE_ANY_EXHDR(summary),
+												  names.data, &compressed, &uncompressed, &found, CH_ERR));
+			if (!found)
+			{
+				if (t->options.storage == CH_STORAGE_PAGES)
+					ch_pages_attach(t, p);
+				CH_CALL("sizing a part's columns",
+						eng->part_column_bytes(t->handle, p->name, names.data, &compressed, &uncompressed, CH_ERR));
+			}
 			*bytes += (double) compressed * kept / p->rows;
 			if (raw)
 				*raw += (double) uncompressed * kept / p->rows;

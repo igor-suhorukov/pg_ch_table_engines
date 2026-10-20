@@ -312,6 +312,39 @@ CHTE_API int			chte_part_stats(chte_table *table, const char *part_name, const c
 							chte_column_stats *stats, chte_error *error);
 
 /*
+ * A part's summary (ch_table_engines.md §3, VC20's B6): what chte_part_column_bytes(),
+ * chte_part_stats() and a filter's pruning by statistics read of a loaded part -- each
+ * column's compressed and uncompressed bytes and its statistics -- in bytes of the
+ * library's own, which the caller keeps with the part and hands back, with its name,
+ * to the calls below, which load no part.  chte_write_part_summary makes them for a
+ * writer's part i, valid until the writer is closed.  *found 0: the bytes are of
+ * another format, or the part was written without a column asked for -- the loaded
+ * part's to tell.
+ */
+CHTE_API int			chte_write_part_summary(chte_writer *writer, size_t i, const void **summary, size_t *size,
+									chte_error *error);
+CHTE_API int			chte_summary_column_bytes(chte_table *table, const char *part_name, const void *summary,
+									  size_t size, const char *columns, uint64_t *compressed,
+									  uint64_t *uncompressed, int *found, chte_error *error);
+CHTE_API int			chte_summary_stats(chte_table *table, const char *part_name, const void *summary,
+							   size_t size, const char *column, chte_column_stats *stats, int *found,
+							   chte_error *error);
+
+/*
+ * What chte_part_select() would keep of a part, as far as the filter and the part's
+ * summary tell without the part (VC20's B7): CHTE_SELECT_NONE, no row -- the filter's
+ * key is always false, or the summary's statistics rule every row out;
+ * CHTE_SELECT_ALL, every granule -- the statistics leave a row, and the filter's key
+ * condition narrows no part's granules; CHTE_SELECT_RANGES, chte_part_select()'s to
+ * tell.  A summary NULL, or of another format, prunes nothing by statistics.
+ */
+#define CHTE_SELECT_NONE	0
+#define CHTE_SELECT_ALL		1
+#define CHTE_SELECT_RANGES	2
+CHTE_API int			chte_filter_summary_select(chte_filter *filter, const char *part_name, const void *summary,
+									   size_t size, int *verdict, chte_error *error);
+
+/*
  * Reading one part: columns is a comma-separated list of names (virtual columns such as
  * _part_offset allowed); ranges, when nranges is not 0, the granules to read, in order.
  * next returns 0 rows at the end; vectors stay valid until the following next or end,

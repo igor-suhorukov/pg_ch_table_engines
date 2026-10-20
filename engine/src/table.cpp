@@ -249,10 +249,18 @@ void PgMergeTree::forgetPart(const String & part_name) const
 {
     parts.erase(part_name);
     estimates.erase(part_name);
+    summaries.erase(part_name);
 }
 
-namespace
+std::shared_ptr<const PartSummary> PgMergeTree::partSummary(const String & part_name, const void * data, size_t size) const
 {
+    auto it = summaries.find(part_name);
+    if (it != summaries.end() && it->second.first == size)
+        return it->second.second;
+    auto summary = parseSummary(data, size);
+    summaries[part_name] = {size, summary};
+    return summary;
+}
 
 /// A column's bytes in a part: its streams' files in the part's checksums, as
 /// MergeTreeDataPartWide::getColumnSizeImpl adds them up.  A compact part's, whose columns share one
@@ -281,8 +289,6 @@ ColumnSize columnSize(const IMergeTreeDataPart & part, const String & name)
             size.marks += it->second.file_size;
     }, column->type, part.getColumnSample(*column));
     return size;
-}
-
 }
 
 ColumnSize PgMergeTree::columnsSize(const String & part_name, const Names & columns) const

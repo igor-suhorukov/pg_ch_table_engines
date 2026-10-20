@@ -29,6 +29,10 @@
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Storages/Statistics/Statistics.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 
@@ -211,12 +215,11 @@ std::vector<Range> columnBoxes(const Estimates & estimates, const String & name,
     return boxes;
 }
 
-/// Whether a part's statistics leave a row the filter may keep.
-bool statisticsCanMatch(chte_filter & filter, const MergeTreeData::DataPartPtr & part)
+/// Whether a part's statistics, their estimates, leave a row the filter may keep.
+bool statisticsCanMatch(chte_filter & filter, const Estimates & estimates)
 {
     if (!filter.stats_condition)
         return true;
-    auto estimates = filter.table->storage->partEstimates(part, filter.stats_columns.getNames());
     std::vector<std::vector<Range>> boxes;
     DataTypes types;
     size_t combinations = 1;
@@ -260,7 +263,8 @@ const MarkRanges & selectedRanges(chte_filter & filter, const MergeTreeData::Dat
         return it->second;
 
     MarkRanges ranges{MarkRange(0, part->index_granularity->getMarksCountWithoutFinal())};
-    bool pruned = !statisticsCanMatch(filter, part);
+    bool pruned = filter.stats_condition
+        && !statisticsCanMatch(filter, filter.table->storage->partEstimates(part, filter.stats_columns.getNames()));
     if (!pruned && filter.key_condition)
     {
         if (filter.key_condition->alwaysFalse())
@@ -285,6 +289,172 @@ Names splitNames(const char * list)
         boost::trim(name);
     std::erase_if(names, [](const String & name) { return name.empty(); });
     return names;
+}
+
+/// A column's statistics for the caller, from their estimate, where it has one.
+void fillStats(chte_table & table, const Estimate * estimate, const char * column, chte_column_stats * stats)
+{
+    *stats = {};
+    table.scratch.clear();
+    /// only "basic" statistics count, whose least and greatest values are exact
+    if (!estimate || !estimate->types.contains(StatisticsType::Basic))
+        return;
+    stats->has_stats = 1;
+    stats->rows = estimate->rows_count;
+    if (estimate->estimated_null_count)
+    {
+        stats->has_null_count = 1;
+        stats->null_count = *estimate->estimated_null_count;
+    }
+    else if (!isNullableOrLowCardinalityNullable(table.metadata->getColumns().getPhysical(column).type))
+        stats->has_null_count = 1;	/* none can be NULL */
+    if (estimate->estimated_min && estimate->estimated_max)
+    {
+        DataTypePtr type = removeLowCardinalityAndNullable(table.metadata->getColumns().getPhysical(column).type);
+        auto min = type->createColumn();
+        auto max = type->createColumn();
+        min->insert(*estimate->estimated_min);
+        max->insert(*estimate->estimated_max);
+        table.scratch.push_back(std::move(min));
+        table.scratch.push_back(std::move(max));
+        stats->min = vectorOf(*table.scratch[0]);
+        stats->max = vectorOf(*table.scratch[1]);
+        stats->has_minmax = 1;
+    }
+}
+
+/*
+ * A summary's bytes: a format byte; the number of columns; for each, its name, its compressed
+ * and uncompressed bytes, and whether it has statistics -- if so, their estimate: its types as
+ * bits, its rows, which of its optional members it has, and those, each count a varint and each
+ * least and greatest value ClickHouse's binary Field.
+ */
+constexpr UInt8 SUMMARY_FORMAT = 1;
+enum : UInt8
+{
+    HAS_CARDINALITY = 1,
+    HAS_MIN = 2,
+    HAS_MAX = 4,
+    HAS_NULL_COUNT = 8,
+    HAS_DEFAULT_COUNT = 16,
+};
+
+}
+
+namespace chte
+{
+
+String summarizePart(const IMergeTreeDataPart & part)
+{
+    Names names = part.getColumns().getNames();
+    auto statistics = part.loadStatistics(names);
+    WriteBufferFromOwnString out;
+    writeBinary(SUMMARY_FORMAT, out);
+    writeVarUInt(names.size(), out);
+    for (const auto & name : names)
+    {
+        auto size = columnSize(part, name);
+        writeStringBinary(name, out);
+        writeVarUInt(size.data_compressed, out);
+        writeVarUInt(size.data_uncompressed, out);
+        auto it = statistics.find(name);
+        writeBinary(UInt8(it != statistics.end()), out);
+        if (it == statistics.end())
+            continue;
+        Estimate e = it->second->getEstimate();
+        UInt64 types = 0;
+        for (auto type : e.types)
+            types |= UInt64(1) << static_cast<UInt8>(type);
+        UInt8 has = (e.estimated_cardinality ? HAS_CARDINALITY : 0) | (e.estimated_min ? HAS_MIN : 0)
+            | (e.estimated_max ? HAS_MAX : 0) | (e.estimated_null_count ? HAS_NULL_COUNT : 0)
+            | (e.estimated_default_count ? HAS_DEFAULT_COUNT : 0);
+        writeVarUInt(types, out);
+        writeVarUInt(e.rows_count, out);
+        writeBinary(has, out);
+        if (e.estimated_cardinality)
+            writeVarUInt(*e.estimated_cardinality, out);
+        if (e.estimated_min)
+            writeFieldBinary(*e.estimated_min, out);
+        if (e.estimated_max)
+            writeFieldBinary(*e.estimated_max, out);
+        if (e.estimated_null_count)
+            writeVarUInt(*e.estimated_null_count, out);
+        if (e.estimated_default_count)
+            writeVarUInt(*e.estimated_default_count, out);
+    }
+    out.finalize();
+    return std::move(out.str());
+}
+
+std::shared_ptr<const PartSummary> parseSummary(const void * data, size_t size)
+{
+    if (!data || size == 0)
+        return nullptr;
+    ReadBufferFromMemory in(static_cast<const char *>(data), size);
+    UInt8 format;
+    readBinary(format, in);
+    if (format != SUMMARY_FORMAT)
+        return nullptr;
+    auto summary = std::make_shared<PartSummary>();
+    UInt64 ncolumns;
+    readVarUInt(ncolumns, in);
+    for (UInt64 i = 0; i < ncolumns; ++i)
+    {
+        String name;
+        ColumnSize size_of;
+        UInt8 has_estimate;
+        readStringBinary(name, in);
+        readVarUInt(size_of.data_compressed, in);
+        readVarUInt(size_of.data_uncompressed, in);
+        summary->sizes.emplace(name, size_of);
+        readBinary(has_estimate, in);
+        if (!has_estimate)
+            continue;
+        Estimate e;
+        UInt64 types;
+        UInt8 has;
+        readVarUInt(types, in);
+        for (UInt8 t = 0; t < 64; ++t)
+            if (types & (UInt64(1) << t))
+                e.types.insert(static_cast<StatisticsType>(t));
+        readVarUInt(e.rows_count, in);
+        readBinary(has, in);
+        UInt64 count;
+        if (has & HAS_CARDINALITY)
+        {
+            readVarUInt(count, in);
+            e.estimated_cardinality = count;
+        }
+        if (has & HAS_MIN)
+            e.estimated_min = readFieldBinary(in);
+        if (has & HAS_MAX)
+            e.estimated_max = readFieldBinary(in);
+        if (has & HAS_NULL_COUNT)
+        {
+            readVarUInt(count, in);
+            e.estimated_null_count = count;
+        }
+        if (has & HAS_DEFAULT_COUNT)
+        {
+            readVarUInt(count, in);
+            e.estimated_default_count = count;
+        }
+        summary->estimates.emplace(std::move(name), std::move(e));
+    }
+    return summary;
+}
+
+}
+
+namespace
+{
+
+/// The summary a caller hands with a part's name; nullptr where there is none of this format.
+std::shared_ptr<const PartSummary> summaryOf(chte_table & table, const char * part_name, const void * summary, size_t size)
+{
+    if (!part_name || !summary || size == 0)
+        return nullptr;
+    return table.storage->partSummary(part_name, summary, size);
 }
 
 }
@@ -376,35 +546,83 @@ extern "C" int chte_part_stats(chte_table * table, const char * part_name, const
     return guarded(error, [&]
     {
         auto part = table->storage->getPart(part_name);
-        *stats = {};
-        table->scratch.clear();
         auto estimates = table->storage->partEstimates(part, {column ? column : ""});
         auto it = estimates.find(column ? column : "");
-        /// only "basic" statistics count, whose least and greatest values are exact
-        if (it == estimates.end() || !it->second.types.contains(StatisticsType::Basic))
+        fillStats(*table, it == estimates.end() ? nullptr : &it->second, column, stats);
+    });
+}
+
+extern "C" int chte_summary_column_bytes(chte_table * table, const char * part_name, const void * summary, size_t size,
+                                         const char * columns, uint64_t * compressed, uint64_t * uncompressed, int * found,
+                                         chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        *found = 0;
+        *compressed = 0;
+        *uncompressed = 0;
+        auto s = summaryOf(*table, part_name, summary, size);
+        if (!s)
             return;
-        const auto & estimate = it->second;
-        stats->has_stats = 1;
-        stats->rows = estimate.rows_count;
-        if (estimate.estimated_null_count)
+        uint64_t c = 0;
+        uint64_t u = 0;
+        for (const auto & name : splitNames(columns))
         {
-            stats->has_null_count = 1;
-            stats->null_count = *estimate.estimated_null_count;
+            auto it = s->sizes.find(name);
+            if (it == s->sizes.end())
+                return;			/* a column the part was written without: the part's to tell */
+            c += it->second.data_compressed;
+            u += it->second.data_uncompressed;
         }
-        else if (!isNullableOrLowCardinalityNullable(table->metadata->getColumns().getPhysical(column).type))
-            stats->has_null_count = 1;	/* none can be NULL */
-        if (estimate.estimated_min && estimate.estimated_max)
+        *compressed = c;
+        *uncompressed = u;
+        *found = 1;
+    });
+}
+
+extern "C" int chte_summary_stats(chte_table * table, const char * part_name, const void * summary, size_t size,
+                                  const char * column, chte_column_stats * stats, int * found, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        *found = 0;
+        *stats = {};
+        auto s = summaryOf(*table, part_name, summary, size);
+        if (!s || !column || !s->sizes.contains(column))
+            return;
+        auto it = s->estimates.find(column);
+        fillStats(*table, it == s->estimates.end() ? nullptr : &it->second, column, stats);
+        *found = 1;
+    });
+}
+
+extern "C" int chte_filter_summary_select(chte_filter * filter, const char * part_name, const void * summary, size_t size,
+                                          int * verdict, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        /// as selectedRanges() decides, but for the granules the key keeps, which only the part's index tells
+        *verdict = CHTE_SELECT_RANGES;
+        if (filter->key_condition && filter->key_condition->alwaysFalse())
         {
-            DataTypePtr type = removeLowCardinalityAndNullable(table->metadata->getColumns().getPhysical(column).type);
-            auto min = type->createColumn();
-            auto max = type->createColumn();
-            min->insert(*estimate.estimated_min);
-            max->insert(*estimate.estimated_max);
-            table->scratch.push_back(std::move(min));
-            table->scratch.push_back(std::move(max));
-            stats->min = vectorOf(*table->scratch[0]);
-            stats->max = vectorOf(*table->scratch[1]);
-            stats->has_minmax = 1;
+            *verdict = CHTE_SELECT_NONE;
+            return;
         }
+        if (filter->stats_condition)
+        {
+            auto s = summaryOf(*filter->table, part_name, summary, size);
+            if (!s)
+                return;
+            for (const auto & name : filter->stats_columns.getNames())
+                if (!s->sizes.contains(name))
+                    return;		/* a column the part was written without */
+            if (!statisticsCanMatch(*filter, s->estimates))
+            {
+                *verdict = CHTE_SELECT_NONE;
+                return;
+            }
+        }
+        if (!filter->key_condition || filter->key_condition->alwaysUnknownOrTrue())
+            *verdict = CHTE_SELECT_ALL;
     });
 }

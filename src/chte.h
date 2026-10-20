@@ -91,6 +91,8 @@ extern bool ch_enable_fetch_columns;
 extern bool ch_enable_sink_columns;
 extern bool ch_enable_memory_parts;
 extern bool ch_enable_fetch_cache;
+extern bool ch_enable_part_summaries;
+extern bool ch_enable_summary_pruning;
 extern double ch_fetch_cost;
 extern double ch_fetch_value_cost;
 extern int	ch_insert_buffer_rows;
@@ -204,6 +206,9 @@ typedef struct ChPart
 								 * ch_parts_to_scan() left it unread (ch_part_manifest()); NULL
 								 * in the files store */
 	TimestampTz created;		/* when it was written; 0 at an insert: now */
+	bytea	   *summary;		/* its columns' bytes and statistics, the engine library's
+								 * (VC20's B6): as stored until read (ch_part_summary());
+								 * NULL where none was kept */
 } ChPart;
 
 extern Oid	ch_catalog_relid(const char *name, bool unlogged);
@@ -214,7 +219,10 @@ extern void ch_catalog_insert(Relation catalog, HeapTuple tuple, CommandId cid);
 extern List *ch_parts_visible(const ChStorageId *id, Snapshot snapshot);
 extern List *ch_parts_to_scan(const ChStorageId *id, Snapshot snapshot);
 extern bytea *ch_part_manifest(const ChPart *part);
+extern bytea *ch_part_summary(ChPart *part);
+extern void ch_parts_totals(const ChStorageId *id, Snapshot snapshot, double *rows, uint64 *bytes);
 extern void ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid);
+extern bytea *ch_part_summary_written(chte_writer *writer, size_t i);
 extern List *ch_parts_manifests(const ChStorageId *id);
 extern List *ch_parts_names(const ChStorageId *id);
 extern void ch_part_delete(const ChStorageId *id, const char *name);
