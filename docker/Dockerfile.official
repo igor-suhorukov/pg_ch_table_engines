@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# ch_table_engines' dev image on Docker Hub's postgres (ch_table_engines.md
+# §2.1, §6): PostgreSQL 19 as the PostgreSQL Global Development Group packages
+# it for Debian trixie, with what a leg needs added.  Built from public
+# sources only, it is the image of a machine without pg_accel's images and of
+# GitHub Actions (.github/workflows/ci.yml); its legs are vanilla's
+# (CHTE_LEG=official, test/run.sh).
+#
+#   BASE_IMAGE=postgres:19rc1-trixie   the server, built without assertions
+#                                      and with LLVM's JIT
+#   CHTE_UID                           the host's user's uid, given to postgres
+#                                      here, so that a leg writes its run's
+#                                      directory on any host (test/run.sh)
+#
+# The base has the server and its client, and PGXS's pg_regress,
+# isolationtester and PostgreSQL's TAP modules at the server's own version.
+# What it lacks, added here:
+#   build-essential, postgresql-server-dev-19   PGXS and the server's headers,
+#                             at the server's own version (PG_VERSION, the
+#                             base's): a newer one fails the build rather
+#                             than compile against headers not the server's
+#   liblz4-dev, libzstd-dev   the codecs' headers
+#   perl, libipc-run-perl     prove, and IPC::Run, which the TAP modules need
+#   python3, procps           checks/core.sh and the isolation leg; the waits
+#   /cb/pgperl                the TAP modules, where tap.sh looks for them
+#   /cb/pgregress             PostgreSQL's own regression suite and the
+#                             libraries it loads (regress, and contrib/spi's
+#                             refint and autoinc), for the pgregress leg
+#   /cb/isolation             PostgreSQL's isolation specs, for the isolation
+#                             leg
+# The last two from the source release of the server's version, checked
+# against its SHA-256 as ftp.postgresql.org gives it.
+
+ARG BASE_IMAGE=postgres:19rc1-trixie
+
+FROM ${BASE_IMAGE}
+USER root
+ARG CHTE_UID=1000
+ENV PATH=/usr/lib/postgresql/${PG_MAJOR}/bin:$PATH \
+    TMPDIR=/tmp
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential "postgresql-server-dev-$PG_MAJOR=$PG_VERSION" liblz4-dev libzstd-dev \
+        perl libipc-run-perl python3 procps diffutils ca-certificates curl bzip2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN v="$(pg_config --version | awk '{print $2}')" \
+ && url="https://ftp.postgresql.org/pub/source/v$v/postgresql-$v.tar.bz2" \
+ && curl -fsSL -o /tmp/pg.tar.bz2 "$url" \
+ && echo "$(curl -fsSL "$url.sha256" | awk '{print $1}')  /tmp/pg.tar.bz2" | sha256sum -c - \
+ && mkdir -p /cb/pgregress /cb/isolation \
+ && tar -xjf /tmp/pg.tar.bz2 -C /cb/pgregress --strip-components=1 \
+        "postgresql-$v/src/test/regress" "postgresql-$v/contrib/spi" \
+ && tar -xjf /tmp/pg.tar.bz2 -C /cb/isolation --strip-components=1 \
+        "postgresql-$v/src/test/isolation/specs" \
+ && rm /tmp/pg.tar.bz2 \
+ && inc="$(pg_config --includedir-server)" \
+ && for f in src/test/regress/regress.c contrib/spi/refint.c contrib/spi/autoinc.c; do \
+        gcc -O2 -fPIC -shared -I"$inc" -o "/cb/pgregress/src/test/regress/$(basename "$f" .c).so" "/cb/pgregress/$f" || exit 1; \
+    done \
+ && pgxs="$(pg_config --pkglibdir)/pgxs" \
+ && ln -s "$pgxs/src/test/perl" /cb/pgperl \
+ && test -f /cb/pgperl/PostgreSQL/Test/Cluster.pm \
+ && ln -s "$pgxs/src/test/isolation/isolationtester" /usr/local/bin/isolationtester
+
+# The extension is installed into the server's tree by the legs, as postgres
+RUN usermod -o -u "$CHTE_UID" postgres \
+ && chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql /cb \
+        "$(pg_config --pkglibdir)" "$(pg_config --sharedir)/extension"
+
+# a leg's command, not the server's entrypoint
+ENTRYPOINT []
+CMD ["bash"]
+USER postgres
+WORKDIR /var/lib/postgresql

@@ -25,6 +25,11 @@ if [ ! -f /build/tree/build.ninja ] || [ "${CHTE_ENGINE_RECONFIGURE:-0}" = 1 ]; 
         -DENABLE_LIBFIU=ON -DENABLE_CLICKHOUSE_SELF_EXTRACTING=OFF -DENABLE_XRAY=OFF \
         -DPARALLEL_COMPILE_JOBS="$jobs" -DPARALLEL_LINK_JOBS=2
 fi
+# CHTE_ENGINE_FRESH=1: the engine's own objects compiled again (from ccache
+# where they are the same), whatever their times say -- the build tree serves
+# every checkout, and a source older than an object of another's is not seen
+# to differ (test/run.sh publish-engine)
+[ "${CHTE_ENGINE_FRESH:-0}" = 1 ] && rm -rf /build/tree/CMakeFiles/chte_engine.dir
 ninja -C /build/tree -j "$jobs" -k "${CHTE_ENGINE_KEEP_GOING:-1}" $targets
 if [[ " $targets " == *" chte_engine "* ]]; then
     mkdir -p /build/lib

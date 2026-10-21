@@ -8,8 +8,14 @@
 #
 #   CHTE_SRC    the tree: /src
 #   CHTE_BUILD  where it is built: /tmp/chte-build
-#   PG_CONFIG   the server's: /usr/local/pgsql/bin/pg_config
+#   PG_CONFIG   the server's: the image's PATH's, /usr/local/pgsql/bin's or,
+#               on Docker Hub's postgres (Dockerfile.official),
+#               /usr/lib/postgresql/19/bin's
 #   MAKE_JOBS   8
+#
+# No bitcode for LLVM's inliner: PGDG's server (Dockerfile.official) is built
+# with LLVM, and PGXS would make the bitcode with a clang the images do not
+# have; the other images' servers are built without it.
 #
 # On the port's image (CH6), the port's modules built from a tree of the port
 # (portbuild.sh), when the leg is given their stage at /cbstage: installed
@@ -18,7 +24,7 @@ set -eu
 
 SRC="${CHTE_SRC:-/src}"
 BUILD="${CHTE_BUILD:-/tmp/chte-build}"
-PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql/bin/pg_config}"
+PG_CONFIG="${PG_CONFIG:-$(command -v pg_config || echo /usr/local/pgsql/bin/pg_config)}"
 
 if [ -d /cbstage/usr/local/pgsql ] && [ ! -f /tmp/.chte-port-staged ]; then
 	cp -a /cbstage/usr/local/pgsql/. "$(dirname "$("$PG_CONFIG" --bindir)")/"
@@ -32,8 +38,8 @@ for f in Makefile ch_table_engines.control sql expected src include specs t test
 	[ -e "$SRC/$f" ] && cp -a "$SRC/$f" "$BUILD/"
 done
 echo "building against $("$PG_CONFIG" --version) at $(cat "$("$PG_CONFIG" --bindir)/../.pg_ref_commit" 2> /dev/null || echo '?')"
-make -s -C "$BUILD" PG_CONFIG="$PG_CONFIG" COPT="-Werror" -j"${MAKE_JOBS:-8}" ${CHTE_MAKE_FLAGS:-}
-make -s -C "$BUILD" PG_CONFIG="$PG_CONFIG" install > /dev/null
+make -s -C "$BUILD" PG_CONFIG="$PG_CONFIG" with_llvm=no COPT="-Werror" -j"${MAKE_JOBS:-8}" ${CHTE_MAKE_FLAGS:-}
+make -s -C "$BUILD" PG_CONFIG="$PG_CONFIG" with_llvm=no install > /dev/null
 # the engine library, built in the builder image (test/engine.sh), mounted at $CHTE_ENGINE
 if [ -f "${CHTE_ENGINE:-/engine/libchte_engine.so}" ]; then
 	ln -sf "${CHTE_ENGINE:-/engine/libchte_engine.so}" "$("$PG_CONFIG" --pkglibdir)/libchte_engine.so"

@@ -6,14 +6,15 @@
 # from, with only the submodules engine/submodules.txt lists, shallow.  Run again
 # after adding a line there.
 #
-#   CHTE_CH_ORIGIN  where to clone from: the user's checkout, else GitHub
+#   CHTE_CH_ORIGIN  where to clone from: a local checkout of ClickHouse, if
+#                   the user has one, else GitHub
 #   CHTE_CH_SRC     the clone: ~/.cache/pg_accel/chte/clickhouse-src
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tag=v26.8.8.8-lts
 commit=0de36d42e8bbc78fdaf2bbf90a2853b5e9301bdc
-origin="${CHTE_CH_ORIGIN:-$HOME/dev/projects/oss_databases/ClickHouse}"
-[ -d "$origin/.git" ] || origin=https://github.com/ClickHouse/ClickHouse
+origin="${CHTE_CH_ORIGIN:-https://github.com/ClickHouse/ClickHouse}"
+[ -d "$origin" ] && [ ! -d "$origin/.git" ] && origin=https://github.com/ClickHouse/ClickHouse
 dst="${CHTE_CH_SRC:-$HOME/.cache/pg_accel/chte/clickhouse-src}"
 
 if [ ! -d "$dst/.git" ]; then

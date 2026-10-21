@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The engine library published (ch_table_engines.md §2.2): test/run.sh
+# publish-engine -- ClickHouse's sources at the pinned release, the library
+# built afresh from HEAD's sources, its debug information out, published as
+# the release engine-<key> (test/engine-key.sh) that the ci workflow fetches.
+#
+# Run by hand, on a runner that can build ClickHouse's core: some 30 GB of
+# disk and many cores, for as long as it takes -- a larger runner of GitHub's,
+# or a self-hosted one, whose cache (~/.cache/pg_accel/chte) the next run
+# builds on.  GitHub's standard runners have neither the disk nor the hours.
+# test/run.sh publish-engine does the same on any host that builds the
+# library.
+
+name: engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "the runner's label"
+        type: string
+        default: ubuntu-latest
+      jobs:
+        description: "the build's jobs; empty: the runner's CPUs"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  engine:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@v5
+      - name: disk
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h /
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHTE_ENGINE_JOBS: ${{ inputs.jobs }}
+        run: |
+          [ -n "$CHTE_ENGINE_JOBS" ] || export CHTE_ENGINE_JOBS="$(nproc)"
+          test/run.sh publish-engine
+      - name: runs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runs-engine
+          path: ~/.cache/pg_accel/chte/runs

@@ -154,8 +154,14 @@ crash_backtrace(int signo)
 	void	   *frames[64];
 	int			n = backtrace(frames, lengthof(frames));
 	static const char head[] = "ch_table_engines: a backend faulted; its stack:\n";
+	ssize_t		rc;
 
-	(void) write(STDERR_FILENO, head, sizeof(head) - 1);
+	/*
+	 * Nothing to be done here if the log cannot be written; the result kept,
+	 * as glibc's _FORTIFY_SOURCE (PGDG's builds) wants it used.
+	 */
+	rc = write(STDERR_FILENO, head, sizeof(head) - 1);
+	(void) rc;
 	backtrace_symbols_fd(frames, n, STDERR_FILENO);
 	signal(signo, SIG_DFL);
 	raise(signo);
