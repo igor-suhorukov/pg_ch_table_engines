@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ch_table_engines' legs on GitHub Actions (ch_table_engines.md §6), driven by
+# test/run.sh as on any host, on the dev image of Docker Hub's postgres
+# (docker/Dockerfile.official, CHTE_LEG=official): the one image built from
+# public sources only.
+#
+#   build   the image, the extension built by PGXS with warnings as errors,
+#           and core
+#   legs    the engine library of HEAD's key fetched from its release
+#           (test/engine-key.sh; the engine workflow or test/run.sh
+#           publish-engine publishes it), then each leg that loads it
+#
+# A failed job keeps its runs' directories -- logs, results, differences --
+# as an artifact.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CHTE_LEG: official
+  MAKE_JOBS: 4
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: cache
+        run: echo "CHTE_CACHE=$RUNNER_TEMP/chte" >> "$GITHUB_ENV"
+      - name: image
+        run: test/run.sh images official
+      - name: build
+        run: test/run.sh build
+      - name: core
+        run: test/run.sh core
+      - name: runs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runs-build
+          path: ${{ runner.temp }}/chte/runs
+
+  legs:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [spike, suite, tap, isolation, pgregress]
+    steps:
+      - uses: actions/checkout@v5
+      - name: cache
+        run: echo "CHTE_CACHE=$RUNNER_TEMP/chte" >> "$GITHUB_ENV"
+      - name: engine library
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: test/run.sh fetch-engine
+      - name: image
+        run: test/run.sh images official
+      - name: ${{ matrix.leg }}
+        run: test/run.sh ${{ matrix.leg }}
+      - name: runs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runs-${{ matrix.leg }}
+          path: ${{ runner.temp }}/chte/runs

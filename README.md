@@ -153,6 +153,25 @@ test/run.sh cluster      # a coordinator and three segments with mirrors: DDL, r
 CHTE_LEG=port test/run.sh suite  # any leg on the port's single node
 ```
 
+The vanilla dev images stand on pg_accel's.  On a machine without them, and
+on GitHub Actions (`.github/workflows/ci.yml`), the legs run on Docker Hub's
+`postgres:19rc1-trixie` (`docker/Dockerfile.official`; `CHTE_PG_IMAGE` names
+another), PostgreSQL 19 as PGDG builds it, without assertions, and the engine
+library is fetched rather than built, from the release of its sources' key
+(`test/engine-key.sh`):
+
+```
+test/run.sh images official      # the dev image on Docker Hub's postgres
+test/run.sh fetch-engine         # libchte_engine.so of HEAD's engine sources, from its release
+CHTE_LEG=official test/run.sh build  # the extension alone, warnings as errors; no engine needed
+CHTE_LEG=official test/run.sh suite  # any leg on it
+test/run.sh publish-engine       # the library built afresh from HEAD and published (gh), engine-<key>
+```
+
+Building the library takes some 30 GB of disk and many cores: the `engine`
+workflow runs `publish-engine` by hand on a runner given its label, a larger
+or a self-hosted one; GitHub's standard runners are too small for it.
+
 ## Licence
 
 Apache-2.0 (`LICENSE`).  ClickHouse is Apache-2.0, Copyright ClickHouse, Inc.

@@ -30,7 +30,9 @@ CREATE TABLE ch.parts (
 	tablespace		oid NOT NULL,
 	relfilenumber	oid NOT NULL,
 	backend			integer NOT NULL,
-	name			text NOT NULL,
+	name			text COLLATE "C" NOT NULL,	-- "C" as catalog.c's scan keys compare it,
+											-- whatever the database's default: its
+											-- index in that order
 	rows			bigint NOT NULL,
 	bytes			bigint NOT NULL,
 	min_rowid		bigint NOT NULL,

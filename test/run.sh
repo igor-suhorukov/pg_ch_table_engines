@@ -11,11 +11,19 @@
 #                        git only)
 #   run.sh engine        the builder image, then the engine library built in it
 #                        (~/.cache/pg_accel/chte/engine)
+#   run.sh publish-engine  the engine library built afresh from HEAD's
+#                        sources, its debug information out, published as a
+#                        release of the repository, engine-<key>
+#                        (test/engine-key.sh), with gh
+#   run.sh fetch-engine  the release of HEAD's key fetched instead of built,
+#                        into a cache that builds none (CHTE_ENGINE_BUILD)
 #   run.sh spike         CH0's spike: engine/spike/spike.c against the library
-#   run.sh images [port] the dev images, on pg_accel's vexec-dev images: the
-#                        vanilla server's, or the port's at CHTE_PORT_COMMIT
-#                        (pg_accel/vexec-dev:port-<commit>, which pg_accel's
-#                        docker/compose.yml and vexec.yml build)
+#   run.sh images [port|official]  the dev images: on pg_accel's vexec-dev
+#                        images, the vanilla server's, or the port's at
+#                        CHTE_PORT_COMMIT (pg_accel/vexec-dev:port-<commit>,
+#                        which pg_accel's docker/compose.yml and vexec.yml
+#                        build); or on Docker Hub's postgres, CHTE_PG_IMAGE
+#   run.sh build         the extension built by PGXS, with warnings as errors
 #   run.sh portbuild     the port's modules built from a tree of the port,
 #                        CHTE_PORT_SRC, into CHTE_PORT_BUILD and staged there:
 #                        the port leg's containers install the stage over
@@ -47,9 +55,19 @@
 #   CHTE_CACHE   the runs: ~/.cache/pg_accel/chte
 #   CHTE_CPUS    each container's CPUs: 0, as many as there are; 1 beside a
 #                timed run
-#   CHTE_LEG     the server a leg runs on: vanilla, or port -- the port's
+#   CHTE_LEG     the server a leg runs on: vanilla; official -- Docker Hub's
+#                postgres, built without assertions, the only one of public
+#                sources alone (GitHub Actions'); or port -- the port's
 #                patched server and modules, the port's single node for the
 #                suite, tap, isolation and pgregress
+#   CHTE_PG_IMAGE  official's base: postgres:19rc1-trixie
+#   CHTE_UID, CHTE_GID  the user the containers write the cache as: the
+#                host's (official's and the engine's; the other images' is
+#                1000)
+#   CHTE_ENGINE_BUILD  the engine's build tree, ccache and library:
+#                $CHTE_CACHE/engine
+#   CHTE_CLICKBENCH  hits_10m.tsv's directory, for hits and merges:
+#                ~/.cache/pg_accel/clickbench
 #   CHTE_TESTS   the suite's tests, all by default
 #   CHTE_SETTINGS a setting for the suite's servers: debug_discard_caches = 1
 #                discards every cache wherever an invalidation may be taken
@@ -74,7 +92,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$here/.." && pwd)"
 COMPOSE="$ROOT/docker/compose.yml"
 export CHTE_CACHE="${CHTE_CACHE:-$HOME/.cache/pg_accel/chte}"
+export CHTE_ENGINE_BUILD="${CHTE_ENGINE_BUILD:-$CHTE_CACHE/engine}"
+export CHTE_UID="${CHTE_UID:-$(id -u)}" CHTE_GID="${CHTE_GID:-$(id -g)}"
 export PG_SRC="${PG_SRC:-$HOME/.cache/pg_accel/postgres}"
+CHTE_CLICKBENCH="${CHTE_CLICKBENCH:-$HOME/.cache/pg_accel/clickbench}"
 export CHTE_CPUS="${CHTE_CPUS:-0}"
 export CHTE_PORT_COMMIT="${CHTE_PORT_COMMIT:-c06bdd36239175cb204bc2d319b1ab8e8380fb1d}"
 export CHTE_PORT_SRC="${CHTE_PORT_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry}"
@@ -87,8 +108,8 @@ fi
 export CHTE_PORT_STAGE
 LEG="${CHTE_LEG:-vanilla}"
 case "$LEG" in
-	vanilla|port) ;;
-	*) echo "run.sh: CHTE_LEG is vanilla or port, not $LEG" >&2; exit 2 ;;
+	vanilla|official|port) ;;
+	*) echo "run.sh: CHTE_LEG is vanilla, official or port, not $LEG" >&2; exit 2 ;;
 esac
 
 die() { echo "run.sh: $*" >&2; exit 1; }
@@ -99,10 +120,10 @@ compose() { docker compose -f "$COMPOSE" "$@"; }
 leg() {
 	local name="$1"; shift
 	local tag=""
-	[ "$LEG" = port ] && tag="-port"
+	[ "$LEG" != vanilla ] && tag="-$LEG"
 	local run="$CHTE_CACHE/runs/$(date +%Y%m%dT%H%M%S)-$name$tag"
 	mkdir -p "$run"
-	echo "== $name${tag:+ (the port)}: $run"
+	echo "== $name${tag:+ ($LEG)}: $run"
 	[ "$LEG" = port ] && echo "   the port at ${CHTE_PORT_COMMIT:0:11}, its modules $(
 		[ "$CHTE_PORT_STAGE" = /nonexistent ] && echo "the image's" ||
 			echo "from the stage: $(cat "$CHTE_PORT_STAGE/COMMIT" 2> /dev/null || echo '?')")"
@@ -125,16 +146,50 @@ case "${1:-}" in
 		rc=${PIPESTATUS[0]}
 		echo "== engine: $( [ "$rc" = 0 ] && echo passed || echo "FAILED ($rc)")"
 		exit "$rc" ;;
+	publish-engine)
+		key="$("$here/engine-key.sh")" || exit 1
+		case "$key" in *-dirty) die "the engine's sources differ from HEAD's: commit them first" ;; esac
+		commit="$(git -C "$ROOT" rev-parse HEAD)"
+		gh auth status > /dev/null 2>&1 || die "gh is not logged in (gh auth login, or GH_TOKEN)"
+		(cd "$ROOT" && gh release view "engine-$key" > /dev/null 2>&1) &&
+			{ echo "== publish-engine: engine-$key is published already"; exit 0; }
+		"$here/engine-sources.sh" || exit 1
+		# afresh: the engine's objects compiled again and ClickHouse's configure
+		# run again, so that the library is HEAD's whichever checkout built last
+		CHTE_ENGINE_FRESH=1 CHTE_ENGINE_RECONFIGURE=1 "$0" engine || exit 1
+		compose --profile run run --rm -T engine sh -c '
+			mkdir -p /build/dist && rm -f /build/dist/libchte_engine.so.gz
+			objcopy --strip-debug /build/lib/libchte_engine.so /build/dist/libchte_engine.so
+			gzip -6 /build/dist/libchte_engine.so' || die "the library's debug information out"
+		(cd "$ROOT" && gh release create "engine-$key" "$CHTE_ENGINE_BUILD/dist/libchte_engine.so.gz" \
+			--target "$commit" --latest=false --title "engine library $key" \
+			--notes "libchte_engine.so of key $key (test/engine-key.sh), built at $commit from ClickHouse v26.8.8.8-lts, its debug information out. Fetched by test/run.sh fetch-engine.") ||
+			die "the release engine-$key: gh, and HEAD pushed"
+		echo "== publish-engine: engine-$key" ;;
+	fetch-engine)
+		key="$("$here/engine-key.sh")" || exit 1
+		case "$key" in *-dirty) die "the engine's sources differ from HEAD's: its library is built (run.sh engine), not fetched" ;; esac
+		[ -d "$CHTE_ENGINE_BUILD/tree" ] &&
+			die "$CHTE_ENGINE_BUILD builds its library (run.sh engine); fetch into another (CHTE_ENGINE_BUILD)"
+		mkdir -p "$CHTE_ENGINE_BUILD/lib"
+		rm -f "$CHTE_ENGINE_BUILD/lib/libchte_engine.so.gz"
+		(cd "$ROOT" && gh release download "engine-$key" -p libchte_engine.so.gz -D "$CHTE_ENGINE_BUILD/lib") ||
+			die "no release engine-$key: run.sh publish-engine, or the engine workflow, publishes it"
+		gunzip -f "$CHTE_ENGINE_BUILD/lib/libchte_engine.so.gz" || exit 1
+		echo "== fetch-engine: engine-$key into $CHTE_ENGINE_BUILD/lib" ;;
 	spike)
 		leg spike /src/test/spike.sh ;;
+	build)
+		leg build /src/test/build.sh ;;
 	images)
 		case "${2:-vanilla}" in
 			vanilla) compose --profile build build chte-dev-vanilla ;;
+			official) compose --profile build build chte-dev-official ;;
 			port)
 				docker image inspect "pg_accel/vexec-dev:port-$CHTE_PORT_COMMIT" > /dev/null 2>&1 ||
 					die "no pg_accel/vexec-dev:port-$CHTE_PORT_COMMIT: pg_accel's docker/compose.yml builds pg19-patched and cb-ext at the commit, its docker/vexec.yml vexec-dev-port and vexec-dev-portdev"
 				compose --profile build build chte-dev-port ;;
-			*) die "images: vanilla or port" ;;
+			*) die "images: vanilla, official or port" ;;
 		esac ;;
 	portbuild)
 		[ -f "$CHTE_PORT_SRC/pg19/meson.build" ] || die "no tree of the port at $CHTE_PORT_SRC (CHTE_PORT_SRC)"
@@ -157,13 +212,13 @@ case "${1:-}" in
 	pgregress)
 		leg pgregress /src/test/pgregress.sh ;;
 	hits)
-		[ -f "$HOME/.cache/pg_accel/clickbench/hits_10m.tsv" ] ||
-			die "no hits_10m.tsv: pg_accel's test/clickbench/run.sh fetch, then its subsets"
-		CHTE_DATA="$HOME/.cache/pg_accel/clickbench" leg hits /src/test/hits.sh ;;
+		[ -f "$CHTE_CLICKBENCH/hits_10m.tsv" ] ||
+			die "no hits_10m.tsv in $CHTE_CLICKBENCH: pg_accel's test/clickbench/run.sh fetch, then its subsets"
+		CHTE_DATA="$CHTE_CLICKBENCH" leg hits /src/test/hits.sh ;;
 	merges)
-		[ -f "$HOME/.cache/pg_accel/clickbench/hits_10m.tsv" ] ||
-			die "no hits_10m.tsv: pg_accel's test/clickbench/run.sh fetch, then its subsets"
-		CHTE_DATA="$HOME/.cache/pg_accel/clickbench" leg merges /src/test/merges.sh ;;
+		[ -f "$CHTE_CLICKBENCH/hits_10m.tsv" ] ||
+			die "no hits_10m.tsv in $CHTE_CLICKBENCH: pg_accel's test/clickbench/run.sh fetch, then its subsets"
+		CHTE_DATA="$CHTE_CLICKBENCH" leg merges /src/test/merges.sh ;;
 	cluster)
 		LEG=port leg cluster /src/test/cluster.sh ;;
 	all)

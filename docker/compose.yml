@@ -9,7 +9,12 @@
 #   vanilla            a leg's container on it: the tree read-only at /src,
 #                      its run's directory at /work, the engine library at
 #                      /engine, no network
-#   chte-dev-port      the port (CH6): the patched server with the port's
+#   chte-dev-official  Dockerfile.official: Docker Hub's postgres image of
+#                      PostgreSQL 19 (CHTE_PG_IMAGE) and what a leg needs,
+#                      from public sources only, its postgres the host's
+#                      user's uid (CHTE_UID): GitHub Actions' image
+#   official           a leg's container on it, as vanilla's
+#   chte-dev-port     the port (CH6): the patched server with the port's
 #                      modules, pg_accel/vexec-dev:port-<commit>, and what
 #                      Dockerfile.dev adds
 #   port               a leg's container on it, as vanilla's, and the port's
@@ -21,7 +26,8 @@
 #   chte-engine-builder  Dockerfile.engine: Debian trixie with Clang 21 from
 #                      trixie-backports, for ClickHouse's sources
 #   engine             test/engine.sh on it: ClickHouse v26.8.8.8-lts read-only
-#                      at /ch, the build tree and ccache at /build (§2.2)
+#                      at /ch, the build tree and ccache at /build (§2.2), as
+#                      the host's user (CHTE_UID, CHTE_GID)
 #
 # PG_SRC is the build's checkout of PostgreSQL (pg_accel's
 # test/vexec/checkouts.sh keeps it, ~/.cache/pg_accel/postgres), from which
@@ -78,6 +84,21 @@ services:
     image: pg_chte/dev:${CHTE_VANILLA_FLAVOR:-vanilla}
     profiles: ["run"]
 
+  chte-dev-official:
+    image: pg_chte/dev:official
+    build:
+      context: .
+      dockerfile: Dockerfile.official
+      args:
+        BASE_IMAGE: ${CHTE_PG_IMAGE:-postgres:19rc1-trixie}
+        CHTE_UID: ${CHTE_UID:-1000}
+    profiles: ["build"]
+
+  official:
+    <<: *run
+    image: pg_chte/dev:official
+    profiles: ["run"]
+
   chte-dev-port:
     image: pg_chte/dev:${CHTE_PORT_FLAVOR:-port}-${CHTE_PORT_COMMIT:-unset}
     build:
@@ -130,7 +151,7 @@ services:
   engine:
     image: pg_chte/engine-builder:clang21
     profiles: ["run"]
-    user: "1000:1000"
+    user: "${CHTE_UID:-1000}:${CHTE_GID:-1000}"
     network_mode: none
     mem_limit: ${CHTE_ENGINE_MEM:-44g}
     memswap_limit: ${CHTE_ENGINE_MEM:-44g}
@@ -144,5 +165,6 @@ services:
       CHTE_ENGINE_JOBS: ${CHTE_ENGINE_JOBS:-16}
       CHTE_ENGINE_TARGETS: ${CHTE_ENGINE_TARGETS:-chte_engine}
       CHTE_ENGINE_RECONFIGURE: ${CHTE_ENGINE_RECONFIGURE:-0}
+      CHTE_ENGINE_FRESH: ${CHTE_ENGINE_FRESH:-0}
       CHTE_ENGINE_KEEP_GOING: ${CHTE_ENGINE_KEEP_GOING:-1}
       CHTE_ENGINE_BUILD_TYPE: ${CHTE_ENGINE_BUILD_TYPE:-RelWithDebInfo}
