@@ -35,11 +35,16 @@
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
+#include "catalog/pg_tablespace.h"
 #include "common/file_perm.h"
+#include "common/relpath.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 #include "storage/procarray.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -120,6 +125,20 @@ remember(const ChStorageId *id, const char *part, bool at_commit)
 void
 ch_store_create(const ChStorageId *id)
 {
+	char	   *dir = ch_storage_path(id, false);
+	struct stat st;
+
+	/*
+	 * A directory already there is a storage's no ch.tables row names any
+	 * more: one a prepared transaction's end left, its relfilenumber taken
+	 * again since -- a dropped storage goes at commit, and COMMIT PREPARED,
+	 * in another session or on the port's segment (CH6), has no list of it
+	 * -- or a crash's.  It goes before the new storage's parts can meet its
+	 * part directories of the same names.
+	 */
+	if (stat(dir, &st) == 0)
+		ch_store_remove_now(id, NULL, true);
+	pfree(dir);
 	/* the engine library makes the directory as it first opens the table */
 	remember(id, NULL, false);
 }
@@ -660,5 +679,119 @@ ch_store_sweep(Relation rel, const ChStorageId *id)
 		removed++;
 	}
 	pfree(dir);
+	return removed;
+}
+
+/* The storages' directories in a database's directory of a tablespace no ch.tables row names, removed */
+static int
+sweep_database_dir(Oid spcOid)
+{
+	char	   *dbpath = GetDatabasePath(MyDatabaseId, spcOid);
+	DIR		   *d = AllocateDir(dbpath);
+	struct dirent *de;
+	List	   *orphans = NIL;
+	ListCell   *lc;
+	int			removed = 0;
+
+	if (d == NULL)
+	{
+		pfree(dbpath);
+		return 0;
+	}
+	while ((de = ReadDirExtended(d, dbpath, DEBUG1)) != NULL)
+	{
+		ChStorageId id;
+		unsigned int relnumber;
+		int			backend;
+		char		tail;
+
+		memset(&id, 0, sizeof(id));
+		if (sscanf(de->d_name, "ch_t%d_%u%c", &backend, &relnumber, &tail) == 2)
+		{
+			id.backend = backend;
+			id.persistence = RELPERSISTENCE_TEMP;
+		}
+		else if (sscanf(de->d_name, "ch_%u%c", &relnumber, &tail) == 1)
+		{
+			id.backend = -1;
+			id.persistence = RELPERSISTENCE_PERMANENT;
+		}
+		else
+			continue;
+		id.locator.spcOid = spcOid;
+		id.locator.dbOid = MyDatabaseId;
+		id.locator.relNumber = relnumber;
+		if (!ch_storage_named(&id))
+		{
+			ChStorageId *o = palloc(sizeof(ChStorageId));
+
+			*o = id;
+			orphans = lappend(orphans, o);
+		}
+	}
+	FreeDir(d);
+
+	/* a permanent storage's directory as its REMOVE record names it; a temporary one's unlogged */
+	foreach(lc, orphans)
+	{
+		ChStorageId *o = lfirst(lc);
+
+		ch_store_remove_now(o, NULL, o->persistence == RELPERSISTENCE_PERMANENT);
+		removed++;
+	}
+	pfree(dbpath);
+	return removed;
+}
+
+/*
+ * The sweep of a database (CH6): the directories of the files store's
+ * storages no ch.tables row names any more, in every tablespace -- what a
+ * crash left, or the end of a prepared transaction, which on the port's
+ * segments is the end of every distributed DDL statement and write.  A
+ * storage's row is inserted before its directory is made (am.c), and a
+ * dropped storage's row stays, dead, until VACUUM of ch.tables prunes it,
+ * whose record resolves a standby's conflicts as ch.parts's does for a part's
+ * directory (ch_store_sweep()).  Under ShareLock on the two catalogs, so
+ * that no storage is made or dropped meanwhile, taken without waiting -- a
+ * writer may hold one and want the other: a merge worker's sweep returns -1
+ * where one could not be taken, ch.remove_orphans()'s tries again a moment
+ * on.  Returns how many went.
+ */
+int
+ch_store_sweep_database(bool wait)
+{
+	Oid			tables = ch_catalog_relid("tables", false);
+	Oid			tables_unlogged = ch_catalog_relid("tables", true);
+	DIR		   *d;
+	struct dirent *de;
+	int			removed;
+
+	for (;;)
+	{
+		if (ConditionalLockRelationOid(tables, ShareLock))
+		{
+			if (ConditionalLockRelationOid(tables_unlogged, ShareLock))
+				break;
+			UnlockRelationOid(tables, ShareLock);
+		}
+		if (!wait)
+			return -1;
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	removed = sweep_database_dir(DEFAULTTABLESPACE_OID);
+	d = AllocateDir("pg_tblspc");
+	while (d != NULL && (de = ReadDirExtended(d, "pg_tblspc", DEBUG1)) != NULL)
+	{
+		Oid			spc = atooid(de->d_name);
+
+		if (OidIsValid(spc))
+			removed += sweep_database_dir(spc);
+	}
+	if (d != NULL)
+		FreeDir(d);
+	UnlockRelationOid(tables_unlogged, ShareLock);
+	UnlockRelationOid(tables, ShareLock);
 	return removed;
 }

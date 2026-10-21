@@ -40,6 +40,7 @@
 #include "nodes/execnodes.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
+#include "storage/procarray.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -237,6 +238,7 @@ parts_visible(const ChStorageId *id, Snapshot snapshot, bool keep_toasted)
 		ChPart	   *p = palloc(sizeof(ChPart));
 
 		heap_deform_tuple(tuple, RelationGetDescr(catalog), values, nulls);
+		p->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 		p->name = TextDatumGetCString(values[Anum_parts_name - 1]);
 		p->rows = DatumGetInt64(values[Anum_parts_rows - 1]);
 		p->bytes = DatumGetInt64(values[Anum_parts_bytes - 1]);
@@ -498,6 +500,49 @@ ch_parts_names(const ChStorageId *id)
 	systable_endscan(scan);
 	table_close(catalog, AccessShareLock);
 	return names;
+}
+
+/*
+ * The horizon of a storage's part rows: an inserter older than it committed
+ * or aborted before every snapshot still in use began -- on a node of the
+ * port's cluster, every distributed snapshot's too, gp_core holding the
+ * horizon back while one may still see a transaction in progress that has
+ * committed here (gp_dtx.c).
+ */
+TransactionId
+ch_parts_horizon(const ChStorageId *id)
+{
+	Relation	catalog = open_catalog("parts", id, AccessShareLock);
+	TransactionId horizon = GetOldestNonRemovableTransactionId(catalog);
+
+	table_close(catalog, AccessShareLock);
+	return horizon;
+}
+
+/*
+ * Whether a row of ch.tables or ch.tables_unlogged names a storage, whatever
+ * its visibility, as a part's directory stays while a ch.parts row names it
+ * (store.c): the files store's sweep of a database leaves its directory while
+ * one does, and removes it once VACUUM of the catalog has pruned the last.
+ */
+bool
+ch_storage_named(const ChStorageId *id)
+{
+	bool		named = false;
+
+	for (int unlogged = 0; unlogged < 2 && !named; unlogged++)
+	{
+		Relation	catalog = table_open(ch_catalog_relid("tables", unlogged), AccessShareLock);
+		SysScanDesc scan;
+		ScanKeyData keys[3];
+		int			nkeys = storage_keys(id, keys);
+
+		scan = systable_beginscan(catalog, catalog_index(catalog), true, SnapshotAny, nkeys, keys);
+		named = HeapTupleIsValid(systable_getnext(scan));
+		systable_endscan(scan);
+		table_close(catalog, AccessShareLock);
+	}
+	return named;
 }
 
 void

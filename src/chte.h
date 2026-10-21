@@ -99,6 +99,7 @@ extern int	ch_insert_buffer_rows;
 extern int	ch_insert_buffer_bytes;
 extern int	ch_default_storage;
 extern bool ch_preloaded;
+extern bool ch_cluster_node(void);
 
 /* am.c */
 extern PGDLLIMPORT TupleTableSlotOps ch_slot_ops;
@@ -209,6 +210,7 @@ typedef struct ChPart
 	bytea	   *summary;		/* its columns' bytes and statistics, the engine library's
 								 * (VC20's B6): as stored until read (ch_part_summary());
 								 * NULL where none was kept */
+	TransactionId xmin;			/* its catalog row's inserter, as listed (ch_parts_visible()) */
 } ChPart;
 
 extern Oid	ch_catalog_relid(const char *name, bool unlogged);
@@ -237,6 +239,8 @@ extern void ch_counters_allocate(const ChStorageId *id, uint64 nrowids, uint64 n
 								 uint64 *first_rowid, uint64 *first_block);
 extern void ch_counters_xact_callback(XactEvent event);
 extern void ch_parts_conflict_out(Relation rel, const ChStorageId *id, Snapshot snapshot);
+extern TransactionId ch_parts_horizon(const ChStorageId *id);
+extern bool ch_storage_named(const ChStorageId *id);
 
 /* convert.c: datums and the library's vectors */
 typedef struct ChVectorBuilder ChVectorBuilder;
@@ -288,6 +292,7 @@ extern void ch_store_register_rmgr(void);
 extern void ch_store_remove_now(const ChStorageId *id, const char *part, bool log);
 extern void ch_store_copy_part(Relation rel, const ChStorageId *from, const ChStorageId *to, const char *part);
 extern int	ch_store_sweep(Relation rel, const ChStorageId *id);
+extern int	ch_store_sweep_database(bool wait);
 
 /* pages.c: the pages store */
 extern void ch_pages_ops(ChTable *t, chte_pages_ops *ops);

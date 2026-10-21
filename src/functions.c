@@ -14,8 +14,10 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_database.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplestore.h"
@@ -163,4 +165,18 @@ ch_remove_orphans(PG_FUNCTION_ARGS)
 	removed = ch_store_sweep(rel, &id);
 	relation_close(rel, NoLock);
 	PG_RETURN_INT32(removed);
+}
+
+/*
+ * ch.remove_orphans(): the files store's sweep of the database (store.c), as
+ * the merge workers' passes end with: the directories of storages no
+ * ch.tables row names any more.  The database's owner's.
+ */
+PG_FUNCTION_INFO_V1(ch_remove_orphans_database);
+Datum
+ch_remove_orphans_database(PG_FUNCTION_ARGS)
+{
+	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE, get_database_name(MyDatabaseId));
+	PG_RETURN_INT32(ch_store_sweep_database(true));
 }
