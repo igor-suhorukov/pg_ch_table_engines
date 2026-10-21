@@ -299,6 +299,18 @@ buffer_for(Relation rel, CommandId cid)
 	{
 		MemoryContext old;
 
+		/*
+		 * The transaction's ID taken with its first buffered row, not at the
+		 * flush: on the Cloudberry port's segment (CH6) a statement reports it
+		 * to the coordinator as it ends, which writes the segment's part of a
+		 * distributed transaction in two phases where it reports one -- and a
+		 * COPY of the rows the coordinator routes to the segment can end
+		 * without a flush, gp_core running it apart from this library's
+		 * ProcessUtility hook, row by row where the table has BEFORE triggers,
+		 * with no finish_bulk_insert.
+		 */
+		if (!IsInParallelMode())
+			(void) GetCurrentTransactionId();
 		/* SERIALIZABLE: a statement's writes to the relation, as one relation-level write (§2.6) */
 		CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
 		old = MemoryContextSwitchTo(TopTransactionContext);

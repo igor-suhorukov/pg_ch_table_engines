@@ -68,6 +68,10 @@ CREATE UNIQUE INDEX parts_unlogged_storage_name ON ch.parts_unlogged (tablespace
 -- under the default thresholds.
 ALTER TABLE ch.parts SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
 ALTER TABLE ch.parts_unlogged SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
+-- And a dropped storage's directory, once VACUUM has pruned its ch.tables
+-- row, where the end of a prepared transaction left it (CH6, store.c).
+ALTER TABLE ch.tables SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
+ALTER TABLE ch.tables_unlogged SET (autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0);
 -- A part's summary, read at every planning, stays in its row, compressed, where
 -- the row's other values leave it room: no TOAST fetch for it.
 ALTER TABLE ch.parts ALTER COLUMN summary SET STORAGE MAIN;
@@ -77,6 +81,27 @@ CREATE INDEX tombstones_unlogged_storage_rowid ON ch.tombstones_unlogged (tables
 
 REVOKE ALL ON ch.tables, ch.parts, ch.tombstones, ch.tables_unlogged, ch.parts_unlogged, ch.tombstones_unlogged FROM PUBLIC;
 GRANT SELECT ON ch.tables, ch.parts, ch.tombstones, ch.tables_unlogged, ch.parts_unlogged, ch.tombstones_unlogged TO PUBLIC;
+
+-- On the Cloudberry port (CH6), each node's catalogs are its own: the
+-- storages, parts and deletions of the node's share of each table, written by
+-- the node itself.  gp_sql gives a table an extension's script makes the
+-- policy "replicated", under which the coordinator reads one segment's rows,
+-- gpexpand copies one segment's onto every other and ALTER EXTENSION ...
+-- UPDATE empties the coordinator's; without gp_core's "gp" label a table is
+-- the node's own, as the port's modules' catalogs are.  Every node runs the
+-- script, gp_core with it on every node or on none.
+DO $$
+BEGIN
+	IF current_setting('gp.role', true) IS NOT NULL THEN
+		SECURITY LABEL FOR gp ON TABLE ch.tables IS NULL;
+		SECURITY LABEL FOR gp ON TABLE ch.parts IS NULL;
+		SECURITY LABEL FOR gp ON TABLE ch.tombstones IS NULL;
+		SECURITY LABEL FOR gp ON TABLE ch.tables_unlogged IS NULL;
+		SECURITY LABEL FOR gp ON TABLE ch.parts_unlogged IS NULL;
+		SECURITY LABEL FOR gp ON TABLE ch.tombstones_unlogged IS NULL;
+	END IF;
+END
+$$;
 
 CREATE FUNCTION ch.mergetree_handler(internal) RETURNS table_am_handler
 	AS 'MODULE_PATHNAME', 'ch_mergetree_handler' LANGUAGE C STRICT;
@@ -158,3 +183,10 @@ CREATE FUNCTION ch.optimize(rel regclass, final boolean DEFAULT false) RETURNS i
 -- too, when no writer holds the table.
 CREATE FUNCTION ch.remove_orphans(rel regclass) RETURNS integer
 	AS 'MODULE_PATHNAME', 'ch_remove_orphans' LANGUAGE C STRICT VOLATILE;
+
+-- The files store's sweep of the database: the directories of storages no
+-- ch.tables row names any more, which a crash leaves, or the end of a
+-- prepared transaction -- on the Cloudberry port's segments, of every
+-- distributed DDL statement (CH6).  The merge workers' passes end with it.
+CREATE FUNCTION ch.remove_orphans() RETURNS integer
+	AS 'MODULE_PATHNAME', 'ch_remove_orphans_database' LANGUAGE C STRICT VOLATILE;

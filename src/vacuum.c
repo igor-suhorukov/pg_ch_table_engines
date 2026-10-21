@@ -255,6 +255,7 @@ ch_fold_deletions(Relation rel)
 	bool	   *handled;
 	ChTombstone *gone;
 	int			ngone = 0;
+	TransactionId horizon;
 
 	/* pinned throughout: the flush, the catalogs' reads and writes may accept an invalidation of the table */
 	t = ch_table(rel);
@@ -271,6 +272,13 @@ ch_fold_deletions(Relation rel)
 	folded = palloc_extended(sizeof(uint64) * dead.n, MCXT_ALLOC_HUGE);
 	handled = palloc_extended(sizeof(bool) * dead.n, MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 	parts = ch_parts_visible(&t->storage, NULL);
+	/*
+	 * On a node of the port's cluster (CH6), a part whose row is not older
+	 * than the horizon may be one a distributed snapshot does not see yet,
+	 * whose rows a fold of the node's own would give it, as a merge would
+	 * (merge.c): it is left as it is, its rows' tombstones with it.
+	 */
+	horizon = ch_cluster_node() ? ch_parts_horizon(&t->storage) : InvalidTransactionId;
 	foreach(lc, parts)
 	{
 		ChPart	   *p = lfirst(lc);
@@ -282,6 +290,8 @@ ch_fold_deletions(Relation rel)
 
 		nmine = ch_dead_rows_of_part(t, p, &dead, &mine, handled);
 		if (nmine == 0)
+			continue;
+		if (TransactionIdIsValid(horizon) && !TransactionIdPrecedes(p->xmin, horizon))
 			continue;
 		writer = ch_fold_part(t, p, mine, nmine, &nparts, &owner);
 		for (size_t i = 0; i < nparts; i++)

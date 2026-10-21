@@ -90,6 +90,60 @@ ch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 }
 
 /*
+ * On a node of the Cloudberry port's cluster (ch_table_engines.md CH6),
+ * gp_core sends a DDL statement to the segments as its own ProcessUtility
+ * hook receives it, before it runs it here.  This library's hook takes the
+ * engines' options out of a statement (options.c), and so must run inside
+ * gp_core's: listed before gp_core in shared_preload_libraries.  Listed
+ * after it, or loaded later, it would send the segments the statement
+ * without the options, and every segment would make its share of a table
+ * without them.  gp_core publishes its rendezvous variable as its _PG_init
+ * ends, and gp.cluster_config names the cluster's nodes; on a single node
+ * nothing is sent, and either order does.
+ */
+static bool
+cluster_node(void)
+{
+	void	  **core = (void **) find_rendezvous_variable("Cloudberry/gp_core");
+	const char *nodes;
+
+	if (*core == NULL)
+		return false;
+	nodes = GetConfigOption("gp.cluster_config", true, false);
+	return nodes != NULL && nodes[0] != '\0';
+}
+
+/*
+ * Whether this server is a node of the port's cluster, gp_core loaded and its
+ * nodes named: known in a process forked once every library is loaded, and
+ * asked afresh in the postmaster, where gp_core may load after this library.
+ */
+bool
+ch_cluster_node(void)
+{
+	static int	known = -1;
+
+	if (!IsUnderPostmaster)
+		return cluster_node();
+	if (known < 0)
+		known = cluster_node() ? 1 : 0;
+	return known == 1;
+}
+
+static void
+check_cluster_order(void)
+{
+	if (!cluster_node())
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("ch_table_engines must come before gp_core in shared_preload_libraries on a node of a cluster"),
+			 errdetail("gp_core sends each DDL statement to the segments as its own hook receives it; "
+					   "the hook that takes the engines' options out of a statement must run inside it."),
+			 errhint("List ch_table_engines first in shared_preload_libraries on every node.")));
+}
+
+/*
  * A test leg's aid (test/isolation.sh): where CHTE_BACKTRACE_ON_CRASH is in
  * the server's environment, a backend that faults writes its stack to the
  * server's log before it dies as it would have.
@@ -110,6 +164,7 @@ crash_backtrace(int signo)
 void
 _PG_init(void)
 {
+	check_cluster_order();
 	ch_preloaded = process_shared_preload_libraries_in_progress;
 	if (getenv("CHTE_BACKTRACE_ON_CRASH") != NULL && getenv("CHTE_BACKTRACE_ON_CRASH")[0] != '\0')
 	{

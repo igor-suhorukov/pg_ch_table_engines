@@ -10,11 +10,21 @@
 #   CHTE_BUILD  where it is built: /tmp/chte-build
 #   PG_CONFIG   the server's: /usr/local/pgsql/bin/pg_config
 #   MAKE_JOBS   8
+#
+# On the port's image (CH6), the port's modules built from a tree of the port
+# (portbuild.sh), when the leg is given their stage at /cbstage: installed
+# over the image's own first, once a container.
 set -eu
 
 SRC="${CHTE_SRC:-/src}"
 BUILD="${CHTE_BUILD:-/tmp/chte-build}"
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql/bin/pg_config}"
+
+if [ -d /cbstage/usr/local/pgsql ] && [ ! -f /tmp/.chte-port-staged ]; then
+	cp -a /cbstage/usr/local/pgsql/. "$(dirname "$("$PG_CONFIG" --bindir)")/"
+	touch /tmp/.chte-port-staged
+	echo "the port's modules from the stage: $(cat /cbstage/COMMIT 2> /dev/null || echo '?')"
+fi
 
 rm -rf "$BUILD"
 mkdir -p "$BUILD"

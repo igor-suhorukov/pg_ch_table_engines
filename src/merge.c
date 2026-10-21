@@ -32,6 +32,7 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
@@ -197,6 +198,7 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 		next.manifest = NULL;
 		next.created = 0;
 		next.summary = ch_part_summary_written(writer, 0);
+		next.xmin = InvalidTransactionId;
 		store_part(rel, t, info.temp_dir, &next);
 		/* a part of the pages store is in pages now: its directory goes, uncommitted */
 		if (t->options.storage != CH_STORAGE_PAGES)
@@ -280,6 +282,29 @@ ch_merge_parts(Relation rel, ChMergeMode mode)
 		}
 		if (nplaces > 1)
 			qsort(places, nplaces, sizeof(PartPlace), place_order);
+
+		/*
+		 * On a node of the Cloudberry port's cluster (CH6), a distributed
+		 * snapshot reads this node's rows through a snapshot of the node's
+		 * with the distributed transactions it does not see yet left in
+		 * progress, those that have committed here among them (gp_core's
+		 * gp_dtx.c).  A merge in a transaction of the node's own -- a merge
+		 * worker's -- is committed for that snapshot, and would give it the
+		 * rows of such a transaction's part through the merged part.  So
+		 * only the parts before the first whose row is not older than the
+		 * horizon merge, gp_core holding the horizon back while a snapshot
+		 * may still see a transaction committed here in progress; the parts
+		 * after it wait for it, since a merge takes adjacent parts.
+		 */
+		if (ch_cluster_node() && nplaces > 0)
+		{
+			TransactionId horizon = ch_parts_horizon(&t->storage);
+			int			settled = 0;
+
+			while (settled < nplaces && TransactionIdPrecedes(places[settled].part->xmin, horizon))
+				settled++;
+			nplaces = settled;
+		}
 
 		if (mode == CH_MERGE_FINAL)
 		{

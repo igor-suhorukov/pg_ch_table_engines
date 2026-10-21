@@ -102,6 +102,37 @@ registering only the functions the filters use (`ch.engine_functions`), the
 others at the first write, merge or rewrite, or a table whose definition
 names them.  `ch.engine_info()` counts a process's threads and functions.
 
+## On the Cloudberry port
+
+The same library runs on [the port of Apache Cloudberry to PostgreSQL
+19](https://github.com/igor-suhorukov/cloudberry/tree/extension_postgresql_19)
+(its `pg19/`), on one node and on a cluster, without using anything of the
+port's core patch series.  On a cluster the engine library is installed on
+the coordinator, every segment and every mirror, and the extension is
+preloaded on each of them, **before gp_core**:
+
+```
+shared_preload_libraries = 'ch_table_engines,gp_core,gp_orca,gp_sql'
+```
+
+gp_core sends a DDL statement to the segments as its own hook receives it,
+and the extension's hook, which takes the engines' options out of a
+statement, has to run inside it; a node of a cluster that lists the
+extension after gp_core, or loads it later, refuses to start, saying so.
+`CREATE EXTENSION ch_table_engines` on the coordinator reaches every node;
+its catalogs are each node's own, the parts and deletions of its share of
+each table.  A distributed table's rows go to the segments by its
+`DISTRIBUTED BY`, each segment keeping them as parts of its own, merged by
+its own merge workers; a merge or a fold in a transaction of the segment's
+own leaves out the parts a distributed snapshot may not see yet.  A
+session's `ch.*` settings reach the segments, since the port's `afd2eac3e9b`.  `ALTER TABLE ... SET DISTRIBUTED BY`, `SET WITH
+(REORGANIZE)` and `EXPAND TABLE` move the rows through the access method,
+mirrors replay both stores, and the files store's directories that the end
+of a prepared transaction leaves go with `ch.remove_orphans()`, which the
+merge workers run.  The functions that describe and keep a table --
+`ch.parts`, `ch.optimize` and the rest -- see the node they run on; on a
+cluster, `gp.exec_on_segments()` runs them on each segment.
+
 ## Building and testing
 
 Everything builds and runs in containers (`test/run.sh`, `docker/`):
@@ -116,6 +147,10 @@ test/run.sh pgregress  # PostgreSQL's own suite with default_table_access_method
 test/run.sh hits       # 10M ClickBench rows into heap and both stores, compared, and reads timed
 test/run.sh merges     # the same rows in small batches beside the merge workers: parts, WAL, checksums
 CHTE_SETTINGS="debug_discard_caches = 1" test/run.sh suite  # every cache discarded at each chance
+test/run.sh images port  # the dev image of the port, on pg_accel's vexec-dev:port-<commit>
+test/run.sh portbuild    # the port's modules from CHTE_PORT_SRC, staged for the port's legs
+test/run.sh cluster      # a coordinator and three segments with mirrors: DDL, rows, merges, expand, failover
+CHTE_LEG=port test/run.sh suite  # any leg on the port's single node
 ```
 
 ## Licence

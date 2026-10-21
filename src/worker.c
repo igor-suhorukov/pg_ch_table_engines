@@ -49,6 +49,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relfilenumbermap.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -216,7 +217,42 @@ ch_merge_launcher_main(Datum arg)
 
 /* ---- a database's worker ---- */
 
-/* The database's tables of the engines: ch.tables' and ch.tables_unlogged's, temporary ones left out */
+/*
+ * Whether a command waits for the database to itself: DROP DATABASE and
+ * ALTER DATABASE's RENAME and SET TABLESPACE take its lock, CREATE DATABASE
+ * its template's (dbcommands.c), and each then waits a few seconds for the
+ * other backends to exit (CountOtherDBBackends()).  The extension's
+ * ProcessUtility hook sends the worker SIGTERM first (ch_merge_workers_stop()),
+ * but on a segment of the Cloudberry port (CH6) gp_core runs the coordinator's
+ * statement past it: the worker asks itself, between merges and each second
+ * it sleeps, by a lock those commands' locks refuse, and leaves.
+ */
+static bool
+database_wanted(void)
+{
+	bool		wanted;
+
+	StartTransactionCommand();
+	wanted = !ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, 0, RowExclusiveLock);
+	CommitTransactionCommand();
+	return wanted;
+}
+
+static void
+leave_if_wanted(void)
+{
+	if (database_wanted())
+		proc_exit(0);			/* the launcher looks again a minute on */
+}
+
+/*
+ * The database's tables of the engines: the relations ch.tables' and
+ * ch.tables_unlogged's storages are now, temporary ones left out.  A
+ * storage's row keeps the relation it was made for, which for a rewrite's
+ * (VACUUM FULL, CLUSTER, ALTER TABLE's) is the transient relation whose
+ * storage the table takes: the relation is the one whose relfilenumber the
+ * storage's is.
+ */
 static List *
 engine_tables(void)
 {
@@ -236,10 +272,15 @@ engine_tables(void)
 		while (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection)))
 		{
 			bool		isnull;
+			Oid			spc = DatumGetObjectId(heap_getattr(tuple, 1, RelationGetDescr(catalog), &isnull));
+			Oid			relnumber = DatumGetObjectId(heap_getattr(tuple, 2, RelationGetDescr(catalog), &isnull));
 			int32		backend = DatumGetInt32(heap_getattr(tuple, 3, RelationGetDescr(catalog), &isnull));
-			Oid			relid = DatumGetObjectId(heap_getattr(tuple, 4, RelationGetDescr(catalog), &isnull));
+			Oid			relid;
 
-			if (backend == -1 && !list_member_oid(relids, relid))
+			if (backend != -1)
+				continue;
+			relid = RelidByRelfilenumber(spc == MyDatabaseTableSpace ? InvalidOid : spc, relnumber);
+			if (OidIsValid(relid) && !list_member_oid(relids, relid))
 				relids = lappend_oid(relids, relid);
 		}
 		table_endscan(scan);
@@ -341,6 +382,36 @@ sweep_once(Oid relid)
 	PG_END_TRY();
 }
 
+/*
+ * The files store's sweep of the database (store.c): the directories of
+ * storages no ch.tables row names, which the end of a prepared transaction
+ * leaves -- on the port's segments, of every distributed one (CH6).
+ */
+static void
+sweep_database_once(void)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+
+	StartTransactionCommand();
+	PG_TRY();
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		(void) ch_store_sweep_database(false);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		AbortCurrentTransaction();
+		FlushErrorState();
+		RESUME_INTERRUPTS();
+	}
+	PG_END_TRY();
+}
+
 void
 ch_merge_worker_main(Datum arg)
 {
@@ -386,14 +457,24 @@ ch_merge_worker_main(Datum arg)
 			for (int i = 0; i < CH_MERGES_PER_PASS; i++)
 			{
 				CHECK_FOR_INTERRUPTS();
+				leave_if_wanted();
 				if (!merge_once(lfirst_oid(lc)))
 					break;
 			}
 			sweep_once(lfirst_oid(lc));
 		}
-		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 (long) ch_merge_naptime * 1000L, PG_WAIT_EXTENSION);
-		ResetLatch(MyLatch);
+		sweep_database_once();
+		/* asleep a second at a time, a command that wants the database answered */
+		for (int s = 0; s < ch_merge_naptime; s++)
+		{
+			leave_if_wanted();
+			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 1000L, PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+			if (ConfigReloadPending)
+				break;
+		}
 	}
 }
 

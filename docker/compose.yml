@@ -9,6 +9,15 @@
 #   vanilla            a leg's container on it: the tree read-only at /src,
 #                      its run's directory at /work, the engine library at
 #                      /engine, no network
+#   chte-dev-port      the port (CH6): the patched server with the port's
+#                      modules, pg_accel/vexec-dev:port-<commit>, and what
+#                      Dockerfile.dev adds
+#   port               a leg's container on it, as vanilla's, and the port's
+#                      modules built from a tree of the port (portbuild) at
+#                      /cbstage where CHTE_PORT_STAGE names their stage
+#   portbuild          test/portbuild.sh: the port's modules built from
+#                      CHTE_PORT_SRC, a tree of the port, in pg_accel's
+#                      portdev image, into CHTE_PORT_BUILD and staged there
 #   chte-engine-builder  Dockerfile.engine: Debian trixie with Clang 21 from
 #                      trixie-backports, for ClickHouse's sources
 #   engine             test/engine.sh on it: ClickHouse v26.8.8.8-lts read-only
@@ -17,6 +26,8 @@
 # PG_SRC is the build's checkout of PostgreSQL (pg_accel's
 # test/vexec/checkouts.sh keeps it, ~/.cache/pg_accel/postgres), from which
 # the image takes PostgreSQL's TAP modules at its server's own commit.
+# CHTE_PORT_COMMIT is the port's commit its images were built from
+# (pg_accel/cb-ext:<commit>, test/run.sh images port).
 
 name: pg_chte
 
@@ -45,6 +56,9 @@ x-run: &run
     CHTE_BACKTRACE_ON_CRASH: ${CHTE_BACKTRACE_ON_CRASH:-}
     CHTE_HITS_ROWS: ${CHTE_HITS_ROWS:-}
     CHTE_BATCH_PAGES: ${CHTE_BATCH_PAGES:-}
+    CHTE_PRELOAD: ${CHTE_PRELOAD:-}
+    CHTE_SEGMENTS: ${CHTE_SEGMENTS:-}
+    CHTE_CLUSTER_PARTS: ${CHTE_CLUSTER_PARTS:-}
     CHTE_ENGINE: /engine/libchte_engine.so
 
 services:
@@ -62,6 +76,48 @@ services:
   vanilla:
     <<: *run
     image: pg_chte/dev:${CHTE_VANILLA_FLAVOR:-vanilla}
+    profiles: ["run"]
+
+  chte-dev-port:
+    image: pg_chte/dev:${CHTE_PORT_FLAVOR:-port}-${CHTE_PORT_COMMIT:-unset}
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      additional_contexts:
+        pgsrc: ${PG_SRC:-${HOME}/.cache/pg_accel/postgres}
+      args:
+        BASE_IMAGE: pg_accel/vexec-dev:${CHTE_PORT_FLAVOR:-port}-${CHTE_PORT_COMMIT:-unset}
+    profiles: ["build"]
+
+  port:
+    <<: *run
+    image: pg_chte/dev:${CHTE_PORT_FLAVOR:-port}-${CHTE_PORT_COMMIT:-unset}
+    volumes:
+      - ..:/src:ro
+      - ${CHTE_WORK:-/nonexistent}:/work
+      - ${CHTE_DATA:-/nonexistent}:/data:ro
+      - ${CHTE_ENGINE_BUILD:-${HOME}/.cache/pg_accel/chte/engine}/lib:/engine:ro
+      - ${CHTE_PORT_STAGE:-/nonexistent}:/cbstage:ro
+    profiles: ["run"]
+
+  portbuild:
+    image: pg_accel/vexec-dev:${CHTE_PORT_FLAVOR:-port}dev-${CHTE_PORT_COMMIT:-unset}
+    user: postgres
+    network_mode: none
+    entrypoint: ["/src/test/portbuild.sh"]
+    mem_limit: ${CHTE_PORTBUILD_MEM:-16g}
+    memswap_limit: ${CHTE_PORTBUILD_MEM:-16g}
+    tmpfs:
+      - /tmp:exec
+    volumes:
+      - ..:/src:ro
+      - ${CHTE_PORT_SRC:-/nonexistent}:/cbsrc:ro
+      - ${CHTE_PAX_CONTRIB:-/nonexistent}/tabulate:/cbsrc/contrib/pax_storage/src/cpp/contrib/tabulate:ro
+      - ${CHTE_PAX_CONTRIB:-/nonexistent}/googletest:/cbsrc/contrib/pax_storage/src/cpp/contrib/googletest:ro
+      - ${CHTE_PORT_BUILD:-/nonexistent}:/cbbuild
+    environment:
+      PORTBUILD_JOBS: ${PORTBUILD_JOBS:-8}
+      PORTBUILD_COMMIT: ${PORTBUILD_COMMIT:-unknown}
     profiles: ["run"]
 
   chte-engine-builder:
