@@ -692,6 +692,16 @@ translate_key(ChTable *t, const ScanKeyData *key)
 	return list_make1(leaf);
 }
 
+/*
+ * Whether a table's units carry what a filter prunes them by: an engine's granules and parts, a Parquet
+ * file's row groups their statistics; an Arrow file's record batches carry none (§2.17)
+ */
+static bool
+prunable(const ChTable *t)
+{
+	return !t->external || t->ext_kind != CH_EXTERNAL_ARROW;
+}
+
 /* The quals of a list a filter is made from */
 List *
 ch_filter_quals(ChTable *t, List *quals)
@@ -699,6 +709,8 @@ ch_filter_quals(ChTable *t, List *quals)
 	List	   *out = NIL;
 	ListCell   *lc;
 
+	if (!prunable(t))
+		return NIL;
 	foreach(lc, quals)
 		if (translate_qual(t, lfirst(lc)) != NIL)
 			out = lappend(out, lfirst(lc));
@@ -715,8 +727,8 @@ ch_filter_make(ChTable *t, List *quals)
 chte_filter *
 ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys)
 {
-	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext, "ch filter", ALLOCSET_SMALL_SIZES);
-	MemoryContext old = MemoryContextSwitchTo(cxt);
+	MemoryContext cxt;
+	MemoryContext old;
 	List	   *nodes = NIL;
 	int			nquals = 0;
 	ListCell   *lc;
@@ -724,6 +736,10 @@ ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys)
 	chte_filter *filter = NULL;
 	int			i = 0;
 
+	if (!prunable(t))
+		return NULL;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "ch filter", ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(cxt);
 	foreach(lc, quals)
 	{
 		List	   *q = translate_qual(t, lfirst(lc));

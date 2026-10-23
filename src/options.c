@@ -295,7 +295,7 @@ ch_external_options_validate(List *defs, ChExternalKind kind, bool creating)
 			if (def->defaction == DEFELEM_DROP)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("option \"location\" of a %s table cannot be reset", ch_external_name(kind)),
+						 errmsg("option \"location\" of a table of access method %s cannot be reset", ch_external_name(kind)),
 						 errhint("Set another location with ALTER TABLE ... SET (location = '...').")));
 			v = def_string(def);
 			if (v[0] != '/')
@@ -305,7 +305,7 @@ ch_external_options_validate(List *defs, ChExternalKind kind, bool creating)
 			if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						 errmsg("permission denied to set the location of a %s table", ch_external_name(kind)),
+						 errmsg("permission denied to set the location of a table of access method %s", ch_external_name(kind)),
 						 errdetail("Only roles with privileges of the \"%s\" role may read the server's files.",
 								   "pg_read_server_files")));
 			has_location = true;
@@ -318,13 +318,13 @@ ch_external_options_validate(List *defs, ChExternalKind kind, bool creating)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("option \"%s\" does not apply to a %s table", name, ch_external_name(kind)),
+					 errmsg("option \"%s\" does not apply to a table of access method %s", name, ch_external_name(kind)),
 					 errhint("Its options are \"location\" and \"settings\".")));
 	}
 	if (creating && !has_location)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("a %s table needs option \"location\"", ch_external_name(kind)),
+				 errmsg("a table of access method %s needs option \"location\"", ch_external_name(kind)),
 				 errhint("Name its files: CREATE TABLE ... USING %s WITH (location = '/path/to/files').",
 						 ch_external_name(kind))));
 }
@@ -876,7 +876,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 			if (stmt->partspec != NULL || stmt->partbound != NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("a %s table cannot be partitioned or a partition", ch_external_name(ext_kind))));
+						 errmsg("a table of access method %s cannot be partitioned or a partition", ch_external_name(ext_kind))));
 			copy = copyObject(stmt);
 			ours = take_engine_options(&copy->options);
 			ch_external_options_validate(ours, ext_kind, true);
@@ -969,7 +969,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 					if (OidIsValid(part) && ch_is_external_am(get_rel_relam(part), &ext_kind))
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("a %s table cannot be a partition", ch_external_name(ext_kind))));
+								 errmsg("a table of access method %s cannot be a partition", ch_external_name(ext_kind))));
 					if (OidIsValid(part))
 						ch_plain_revoke(part);
 				}

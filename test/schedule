@@ -21,6 +21,7 @@ test: functions
 test: engine
 test: store
 test: external
+test: external_arrow
 nopreload: nopreload
 # again with the files store as the default (§2.9): the tests whose answers do not name a store
 files: setup types insert visibility ddl notnull scans chscan summaries dictionaries dml indexes fetch merge discard functions

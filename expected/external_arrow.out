@@ -1,0 +1,362 @@
+-- Tables of Arrow IPC files (ch_table_engines.md §2.17, CH7's Arrow step): files written by ClickHouse's
+-- own Arrow writer -- uncompressed, with LZ4 frames, with zstd -- read through the arrow access method as
+-- their Parquet copy and heap read the same rows: the plain scan, ChScan, in parallel, and vexec where it
+-- is preloaded.  A table's units are its files' record batches.
+\! rm -rf /tmp/chte_arrow && mkdir -p /tmp/chte_arrow/glob
+SET extra_float_digits = 0;
+CREATE TABLE src (id int8 NOT NULL, i2 int2, i4 int4, f8 float8, n numeric(18, 4), b bool, d date,
+				  ts timestamp, tz timestamptz, t text, by bytea, u uuid);
+INSERT INTO src
+SELECT g, (g % 200 - 100)::int2, CASE WHEN g % 9 = 0 THEN NULL ELSE g * 7 END, g / 3.0,
+	   round(g / 7.0, 4), g % 2 = 0, DATE '1998-03-01' + g % 2000,
+	   TIMESTAMP '1960-01-01 00:00:00' + g * INTERVAL '17 minutes 0.25 seconds',
+	   TIMESTAMPTZ '2010-06-07 08:09:10+02' + g * INTERVAL '3 hours',
+	   CASE WHEN g % 13 = 0 THEN NULL ELSE 'arrow ' || g || repeat('ü', g % 4) END,
+	   decode(lpad(to_hex(g * 31), 10, '0'), 'hex'),
+	   ('11111111-2222-4333-8444-' || lpad(to_hex(g), 12, '0'))::uuid
+FROM generate_series(1, 50000) g;
+\set columns 'id Int64, i2 Nullable(Int16), i4 Nullable(Int32), f8 Nullable(Float64), n Nullable(Decimal(18, 4)), b Nullable(Bool), d Nullable(Date32), ts Nullable(DateTime64(6, ''UTC'')), tz Nullable(DateTime64(6, ''UTC'')), t Nullable(String), by Nullable(String), u Nullable(FixedString(16))'
+SELECT ch.write_file('Parquet', '/tmp/chte_arrow/copy.parquet', 'SELECT * FROM src ORDER BY id', :'columns') > 0 AS parquet;
+ parquet 
+---------
+ t
+(1 row)
+
+SELECT codec, ch.write_file('Arrow', '/tmp/chte_arrow/' || codec || '.arrow', 'SELECT * FROM src ORDER BY id', :'columns',
+							'output_format_arrow_compression_method = ''' || codec || '''') > 0 AS arrow
+FROM (VALUES ('none'), ('lz4_frame'), ('zstd')) c (codec);
+   codec   | arrow 
+-----------+-------
+ none      | t
+ lz4_frame | t
+ zstd      | t
+(3 rows)
+
+SELECT a.size > b.size AS lz4_smaller, a.size > c.size AS zstd_smaller
+FROM pg_stat_file('/tmp/chte_arrow/none.arrow') a, pg_stat_file('/tmp/chte_arrow/lz4_frame.arrow') b,
+	 pg_stat_file('/tmp/chte_arrow/zstd.arrow') c;
+ lz4_smaller | zstd_smaller 
+-------------+--------------
+ t           | t
+(1 row)
+
+CREATE TABLE pq (LIKE src) USING parquet WITH (location = '/tmp/chte_arrow/copy.parquet');
+CREATE TABLE a_none (LIKE src) USING arrow WITH (location = '/tmp/chte_arrow/none.arrow');
+CREATE TABLE a_lz4 (LIKE src) USING arrow WITH (location = '/tmp/chte_arrow/lz4_frame.arrow');
+CREATE TABLE a_zstd (LIKE src) USING arrow WITH (location = '/tmp/chte_arrow/zstd.arrow');
+SELECT t, f.rows, f.units > 1 AS batches, f.first_row FROM unnest(ARRAY['a_none', 'a_lz4', 'a_zstd']) t,
+	LATERAL ch.external_files(t::regclass) f;
+   t    | rows  | batches | first_row 
+--------+-------+---------+-----------
+ a_none | 50000 | t       |         0
+ a_lz4  | 50000 | t       |         0
+ a_zstd | 50000 | t       |         0
+(3 rows)
+
+-- every row heap's and the Parquet copy's, both ways
+CREATE FUNCTION rows_differ(a text, b text, cols text DEFAULT 'id, i2, i4, f8, n, b, d, ts, tz, t, by, u')
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	n bigint;
+BEGIN
+	EXECUTE format('SELECT count(*) FROM ((SELECT %3$s FROM %1$s EXCEPT ALL SELECT %3$s FROM %2$s)
+					UNION ALL (SELECT %3$s FROM %2$s EXCEPT ALL SELECT %3$s FROM %1$s)) diff', a, b, cols) INTO n;
+	RETURN n;
+END $$;
+SET ch.enable_chscan = off;
+SELECT t, rows_differ(t, 'src') AS heap, rows_differ(t, 'pq') AS parquet
+FROM unnest(ARRAY['a_none', 'a_lz4', 'a_zstd']) t;
+   t    | heap | parquet 
+--------+------+---------
+ a_none |    0 |       0
+ a_lz4  |    0 |       0
+ a_zstd |    0 |       0
+(3 rows)
+
+RESET ch.enable_chscan;
+SELECT t, rows_differ(t, 'src') AS heap, rows_differ(t, 'pq') AS parquet, rows_differ(t, 'pq', 'id, d, t') AS some
+FROM unnest(ARRAY['a_none', 'a_lz4', 'a_zstd']) t;
+   t    | heap | parquet | some 
+--------+------+---------+------
+ a_none |    0 |       0 |    0
+ a_lz4  |    0 |       0 |    0
+ a_zstd |    0 |       0 |    0
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, d FROM a_zstd WHERE d > '2000-01-01';
+             QUERY PLAN             
+------------------------------------
+ Custom Scan (ChScan) on a_zstd
+   Filter: (d > '01-01-2000'::date)
+   Columns: id, d
+(3 rows)
+
+-- aggregates, a join, each as the Parquet copy's
+SELECT 'pq' AS t, count(*), count(i4), sum(i2), sum(i4), sum(f8), sum(n), min(d), max(d), min(ts), max(tz), sum(length(t)), max(by)
+FROM pq
+UNION ALL
+SELECT 'a_none', count(*), count(i4), sum(i2), sum(i4), sum(f8), sum(n), min(d), max(d), min(ts), max(tz), sum(length(t)), max(by)
+FROM a_none
+UNION ALL
+SELECT 'a_lz4', count(*), count(i4), sum(i2), sum(i4), sum(f8), sum(n), min(d), max(d), min(ts), max(tz), sum(length(t)), max(by)
+FROM a_lz4
+UNION ALL
+SELECT 'a_zstd', count(*), count(i4), sum(i2), sum(i4), sum(f8), sum(n), min(d), max(d), min(ts), max(tz), sum(length(t)), max(by)
+FROM a_zstd
+ORDER BY 1;
+   t    | count | count |  sum   |    sum     |    sum    |      sum       |    min     |    max     |             min             |             max              |  sum   |     max      
+--------+-------+-------+--------+------------+-----------+----------------+------------+------------+-----------------------------+------------------------------+--------+--------------
+ a_lz4  | 50000 | 44445 | -25000 | 7777972230 | 416675000 | 178575000.0000 | 03-01-1998 | 08-21-2003 | Fri Jan 01 00:17:00.25 1960 | Sat Jul 17 23:09:10 2027 PDT | 566671 | \x000017a6b0
+ a_none | 50000 | 44445 | -25000 | 7777972230 | 416675000 | 178575000.0000 | 03-01-1998 | 08-21-2003 | Fri Jan 01 00:17:00.25 1960 | Sat Jul 17 23:09:10 2027 PDT | 566671 | \x000017a6b0
+ a_zstd | 50000 | 44445 | -25000 | 7777972230 | 416675000 | 178575000.0000 | 03-01-1998 | 08-21-2003 | Fri Jan 01 00:17:00.25 1960 | Sat Jul 17 23:09:10 2027 PDT | 566671 | \x000017a6b0
+ pq     | 50000 | 44445 | -25000 | 7777972230 | 416675000 | 178575000.0000 | 03-01-1998 | 08-21-2003 | Fri Jan 01 00:17:00.25 1960 | Sat Jul 17 23:09:10 2027 PDT | 566671 | \x000017a6b0
+(4 rows)
+
+SELECT count(*), sum(z.i4 - p.i4) FROM a_zstd z JOIN pq p USING (id) WHERE z.u = p.u AND z.ts = p.ts;
+ count | sum 
+-------+-----
+ 50000 |   0
+(1 row)
+
+-- in parallel: the record batches shared out
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(i4) FROM a_lz4;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (ChScan) on a_lz4
+                     Columns: i4
+(6 rows)
+
+SELECT count(*), sum(i4), sum(n), max(t) FROM a_lz4;
+ count |    sum     |      sum       |   max    
+-------+------------+----------------+----------
+ 50000 | 7777972230 | 178575000.0000 | arrow 9ü
+(1 row)
+
+SELECT count(*) FROM a_none a JOIN src s USING (id) WHERE a.t IS NOT DISTINCT FROM s.t AND a.tz = s.tz;
+ count 
+-------
+ 50000
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM a_zstd WHERE id % 1000 = 0;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Custom Scan (ChScan) on a_zstd (actual rows=16.67 loops=3)
+                     Filter: ((id % '1000'::bigint) = 0)
+                     Rows Removed by Filter: 16650
+                     Columns: id
+                     Record Batches: 7 read of 7
+(10 rows)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+-- with vexec, where it is preloaded: its scans through the source, in both its batch formats
+CREATE FUNCTION vexec_scans(query text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+	found boolean := false;
+BEGIN
+	IF current_setting('shared_preload_libraries') NOT LIKE '%vexec%' THEN
+		RETURN;
+	END IF;
+	FOR line IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
+		found := found OR line LIKE '%Source: arrow%';
+	END LOOP;
+	IF NOT found THEN
+		RAISE EXCEPTION 'vexec does not scan: %', query;
+	END IF;
+END $$;
+SET vexec.mode = force;
+SET vexec.batch_dictionary = off;
+SET vexec.batch_format = postgres;
+SELECT vexec_scans('SELECT id, i4, d, t FROM a_lz4 WHERE d > ''2001-06-01''');
+ vexec_scans 
+-------------
+ 
+(1 row)
+
+SELECT t, rows_differ(t, 'pq') AS parquet FROM unnest(ARRAY['a_none', 'a_lz4', 'a_zstd']) t;
+   t    | parquet 
+--------+---------
+ a_none |       0
+ a_lz4  |       0
+ a_zstd |       0
+(3 rows)
+
+SELECT count(*), sum(i2), sum(i4), sum(n), min(d), max(ts) FROM a_zstd;
+ count |  sum   |    sum     |      sum       |    min     |           max            
+-------+--------+------------+----------------+------------+--------------------------
+ 50000 | -25000 | 7777972230 | 178575000.0000 | 03-01-1998 | Sun Aug 13 10:08:20 1961
+(1 row)
+
+SET vexec.batch_format = arrow;
+SELECT t, rows_differ(t, 'pq') AS parquet FROM unnest(ARRAY['a_none', 'a_lz4', 'a_zstd']) t;
+   t    | parquet 
+--------+---------
+ a_none |       0
+ a_lz4  |       0
+ a_zstd |       0
+(3 rows)
+
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SELECT count(*), sum(i2), sum(i4), sum(n), min(d), max(ts) FROM a_zstd;
+ count |  sum   |    sum     |      sum       |    min     |           max            
+-------+--------+------------+----------------+------------+--------------------------
+ 50000 | -25000 | 7777972230 | 178575000.0000 | 03-01-1998 | Sun Aug 13 10:08:20 1961
+(1 row)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+RESET vexec.batch_format;
+RESET vexec.batch_dictionary;
+RESET vexec.mode;
+DROP FUNCTION vexec_scans(text);
+-- TIDs: a batch's rows numbered from the file's first
+SELECT ctid, id FROM a_lz4 WHERE id IN (1, 8192, 8193, 50000) ORDER BY id;
+   ctid    |  id   
+-----------+-------
+ (0,1)     |     1
+ (28,44)   |  8192
+ (28,45)   |  8193
+ (171,239) | 50000
+(4 rows)
+
+SELECT id, t FROM a_zstd WHERE ctid = '(28,46)';
+  id  |      t       
+------+--------------
+ 8194 | arrow 8194üü
+(1 row)
+
+ANALYZE a_none;
+SELECT reltuples FROM pg_class WHERE relname = 'a_none';
+ reltuples 
+-----------
+     50000
+(1 row)
+
+-- a glob of Arrow files, and the columns they offer
+SELECT ch.write_file('Arrow', '/tmp/chte_arrow/glob/part_' || k || '.arrow',
+					 'SELECT id, t FROM src WHERE id % 2 = ' || k - 1 || ' ORDER BY id', 'id Int64, t Nullable(String)',
+					 'output_format_arrow_compression_method = ''zstd''') > 0
+FROM generate_series(1, 2) k;
+ ?column? 
+----------
+ t
+ t
+(2 rows)
+
+CREATE TABLE ag (id bigint NOT NULL, t text) USING arrow WITH (location = '/tmp/chte_arrow/glob');
+SELECT count(*), sum(id), rows_differ('ag', 'src', 'id, t') FROM ag;
+ count |    sum     | rows_differ 
+-------+------------+-------------
+ 50000 | 1250025000 |           0
+(1 row)
+
+SELECT ch.external_columns('arrow', '/tmp/chte_arrow/lz4_frame.arrow');
+       external_columns       
+------------------------------
+ id bigint NOT NULL,         +
+ i2 smallint,                +
+ i4 integer,                 +
+ f8 double precision,        +
+ n numeric(18, 4),           +
+ b boolean,                  +
+ d date,                     +
+ ts timestamp with time zone,+
+ tz timestamp with time zone,+
+ t text,                     +
+ by text,                    +
+ u bytea
+(1 row)
+
+-- a column of ClickHouse's LowCardinality, written as an Arrow dictionary
+SELECT ch.write_file('Arrow', '/tmp/chte_arrow/dict.arrow',
+					 'SELECT id, CASE WHEN id % 11 = 0 THEN NULL ELSE ''k'' || id % 7 END FROM src ORDER BY id',
+					 'id Int64, k LowCardinality(Nullable(String))',
+					 'output_format_arrow_low_cardinality_as_dictionary = 1') > 0 AS dictionary;
+ dictionary 
+------------
+ t
+(1 row)
+
+CREATE TABLE ad (id bigint NOT NULL, k text) USING arrow WITH (location = '/tmp/chte_arrow/dict.arrow');
+SELECT k, count(*) FROM ad GROUP BY k ORDER BY k;
+ k  | count 
+----+-------
+ k0 |  6493
+ k1 |  6493
+ k2 |  6494
+ k3 |  6494
+ k4 |  6493
+ k5 |  6494
+ k6 |  6494
+    |  4545
+(8 rows)
+
+SELECT count(*) FROM ad JOIN src USING (id) WHERE k IS NOT DISTINCT FROM CASE WHEN id % 11 = 0 THEN NULL ELSE 'k' || id % 7 END;
+ count 
+-------
+ 50000
+(1 row)
+
+SELECT ch.external_columns('arrow', '/tmp/chte_arrow/dict.arrow');
+  external_columns   
+---------------------
+ id bigint NOT NULL,+
+ k text
+(1 row)
+
+-- the checks of the Parquet step's: a column the files lack, a type that cannot take theirs, a NULL refused
+CREATE TABLE bad (nope bigint) USING arrow WITH (location = '/tmp/chte_arrow/none.arrow');
+ERROR:  checking the files of "bad": column "nope" of "bad" is not in file /tmp/chte_arrow/none.arrow
+DETAIL:  ClickHouse error code 8.
+CREATE TABLE bad (id integer) USING arrow WITH (location = '/tmp/chte_arrow/none.arrow');
+ERROR:  checking the files of "bad": column "id" of "bad" cannot take the values of file /tmp/chte_arrow/none.arrow, of ClickHouse's type Int64
+DETAIL:  ClickHouse error code 53.
+CREATE TABLE bad (id bigint) USING arrow WITH (location = '/tmp/chte_arrow/copy.parquet');
+ERROR:  checking the files of "bad": Not an Arrow file: missing leading magic
+DETAIL:  ClickHouse error code 117.
+CREATE TABLE nn (i4 integer NOT NULL) USING arrow WITH (location = '/tmp/chte_arrow/zstd.arrow');
+SELECT sum(i4) FROM nn;
+ERROR:  reading a file: file /tmp/chte_arrow/zstd.arrow holds a NULL of column "i4", which the table declares NOT NULL
+DETAIL:  ClickHouse error code 349.
+DROP TABLE nn;
+-- COPY's table form returns no rows; writes refused
+COPY a_zstd (id, t) TO STDOUT WITH (FORMAT csv, HEADER);
+NOTICE:  COPY of a_zstd returns no rows: its rows are those of the files at its location
+HINT:  COPY (SELECT * FROM a_zstd) TO ... reads them.
+id,t
+INSERT INTO a_zstd (id) VALUES (1);
+ERROR:  cannot insert into "a_zstd"
+DETAIL:  A table of access method arrow reads the files at its location, and is never written.
+-- the reader started no thread
+SELECT threads FROM ch.engine_info();
+ threads 
+---------
+       5
+(1 row)
+
+DROP TABLE pq, a_none, a_lz4, a_zstd, ag, ad, src;
+DROP FUNCTION rows_differ(text, text, text);
+\! rm -rf /tmp/chte_arrow

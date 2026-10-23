@@ -1,7 +1,7 @@
 /*
  * External tables (ch_table_engines.md §2.17, CH7): files PostgreSQL does not own, read by ClickHouse's
- * own input formats on the calling thread -- Parquet's v3 reader (ParquetV3BlockInputFormat) -- and
- * never written but by the tests' writer below.
+ * own readers on the calling thread -- Parquet's v3 reader (ParquetV3BlockInputFormat) here, Arrow IPC's
+ * decoder of record batches in arrow.cpp -- and never written but by the tests' writer below.
  *
  * A table is its format, its location and its columns: each the caller's name ("c<attnum>"), the
  * files' name of it, the ClickHouse type the caller takes it as (§2.5's) and how its values become
@@ -19,7 +19,7 @@
  * (Parquet::Reader::prefilterAndInitRowGroups()); a read of units hands the reader the filter too,
  * so that its page index, bloom filters and dictionaries pass over what they rule out.
  */
-#include "internal.h"
+#include "external.h"
 
 #include <Columns/ColumnDecimal.h>
 #include <Columns/ColumnNullable.h>
@@ -96,104 +96,20 @@ namespace chte
 namespace
 {
 
-/// PostgreSQL's epoch, 2000-01-01, in days and microseconds from 1970-01-01
-constexpr Int32 PG_EPOCH_DAYS = 10957;
-constexpr Int64 PG_EPOCH_MICROSECONDS = Int64(PG_EPOCH_DAYS) * 86400 * 1000000;
-
-/// The row id column every reader may be asked for (chte.h's CH_ROWID_COLUMN)
-constexpr const char * ROWID = "_pg_rowid";
-
 /// Footers kept in the process, at most this many: a listing's first read of a file costs its footer
 constexpr size_t MAX_FOOTERS = 4096;
 
 }
 
-/// A column of an external table
-struct ExternalColumn
+size_t ExternalTable::columnIndex(const String & caller_name) const
 {
-    String name;            /// the caller's
-    String file_name;       /// the files', as the caller gave it
-    DataTypePtr type;       /// the caller's, without Nullable
-    DataTypePtr read_type;  /// what the reader is asked for, without Nullable
-    int convert = CHTE_CONVERT_NONE;
-    bool not_null = false;
-    bool check_utf8 = false;
-};
-
-/// A file's footer, as read once in the process for a path, a size and a modification time
-struct ExternalFooter
-{
-    UInt64 size = 0;
-    Int64 mtime = 0;
-    std::shared_ptr<const parquet::format::FileMetaData> parquet;
-    /// each unit's rows, and their sum
-    std::vector<UInt64> unit_rows;
-    UInt64 rows = 0;
-};
-
-/// A file as a table reads it: its footer, and each of the table's columns resolved in it
-struct ResolvedFile
-{
-    std::shared_ptr<const ExternalFooter> footer;
-    NamesAndTypesList schema;               /// as ClickHouse infers it
-    std::vector<String> names;              /// per table column: the file's name of it
-    std::vector<DataTypePtr> file_types;    /// and its type there, Nullable where it may hold NULLs
-    std::vector<uint8_t> nullable;
-};
-
-/// A file of a listing
-struct ListedFile
-{
-    String path;
-    UInt64 size = 0;
-    Int64 mtime = 0;
-    UInt64 first_row = 0;
-    std::shared_ptr<const ResolvedFile> resolved;
-};
-
-class ExternalTable
-{
-public:
-    int format = CHTE_EXTERNAL_PARQUET;
-    String name;
-    String location;
-    ContextMutablePtr context;
-    FormatSettings format_settings;
-    Parquet::ReadOptions read_options;
-    std::vector<ExternalColumn> columns;
-    std::unordered_map<String, size_t> by_name;
-    /// the files this table has resolved, by path: each one's identity checked at a listing
-    std::map<String, std::shared_ptr<const ResolvedFile>> resolved;
-    /// chte_external_schema's, until the next call
-    NamesAndTypesList schema;
-    std::vector<String> schema_types;
-    std::vector<chte_external_field> fields;
-
-    const ExternalColumn & column(const String & caller_name) const
-    {
-        auto it = by_name.find(caller_name);
-        if (it == by_name.end())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} has no column {}", name, caller_name);
-        return columns[it->second];
-    }
-
-    size_t columnIndex(const String & caller_name) const
-    {
-        auto it = by_name.find(caller_name);
-        if (it == by_name.end())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} has no column {}", name, caller_name);
-        return it->second;
-    }
-};
-
+    auto it = by_name.find(caller_name);
+    if (it == by_name.end())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} has no column {}", name, caller_name);
+    return it->second;
 }
 
-struct chte_external_listing
-{
-    std::shared_ptr<chte::ExternalTable> table;
-    std::vector<chte::ListedFile> files;
-    std::string bytes;
-};
+}
 
 struct chte_file_writer
 {
@@ -221,6 +137,7 @@ namespace
 /// thread and its columns' types the ones the extension takes (JSON and geometry as their strings).
 void forceFormatSettings(FormatSettings & settings)
 {
+    settings.arrow.case_insensitive_column_matching = false;
     settings.parquet.enable_row_group_prefetch = false;
     settings.parquet.enable_json_parsing = false;
     settings.parquet.allow_geoparquet_parser = false;
@@ -257,7 +174,8 @@ std::pair<UInt64, Int64> statIdentity(const struct stat & st)
     return {static_cast<UInt64>(st.st_size), Int64(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec};
 }
 
-/// A listed file opened for reading, its identity checked against the listing's
+}
+
 std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 size, Int64 mtime)
 {
     auto buf = std::make_unique<ReadBufferFromFilePRead>(path, DBMS_DEFAULT_BUFFER_SIZE, -1, nullptr, 0, size);
@@ -271,14 +189,11 @@ std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 
     return buf;
 }
 
-/// Footers kept in the process (MAX_FOOTERS), by path
-std::map<String, std::shared_ptr<const ExternalFooter>> footers;
-
-std::shared_ptr<const ExternalFooter> parquetFooter(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
+namespace
 {
-    auto it = footers.find(path);
-    if (it != footers.end() && it->second->size == size && it->second->mtime == mtime)
-        return it->second;
+
+std::shared_ptr<ExternalFooter> readParquetFooter(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
+{
     auto buf = openListed(path, size, mtime);
     Parquet::Prefetcher prefetcher;
     prefetcher.init(buf.get(), table.read_options, /* parser_shared_resources_= */ nullptr);
@@ -292,10 +207,34 @@ std::shared_ptr<const ExternalFooter> parquetFooter(const ExternalTable & table,
         footer->rows += footer->unit_rows.back();
     }
     footer->parquet = std::move(metadata);
+    return footer;
+}
+
+/// Footers kept in the process (MAX_FOOTERS), by format and path
+std::map<std::pair<int, String>, std::shared_ptr<const ExternalFooter>> footers;
+
+/// A file's footer of the table's format, read once for its identity
+std::shared_ptr<const ExternalFooter> footerOf(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
+{
+    auto key = std::make_pair(table.format, path);
+    auto it = footers.find(key);
+    if (it != footers.end() && it->second->size == size && it->second->mtime == mtime)
+        return it->second;
+    std::shared_ptr<const ExternalFooter> footer = table.format == CHTE_EXTERNAL_ARROW ? readArrowFooter(table, path, size, mtime)
+                                                                                       : readParquetFooter(table, path, size, mtime);
     if (footers.size() >= MAX_FOOTERS)
         footers.clear();
-    footers[path] = footer;
+    footers[key] = footer;
     return footer;
+}
+
+/// A file's columns, as ClickHouse's schema inference of its format reads them
+NamesAndTypesList fileSchema(const ExternalTable & table, const ExternalFooter & footer)
+{
+    if (table.format == CHTE_EXTERNAL_ARROW)
+        return arrowFileSchema(table, footer);
+    Parquet::SchemaConverter schemer(*footer.parquet, table.read_options, /* sample_block= */ nullptr);
+    return schemer.inferSchema();
 }
 
 /// Whether a value of the file's type, Nullable and LowCardinality left out, is one of the caller's
@@ -380,9 +319,8 @@ std::shared_ptr<const ResolvedFile> resolve(ExternalTable & table, const String 
         return it->second;
 
     auto file = std::make_shared<ResolvedFile>();
-    file->footer = parquetFooter(table, path, size, mtime);
-    Parquet::SchemaConverter schemer(*file->footer->parquet, table.read_options, /* sample_block= */ nullptr);
-    file->schema = schemer.inferSchema();
+    file->footer = footerOf(table, path, size, mtime);
+    file->schema = fileSchema(table, *file->footer);
     for (const auto & column : table.columns)
     {
         bool ambiguous;
@@ -549,9 +487,7 @@ public:
     NameAndTypePair input(const String & name) const override
     {
         size_t i = table.columnIndex(name);
-        const auto & column = table.columns[i];
-        DataTypePtr type = file.nullable[i] ? makeNullable(column.read_type) : column.read_type;
-        return {file.names[i], type};
+        return {file.names[i], fileReadType(table, file, i)};
     }
 
     ColumnWithTypeAndName constant(const String & name, const chte_vector & values, uint32_t i) const override
@@ -608,7 +544,7 @@ Block fileHeader(const ExternalTable & table, const ResolvedFile & file, const N
     for (const auto & name : names)
     {
         size_t i = table.columnIndex(name);
-        DataTypePtr type = file.nullable[i] ? makeNullable(table.columns[i].read_type) : table.columns[i].read_type;
+        DataTypePtr type = fileReadType(table, file, i);
         header.insert({type->createColumn(), type, file.names[i]});
     }
     return header;
@@ -653,7 +589,13 @@ const std::vector<uint8_t> & keptUnits(chte_filter & filter, const ExternalTable
     return filter.kept_units.emplace(std::move(key), std::move(kept)).first->second;
 }
 
-/// A column as the reader hands it, as the caller takes it
+}
+
+DataTypePtr fileReadType(const ExternalTable & table, const ResolvedFile & file, size_t i)
+{
+    return file.nullable[i] ? makeNullable(table.columns[i].read_type) : table.columns[i].read_type;
+}
+
 ColumnPtr convertColumn(const ExternalColumn & column, ColumnPtr col, const String & path)
 {
     col = col->convertToFullColumnIfConst()->convertToFullColumnIfSparse();
@@ -702,7 +644,10 @@ ColumnPtr convertColumn(const ExternalColumn & column, ColumnPtr col, const Stri
     return col;
 }
 
-/// What a reader of a file reads through, kept with it
+namespace
+{
+
+/// What a reader of a Parquet file reads through, kept with it
 struct ExternalRead
 {
     std::shared_ptr<ExternalTable> table;
@@ -770,6 +715,8 @@ std::unique_ptr<chte_reader> openExternalReader(chte_table & table, const chte_e
 {
     auto & ext = *table.external;
     const auto & listed = listedFile(listing, file);
+    if (ext.format == CHTE_EXTERNAL_ARROW)
+        return openArrowReader(table, resolvedFor(ext, listing, listed), listed, names, std::move(units), std::move(rows_to_read));
     auto state = std::make_shared<ExternalRead>();
     state->table = table.external;
     state->resolved = resolvedFor(ext, listing, listed);
@@ -966,7 +913,7 @@ extern "C" int chte_external_open(const chte_external_def * def, chte_table ** t
         auto & e = engine();
         if (!def || !def->location)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: location is required");
-        if (def->format != CHTE_EXTERNAL_PARQUET)
+        if (def->format != CHTE_EXTERNAL_PARQUET && def->format != CHTE_EXTERNAL_ARROW)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "external tables of format {} are not supported", def->format);
         auto ext = std::make_shared<ExternalTable>();
         ext->format = def->format;
@@ -1120,9 +1067,7 @@ extern "C" int chte_external_schema(chte_table * table, const chte_external_fiel
             if (stat(files.front().c_str(), &st) != 0)
                 throw ErrnoException(ErrorCodes::CANNOT_STAT, "Cannot stat {}", files.front());
             auto [size, mtime] = statIdentity(st);
-            auto footer = parquetFooter(ext, files.front(), size, mtime);
-            Parquet::SchemaConverter schemer(*footer->parquet, ext.read_options, /* sample_block= */ nullptr);
-            ext.schema = schemer.inferSchema();
+            ext.schema = fileSchema(ext, *footerOf(ext, files.front(), size, mtime));
         }
         for (const auto & column : ext.schema)
             ext.schema_types.push_back(column.type->getName());
@@ -1146,7 +1091,9 @@ extern "C" int chte_external_select(chte_table * table, chte_external_listing * 
         const auto & unit_rows = resolved->footer->unit_rows;
         size_t last = end == 0 ? unit_rows.size() : std::min<size_t>(end, unit_rows.size());
         size_t first = std::min<size_t>(begin, last);
-        const std::vector<uint8_t> * kept = filter && !filter->nodes.empty() ? &keptUnits(*filter, ext, f, *resolved) : nullptr;
+        /// Parquet's row groups by their statistics; Arrow's record batches have none
+        const std::vector<uint8_t> * kept = filter && !filter->nodes.empty() && ext.format == CHTE_EXTERNAL_PARQUET
+            ? &keptUnits(*filter, ext, f, *resolved) : nullptr;
 
         size_t n = 0;
         uint64_t total = 0;
@@ -1184,6 +1131,11 @@ extern "C" int chte_external_column_bytes(chte_table * table, chte_external_list
         for (const auto & name : columnNames(columns))
             if (name != ROWID)
                 paths.insert(resolved->names[ext.columnIndex(name)]);
+        if (ext.format == CHTE_EXTERNAL_ARROW)
+        {
+            arrowColumnBytes(*resolved->footer, paths.size(), compressed, uncompressed);
+            return;
+        }
         for (const auto & row_group : resolved->footer->parquet->row_groups)
             for (const auto & chunk : row_group.columns)
             {
@@ -1203,7 +1155,10 @@ extern "C" int chte_external_stats(chte_table * table, chte_external_listing * l
     {
         auto & ext = externalOf(table);
         const auto & f = listedFile(*listing, file);
-        parquetStats(*table, ext, f, *resolvedFor(ext, *listing, f), column ? column : "", stats);
+        *stats = {};
+        /// Parquet's from its footer; an Arrow IPC file keeps none
+        if (ext.format == CHTE_EXTERNAL_PARQUET)
+            parquetStats(*table, ext, f, *resolvedFor(ext, *listing, f), column ? column : "", stats);
     });
 }
 
@@ -1275,9 +1230,12 @@ extern "C" int chte_file_write_begin(const char * format, const char * path, con
         if (!format || !path || *path != '/')
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_file_write_begin: a format and an absolute path are required");
         String name = format;
-        if (name != "Parquet")
+        if (name == "Parquet")
+            registerOutputFormats();
+        else if (name == "Arrow")
+            registerArrowOutput();
+        else
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "files of format {} are not written", name);
-        registerOutputFormats();
         auto w = std::make_unique<chte_file_writer>();
         w->path = path;
         w->temp_path = fmt::format("{}.tmp{}", path, getpid());

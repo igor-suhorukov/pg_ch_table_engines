@@ -519,7 +519,7 @@ ch_external_copy_to(CopyStmt *stmt, Oid relid)
 		psprintf("%s.%s", quote_identifier(stmt->relation->schemaname), quote_identifier(stmt->relation->relname)) :
 		pstrdup(quote_identifier(stmt->relation->relname));
 	ereport(NOTICE,
-			(errmsg("COPY of %s returns no rows: a %s table's rows are its files'", relname, ch_external_name(kind)),
+			(errmsg("COPY of %s returns no rows: its rows are those of the files at its location", relname),
 			 errhint("COPY (SELECT * FROM %s) TO ... reads them.", relname)));
 	return (Node *) copy;
 }

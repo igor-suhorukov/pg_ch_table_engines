@@ -441,10 +441,10 @@ DETAIL:  ClickHouse error code 107.
 CREATE TABLE bad (id bigint) USING parquet WITH (location = 'all.parquet');
 ERROR:  location "all.parquet" is not an absolute path
 CREATE TABLE bad (id bigint) USING parquet;
-ERROR:  a parquet table needs option "location"
+ERROR:  a table of access method parquet needs option "location"
 HINT:  Name its files: CREATE TABLE ... USING parquet WITH (location = '/path/to/files').
 CREATE TABLE bad (id bigint) USING parquet WITH (location = '/tmp/chte_external/all.parquet', storage = 'files');
-ERROR:  option "storage" does not apply to a parquet table
+ERROR:  option "storage" does not apply to a table of access method parquet
 HINT:  Its options are "location" and "settings".
 CREATE TABLE bad (id bigint) USING mergetree WITH (location = '/tmp/chte_external/all.parquet');
 ERROR:  option "location" does not apply to MergeTree
@@ -531,19 +531,19 @@ SELECT count(*) FROM ext TABLESAMPLE SYSTEM (10);
 ERROR:  TABLESAMPLE is not supported on "ext"
 CREATE TABLE parted (id bigint) PARTITION BY RANGE (id);
 CREATE TABLE p1 PARTITION OF parted FOR VALUES FROM (0) TO (10) USING parquet WITH (location = '/tmp/chte_external/all.parquet');
-ERROR:  a parquet table cannot be partitioned or a partition
+ERROR:  a table of access method parquet cannot be partitioned or a partition
 ALTER TABLE parted ATTACH PARTITION g FOR VALUES FROM (0) TO (10);
-ERROR:  a parquet table cannot be a partition
+ERROR:  a table of access method parquet cannot be a partition
 DROP TABLE parted;
 ALTER TABLE src SET ACCESS METHOD parquet;
 ERROR:  cannot change the access method of a table to parquet
 HINT:  Make the table with CREATE TABLE ... USING parquet WITH (location = '...').
 -- COPY of the table returns no rows (the user's rule, for pg_dump); its query form reads them
 COPY ext TO STDOUT;
-NOTICE:  COPY of ext returns no rows: a parquet table's rows are its files'
+NOTICE:  COPY of ext returns no rows: its rows are those of the files at its location
 HINT:  COPY (SELECT * FROM ext) TO ... reads them.
 COPY ext (id, t) TO STDOUT WITH (FORMAT csv, HEADER);
-NOTICE:  COPY of ext returns no rows: a parquet table's rows are its files'
+NOTICE:  COPY of ext returns no rows: its rows are those of the files at its location
 HINT:  COPY (SELECT * FROM ext) TO ... reads them.
 id,t
 COPY (SELECT id, t FROM ext WHERE id < 4 ORDER BY id) TO STDOUT;
@@ -609,7 +609,7 @@ SELECT count(*) FROM ext WHERE id BETWEEN 2500 AND 3200;
 
 ALTER TABLE ext RESET (settings);
 ALTER TABLE ext RESET (location);
-ERROR:  option "location" of a parquet table cannot be reset
+ERROR:  option "location" of a table of access method parquet cannot be reset
 HINT:  Set another location with ALTER TABLE ... SET (location = '...').
 -- the reader started no thread
 SELECT threads FROM ch.engine_info();

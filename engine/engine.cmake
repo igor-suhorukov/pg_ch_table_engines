@@ -11,7 +11,8 @@ add_library(chte_engine SHARED
     "${CHTE_ENGINE_DIR}/src/rows.cpp"
     "${CHTE_ENGINE_DIR}/src/rewrite.cpp"
     "${CHTE_ENGINE_DIR}/src/merge.cpp"
-    "${CHTE_ENGINE_DIR}/src/external.cpp")
+    "${CHTE_ENGINE_DIR}/src/external.cpp"
+    "${CHTE_ENGINE_DIR}/src/arrow.cpp")
 target_include_directories(chte_engine PRIVATE "${CHTE_ENGINE_DIR}/../include")
 target_link_libraries(chte_engine PRIVATE
     dbms

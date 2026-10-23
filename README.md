@@ -128,11 +128,17 @@ NOT NULL refuses a NULL as it is read, and a text column a value that is not
 UTF-8.  A statement reads the files as they are listed for it, a parallel
 scan's workers the leader's listing; the rows are not under PostgreSQL's MVCC.
 
+`arrow` reads Arrow IPC files -- the file format, its record batches
+uncompressed or compressed with LZ4 frames or zstd, a dictionary-encoded
+column as its values -- through ClickHouse's own Arrow IPC reader, with the
+same options, columns and rules.
+
 ChScan and vexec's source read them as they read the engines' tables: the
 row groups whose statistics rule a filter out are not read (`EXPLAIN
 ANALYZE` counts them), nor the pages their page index rules out, and vexec's
-aggregates of a whole file come from its statistics.  A row's TID is its
-file's first row's id and its place there.  INSERT, UPDATE, DELETE, row locks,
+aggregates of a whole file come from its statistics; an Arrow file's record
+batches, which carry no statistics, are all read.  A row's TID is its file's
+first row's id and its place there.  INSERT, UPDATE, DELETE, row locks,
 indexes and TABLESAMPLE are refused, and so are partitions of these tables.
 
 pg_dump leaves their rows out: `COPY t TO ...`, the table form, returns none,
