@@ -562,9 +562,10 @@ typedef struct chte_external_file
 	const char *path;
 	uint64_t	size;
 	int64_t		mtime;			/* nanoseconds since 1970 */
-	uint64_t	rows;
-	uint32_t	units;
+	uint64_t	rows;			/* an Iceberg data file's deleted rows among them */
+	uint32_t	units;			/* an Iceberg data file is one */
 	uint64_t	first_row;		/* its first row's id: the rows of the files before it */
+	int32_t		deletes;		/* an Iceberg data file's delete files apply to it: not all its rows are live */
 } chte_external_file;
 
 CHTE_API int			chte_external_list(chte_table *table, chte_external_listing **listing, chte_error *error);
@@ -636,6 +637,30 @@ CHTE_API int			chte_file_write_batch(chte_file_writer *writer, uint32_t nrows, c
 									  chte_error *error);
 CHTE_API int			chte_file_write_finish(chte_file_writer *writer, uint64_t *bytes, chte_error *error);
 CHTE_API void		chte_file_write_close(chte_file_writer *writer);
+
+/*
+ * The tests' Iceberg tables (§2.17), on a local disk, by ClickHouse's own Iceberg writers: a table made by
+ * IcebergMetadata::createInitial(), its rows appended by IcebergStorageSink, and its deletes -- which ClickHouse
+ * writes only through its interpreter's mutations, and equality deletes never -- by its Parquet writer, its
+ * manifests' and metadata's generators, an equality delete's manifest given its equality_ids.  The writer takes
+ * chte_file_write_batch's rows and commits them as a snapshot at chte_file_write_finish, which returns the bytes
+ * of the files it added.  CREATE's columns are the table's, each with its type, and its spec, where given, the
+ * table's partitions as ClickHouse's PARTITION BY names them (identity: a column; icebergBucket(n, c), ...); the
+ * others' columns name the table's, a NULL type the table's own: APPEND's every column, DELETE_EQUAL's those whose
+ * values delete a row, DELETE_POSITIONS' file_path (a data file's path in the table's metadata) and pos.
+ */
+#define CHTE_ICEBERG_CREATE				0
+#define CHTE_ICEBERG_APPEND				1
+#define CHTE_ICEBERG_DELETE_POSITIONS	2
+#define CHTE_ICEBERG_DELETE_EQUAL		3
+
+CHTE_API int			chte_iceberg_write_begin(const char *location, int action, const char *spec,
+										 const chte_file_column *columns, size_t ncolumns, const char *settings,
+										 chte_file_writer **writer, chte_error *error);
+
+/* The tests' change of an Iceberg table's schema, by IcebergMetadata::alter(): one command of ClickHouse's ALTER */
+CHTE_API int			chte_iceberg_alter(const char *location, const char *command, const char *settings,
+								   chte_error *error);
 
 #ifdef __cplusplus
 }

@@ -225,6 +225,7 @@ listing_make(chte_external_listing *handle)
 			p->marks = (int32) info.units;
 			p->listing = l;
 			p->file = (int32) i;
+			p->deletes = info.deletes != 0;
 			l->parts = lappend(l->parts, p);
 		}
 		MemoryContextSwitchTo(TopMemoryContext);
@@ -586,8 +587,9 @@ suggested_type(const char *chtype, bool *not_null)
 		return "bytea";
 	if (strcmp(chtype, "Date") == 0 || strcmp(chtype, "Date32") == 0)
 		return "date";
+	/* a timestamp of a time zone -- Parquet's adjusted to UTC -- or one of none, as Iceberg's timestamp */
 	if (strncmp(chtype, "DateTime", 8) == 0)
-		return "timestamp with time zone";
+		return strchr(chtype, '\'') ? "timestamp with time zone" : "timestamp without time zone";
 	return NULL;
 }
 
@@ -740,78 +742,137 @@ default_file_type(const ChColumn *col, int convert)
 	return psprintf("Nullable(%s)", col->chtype);
 }
 
-/*
- * ch.write_file(format, path, query, columns, settings): the rows of a query
- * written to a file by ClickHouse's own output format -- "Parquet" -- as the
- * tests make their tables' files (§2.17): columns, ClickHouse's "name type,
- * ..." of the file, by default the query's columns as Nullable of §2.5's
- * types.  The file is written whole under a temporary name, then renamed.
- * Its caller may write the server's files, as COPY TO a file requires.
- * Returns the file's bytes.
- */
-PG_FUNCTION_INFO_V1(ch_write_file);
-Datum
-ch_write_file(PG_FUNCTION_ARGS)
+/* A given column, "name type": its name, unquoted as ClickHouse quotes one ("..." or `...`, a quote doubled), and its type */
+static void
+given_column(const char *item, int i, chte_file_column *column)
 {
-	const ChEngine *eng;
-	char	   *format = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char	   *query = text_to_cstring(PG_GETARG_TEXT_PP(2));
-	List	   *given = PG_ARGISNULL(3) ? NIL : split_columns(text_to_cstring(PG_GETARG_TEXT_PP(3)));
-	char	   *settings = PG_ARGISNULL(4) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(4));
-	Portal		portal;
-	SPIParseOpenOptions open_options;
-	TupleDesc	desc;
-	ChTable		table;
-	chte_file_column *columns;
-	chte_file_writer *writer;
-	ResourceOwner owner;
-	ChVectorBuilder *builder;
-	MemoryContext cxt;
-	TupleTableSlot *slot;
-	uint64		bytes = 0;
-	int			n = 0;
+	const char *end;
 
+	if (item[0] == '"' || item[0] == '`')
+	{
+		StringInfoData name;
+		char		quote = item[0];
+
+		initStringInfo(&name);
+		for (end = item + 1; *end && !(*end == quote && end[1] != quote); end++)
+		{
+			if (*end == quote)
+				end++;
+			appendStringInfoChar(&name, *end);
+		}
+		if (*end != quote)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("column %d's name is not closed: %s", i + 1, item)));
+		column->name = name.data;
+		end++;
+	}
+	else
+	{
+		end = item + strcspn(item, " \t\n");
+		column->name = pnstrdup(item, end - item);
+	}
+	column->type = end + strspn(end, " \t\n");
+	if (column->type[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("column \"%s\" is given no type", column->name)));
+}
+
+/* Whether the caller may write the server's files, as COPY TO a file requires */
+static void
+check_write_privilege(void)
+{
 	if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to write the server's files"),
 				 errdetail("Only roles with privileges of the \"%s\" role may write the server's files.",
 						   "pg_write_server_files")));
+}
+
+/* Where ch.write_file's and ch.write_iceberg's rows go: a file of a format, or an Iceberg table by an action */
+typedef struct WriteTarget
+{
+	const char *function;
+	const char *format;			/* a file's */
+	const char *path;			/* the file's, or the Iceberg table's location */
+	int			action;			/* the Iceberg table's CHTE_ICEBERG_*; -1: a file */
+	const char *spec;			/* a new Iceberg table's partition spec, or NULL */
+} WriteTarget;
+
+/*
+ * The rows of a query written by the engine library's writer of the target, in
+ * batches of the query's columns: each column's name and type, the given
+ * ones' or -- by default -- the query's own and, for a file, a Nullable of
+ * §2.5's type, for an Iceberg table its own.  Its caller may write the
+ * server's files, as COPY TO a file requires.  Returns the bytes written.
+ */
+static int64
+write_rows(const WriteTarget *target, const char *query, List *given, const char *settings)
+{
+	const ChEngine *eng;
+	Portal		portal = NULL;
+	SPIParseOpenOptions open_options;
+	TupleDesc	desc = NULL;
+	ChTable		table;
+	chte_file_column *columns;
+	chte_file_writer *writer;
+	ResourceOwner owner;
+	ChVectorBuilder *builder = NULL;
+	MemoryContext cxt;
+	TupleTableSlot *slot = NULL;
+	uint64		bytes = 0;
+	int			n = 0;
+	int			ncolumns;
+
+	check_write_privilege();
 	eng = external_engine();
-	if (eng->file_write_begin == NULL)
+	if (target->action < 0 ? eng->file_write_begin == NULL : eng->iceberg_write_begin == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("the engine library writes no files")));
+				 errmsg("the engine library writes no %s", target->action < 0 ? "files" : "Iceberg tables")));
 
 	/* the builder's, the caller's: SPI_finish() deletes what SPI's procedure context holds */
-	cxt = AllocSetContextCreate(CurrentMemoryContext, "ch write_file", ALLOCSET_DEFAULT_SIZES);
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-	memset(&open_options, 0, sizeof(open_options));
-	open_options.read_only = true;
-	portal = SPI_cursor_parse_open(NULL, query, &open_options);
-	desc = portal->tupDesc;
-	if (desc == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("the query of ch.write_file returns no rows")));
-	if (given != NIL && list_length(given) != desc->natts)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("%d columns given for a query of %d", list_length(given), desc->natts)));
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "ch write_rows", ALLOCSET_DEFAULT_SIZES);
+	if (query != NULL)
+	{
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		memset(&open_options, 0, sizeof(open_options));
+		open_options.read_only = true;
+		portal = SPI_cursor_parse_open(NULL, query, &open_options);
+		desc = portal->tupDesc;
+		if (desc == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("the query of %s returns no rows", target->function)));
+		if (given != NIL && list_length(given) != desc->natts)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%d columns given for a query of %d", list_length(given), desc->natts)));
+	}
+	ncolumns = desc ? desc->natts : list_length(given);
 
 	/* the query's columns as a table's, for the builder of the library's vectors */
 	memset(&table, 0, sizeof(table));
-	table.natts = desc->natts;
-	table.columns = MemoryContextAllocZero(cxt, sizeof(ChColumn) * Max(desc->natts, 1));
-	columns = MemoryContextAllocZero(cxt, sizeof(chte_file_column) * Max(desc->natts, 1));
-	for (int i = 0; i < desc->natts; i++)
+	table.natts = desc ? desc->natts : 0;
+	table.columns = MemoryContextAllocZero(cxt, sizeof(ChColumn) * Max(ncolumns, 1));
+	columns = MemoryContextAllocZero(cxt, sizeof(chte_file_column) * Max(ncolumns, 1));
+	for (int i = 0; i < ncolumns; i++)
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
+		Form_pg_attribute att;
 		ChColumn   *col = &table.columns[i];
 		int			convert = CHTE_CONVERT_NONE;
 
+		if (desc == NULL)
+		{
+			/* columns alone: an Iceberg table made of them */
+			given_column(list_nth(given, i), i, &columns[i]);
+			n++;
+			continue;
+		}
+		att = TupleDescAttr(desc, i);
 		ch_column_for_attribute(att, col);
 		switch (getBaseType(att->atttypid))
 		{
@@ -852,76 +913,155 @@ ch_write_file(PG_FUNCTION_ARGS)
 		columns[i].convert = convert;
 		columns[i].source = col->chtype;
 		if (given != NIL)
-		{
-			/* a name, or one quoted as ClickHouse quotes it ("..." or `...`, a quote doubled); then its type */
-			char	   *item = list_nth(given, i);
-			char	   *end;
-
-			if (item[0] == '"' || item[0] == '`')
-			{
-				StringInfoData name;
-				char		quote = item[0];
-
-				initStringInfo(&name);
-				for (end = item + 1; *end && !(*end == quote && end[1] != quote); end++)
-				{
-					if (*end == quote)
-						end++;
-					appendStringInfoChar(&name, *end);
-				}
-				if (*end != quote)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("column %d's name is not closed: %s", i + 1, item)));
-				columns[i].name = name.data;
-				end++;
-			}
-			else
-			{
-				end = item + strcspn(item, " \t\n");
-				columns[i].name = pnstrdup(item, end - item);
-			}
-			columns[i].type = end + strspn(end, " \t\n");
-			if (columns[i].type[0] == '\0')
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("column \"%s\" is given no type", columns[i].name)));
-		}
+			given_column(list_nth(given, i), i, &columns[i]);
 		else
 		{
 			columns[i].name = pstrdup(NameStr(att->attname));
-			columns[i].type = default_file_type(col, convert);
+			/* an Iceberg table's own type of the column, the engine library's to find */
+			columns[i].type = target->action < 0 ? default_file_type(col, convert) : NULL;
 		}
 		n++;
 	}
 
 	owner = ch_handle_reserve();
-	CH_CALL("writing a file", eng->file_write_begin(format, path, columns, n, settings, &writer, CH_ERR));
-	ch_handle_opened(owner, CH_HANDLE_FILE_WRITER, writer);
-	builder = ch_builder_create(&table, cxt);
-	slot = MakeSingleTupleTableSlot(desc, &TTSOpsHeapTuple);
-	for (;;)
-	{
-		SPI_cursor_fetch(portal, true, 8192);
-		if (SPI_processed == 0)
-			break;
-		for (uint64 r = 0; r < SPI_processed; r++)
-		{
-			ExecStoreHeapTuple(SPI_tuptable->vals[r], slot, false);
-			ch_builder_add(builder, slot, 0);
-		}
-		SPI_freetuptable(SPI_tuptable);
+	if (target->action < 0)
 		CH_CALL("writing a file",
-				eng->file_write_batch(writer, ch_builder_rows(builder), ch_builder_vectors(builder), CH_ERR));
-		ch_builder_reset(builder);
-		CHECK_FOR_INTERRUPTS();
+				eng->file_write_begin(target->format, target->path, columns, n, settings, &writer, CH_ERR));
+	else
+		CH_CALL("writing an Iceberg table",
+				eng->iceberg_write_begin(target->path, target->action, target->spec, columns, n, settings, &writer, CH_ERR));
+	ch_handle_opened(owner, CH_HANDLE_FILE_WRITER, writer);
+	if (portal != NULL)
+	{
+		builder = ch_builder_create(&table, cxt);
+		slot = MakeSingleTupleTableSlot(desc, &TTSOpsHeapTuple);
+		for (;;)
+		{
+			SPI_cursor_fetch(portal, true, 8192);
+			if (SPI_processed == 0)
+				break;
+			for (uint64 r = 0; r < SPI_processed; r++)
+			{
+				ExecStoreHeapTuple(SPI_tuptable->vals[r], slot, false);
+				ch_builder_add(builder, slot, 0);
+			}
+			SPI_freetuptable(SPI_tuptable);
+			CH_CALL("writing a file",
+					eng->file_write_batch(writer, ch_builder_rows(builder), ch_builder_vectors(builder), CH_ERR));
+			ch_builder_reset(builder);
+			CHECK_FOR_INTERRUPTS();
+		}
 	}
 	CH_CALL("writing a file", eng->file_write_finish(writer, &bytes, CH_ERR));
 	ch_handle_closing(owner, CH_HANDLE_FILE_WRITER, writer);
 	eng->file_write_close(writer);
-	ExecDropSingleTupleTableSlot(slot);
-	SPI_cursor_close(portal);
-	SPI_finish();
+	if (portal != NULL)
+	{
+		ExecDropSingleTupleTableSlot(slot);
+		SPI_cursor_close(portal);
+		SPI_finish();
+	}
 	MemoryContextDelete(cxt);
-	PG_RETURN_INT64((int64) bytes);
+	return (int64) bytes;
+}
+
+/*
+ * ch.write_file(format, path, query, columns, settings): the rows of a query
+ * written to a file by ClickHouse's own output format -- "Parquet", "Arrow" --
+ * as the tests make their tables' files (§2.17): columns, ClickHouse's "name
+ * type, ..." of the file, by default the query's columns as Nullable of §2.5's
+ * types.  The file is written whole under a temporary name, then renamed.
+ * Returns the file's bytes.
+ */
+PG_FUNCTION_INFO_V1(ch_write_file);
+Datum
+ch_write_file(PG_FUNCTION_ARGS)
+{
+	WriteTarget target = {"ch.write_file", NULL, NULL, -1, NULL};
+
+	target.format = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	target.path = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	PG_RETURN_INT64(write_rows(&target, text_to_cstring(PG_GETARG_TEXT_PP(2)),
+							   PG_ARGISNULL(3) ? NIL : split_columns(text_to_cstring(PG_GETARG_TEXT_PP(3))),
+							   PG_ARGISNULL(4) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(4))));
+}
+
+/*
+ * ch.write_iceberg(location, action, query, columns, settings): an Iceberg
+ * table on the server's disk written by ClickHouse's own Iceberg writers, as
+ * the tests make theirs (§2.17), a snapshot an action:
+ *   'create'            a table of columns ("name type, ...", ClickHouse's),
+ *                       partitioned where the third argument is a partition
+ *                       spec as ClickHouse's PARTITION BY names one
+ *   'append'            the query's rows, a column each of the table's, by name
+ *   'position deletes'  the rows at the positions the query names: its file_path
+ *                       (a data file's path as the table's metadata names it) and pos
+ *   'equality deletes'  the rows whose columns the query names hold its values
+ *   'alter'             its schema changed by the third argument, a command of
+ *                       ClickHouse's ALTER: ADD, DROP, MODIFY or RENAME COLUMN
+ * settings, ClickHouse's: a table's data files' rows
+ * (iceberg_insert_max_rows_in_data_file), their row groups'
+ * (output_format_parquet_row_group_size).  Returns the bytes of the files added.
+ */
+PG_FUNCTION_INFO_V1(ch_write_iceberg);
+Datum
+ch_write_iceberg(PG_FUNCTION_ARGS)
+{
+	WriteTarget target = {"ch.write_iceberg", NULL, NULL, -1, NULL};
+	char	   *action;
+	char	   *query = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	List	   *given = PG_ARGISNULL(3) ? NIL : split_columns(text_to_cstring(PG_GETARG_TEXT_PP(3)));
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("ch.write_iceberg needs a location and an action")));
+	target.path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	action = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (strcmp(action, "alter") == 0)
+	{
+		const ChEngine *eng;
+
+		check_write_privilege();
+		eng = external_engine();
+		if (query == NULL || given != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("ch.write_iceberg's 'alter' takes a command and no columns")));
+		if (eng->iceberg_alter == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the engine library writes no Iceberg tables")));
+		CH_CALL("changing an Iceberg table",
+				eng->iceberg_alter(target.path, query, PG_ARGISNULL(4) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(4)), CH_ERR));
+		PG_RETURN_INT64(0);
+	}
+	if (strcmp(action, "create") == 0)
+		target.action = CHTE_ICEBERG_CREATE;
+	else if (strcmp(action, "append") == 0)
+		target.action = CHTE_ICEBERG_APPEND;
+	else if (strcmp(action, "position deletes") == 0)
+		target.action = CHTE_ICEBERG_DELETE_POSITIONS;
+	else if (strcmp(action, "equality deletes") == 0)
+		target.action = CHTE_ICEBERG_DELETE_EQUAL;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ch.write_iceberg has no action \"%s\"", action),
+				 errhint("Its actions are 'create', 'append', 'position deletes', 'equality deletes' and 'alter'.")));
+	if (target.action == CHTE_ICEBERG_CREATE)
+	{
+		/* a new table's columns, and its partition spec where given in the query's place */
+		if (given == NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("ch.write_iceberg's 'create' takes columns")));
+		target.spec = query;
+		query = NULL;
+	}
+	else if (query == NULL || given != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ch.write_iceberg's actions but 'create' take a query and no columns")));
+	PG_RETURN_INT64(write_rows(&target, query, given, PG_ARGISNULL(4) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(4))));
 }

@@ -1,7 +1,8 @@
-# pg_dump and restore of tables of files (ch_table_engines.md §2.17): the table
-# form of COPY ... TO returns none of their rows, so that no dump holds them
-# but --inserts's, whose restore fails at the access method's refused insert;
-# a restored table reads its location again.  Beside 004_dump.pl.
+# pg_dump and restore of tables of files (ch_table_engines.md §2.17) --
+# Parquet's, Arrow's and an Iceberg table's: the table form of COPY ... TO
+# returns none of their rows, so that no dump holds them but --inserts's, whose
+# restore fails at the access method's refused insert; a restored table reads
+# its location again.  Beside 004_dump.pl.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -31,6 +32,13 @@ $node->safe_psql('src', qq{
 		WITH (location = '$files/one.parquet', settings = 'input_format_parquet_bloom_filter_push_down = 0');
 	CREATE TABLE p2 (id int8, t text) USING parquet WITH (location = '$files/glob/part_*.parquet');
 	CREATE TABLE p3 (t text, id int8) USING parquet WITH (location = '$files/glob');
+	SELECT ch.write_file('Arrow', '$files/one.arrow', 'SELECT * FROM h ORDER BY id', NULL,
+						 'output_format_arrow_compression_method = ''zstd''');
+	CREATE TABLE a1 (id int8, t text, d date, n numeric(10, 2)) USING arrow WITH (location = '$files/one.arrow');
+	SELECT ch.write_iceberg('$files/ice', 'create', NULL, 'id Int64, t Nullable(String), d Nullable(Date32)');
+	SELECT ch.write_iceberg('$files/ice', 'append', 'SELECT id, t, d FROM h ORDER BY id');
+	SELECT ch.write_iceberg('$files/ice', 'equality deletes', 'SELECT id FROM h WHERE id % 10 = 0');
+	CREATE TABLE i1 (id int8, t text, d date) USING iceberg WITH (location = '$files/ice');
 });
 
 my %q = (
@@ -38,11 +46,15 @@ my %q = (
 	p1 => q{SELECT count(*), sum(id), md5(string_agg(t || d || n, ',' ORDER BY id)) FROM p1},
 	p2 => q{SELECT count(*), sum(id), md5(string_agg(t, ',' ORDER BY id)) FROM p2},
 	p3 => q{SELECT count(*), sum(id), md5(string_agg(t, ',' ORDER BY id)) FROM p3},
+	a1 => q{SELECT count(*), sum(id), md5(string_agg(t || d || n, ',' ORDER BY id)) FROM a1},
+	i1 => q{SELECT count(*), sum(id), md5(string_agg(t || d, ',' ORDER BY id)) FROM i1},
 	am => q{SELECT c.relname, a.amname, c.reloptions FROM pg_class c JOIN pg_am a ON a.oid = c.relam
-			WHERE c.relname IN ('h', 'p1', 'p2', 'p3') ORDER BY 1});
+			WHERE c.relname IN ('h', 'p1', 'p2', 'p3', 'a1', 'i1') ORDER BY 1});
 my %expect = map { $_ => $node->safe_psql('src', $q{$_}) } keys %q;
 is((split /\|/, $expect{p1})[0], 5000, 'the table reads its file');
 is((split /\|/, $expect{p2})[0], 5000, 'the table reads its glob');
+is($expect{a1}, $expect{p1}, 'the Arrow table reads its file as the Parquet one');
+is((split /\|/, $expect{i1})[0], 4500, 'the Iceberg table reads its snapshot, its deletes applied');
 
 # The COPY blocks of a dump's text: each table's rows
 sub copy_rows
@@ -68,8 +80,9 @@ my $plain = $node->basedir . '/plain.sql';
 $node->command_ok([ 'pg_dump', '-f', $plain, '-d', $node->connstr('src') ], 'pg_dump, plain');
 my $text = slurp_file($plain);
 is(copy_rows($text, 'h'), 5000, 'the plain dump holds the heap table\'s rows');
-is(copy_rows($text, $_), 0, "the plain dump holds no row of $_") for qw(p1 p2 p3);
-like($text, qr/default_table_access_method = parquet/, 'the plain dump has the access method');
+is(copy_rows($text, $_), 0, "the plain dump holds no row of $_") for qw(p1 p2 p3 a1 i1);
+like($text, qr/default_table_access_method = $_/, "the plain dump has the access method $_") for qw(parquet arrow iceberg);
+like($text, qr/location='\Q$files\E\/ice'/, 'the plain dump has the Iceberg table\'s location');
 like($text, qr/location='\Q$files\E\/one\.parquet'/, 'the plain dump has the location');
 $node->safe_psql('postgres', q{CREATE DATABASE dst1});
 $node->command_ok([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-f', $plain, '-d', $node->connstr('dst1') ],
@@ -80,7 +93,7 @@ restored_ok('dst1', 'plain');
 my $custom = $node->basedir . '/custom.dump';
 $node->command_ok([ 'pg_dump', '-Fc', '-f', $custom, '-d', $node->connstr('src') ], 'pg_dump -Fc');
 my ($out, $err) = run_command([ 'pg_restore', '-f', '-', $custom ]);
-is(copy_rows($out, $_), 0, "the custom dump holds no row of $_") for qw(p1 p2 p3);
+is(copy_rows($out, $_), 0, "the custom dump holds no row of $_") for qw(p1 p2 p3 a1 i1);
 is(copy_rows($out, 'h'), 5000, 'the custom dump holds the heap table\'s rows');
 $node->safe_psql('postgres', q{CREATE DATABASE dst2});
 $node->command_ok([ 'pg_restore', '-j', '4', '-d', $node->connstr('dst2'), $custom ], 'pg_restore -j 4');
@@ -90,7 +103,7 @@ restored_ok('dst2', 'pg_restore -j 4');
 my $data = $node->basedir . '/data.sql';
 $node->command_ok([ 'pg_dump', '--data-only', '-f', $data, '-d', $node->connstr('src') ], 'pg_dump --data-only');
 $text = slurp_file($data);
-is(copy_rows($text, $_), 0, "the data-only dump holds no row of $_") for qw(p1 p2 p3);
+is(copy_rows($text, $_), 0, "the data-only dump holds no row of $_") for qw(p1 p2 p3 a1 i1);
 $node->safe_psql('postgres', q{CREATE DATABASE dst3});
 $node->command_ok([ 'pg_restore', '--schema-only', '-d', $node->connstr('dst3'), $custom ], 'the schema alone');
 $node->command_ok([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-f', $data, '-d', $node->connstr('dst3') ],
@@ -103,10 +116,12 @@ $node->command_ok([ 'pg_dump', '--inserts', '-f', $inserts, '-d', $node->connstr
 $text = slurp_file($inserts);
 my @p1_rows = $text =~ /^INSERT INTO public\.p1 /mg;
 is(scalar @p1_rows, 5000, 'the --inserts dump holds the rows');
+my @i1_rows = $text =~ /^INSERT INTO public\.i1 /mg;
+is(scalar @i1_rows, 4500, 'the --inserts dump holds the Iceberg table\'s live rows');
 $node->safe_psql('postgres', q{CREATE DATABASE dst4});
 ok(!IPC::Run::run([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-f', $inserts, '-d', $node->connstr('dst4') ],
 		'>', \$out, '2>', \$err), 'restore of the --inserts dump fails');
-like($err, qr/cannot insert into "p\d"/, 'at the access method\'s refused insert');
+like($err, qr/cannot insert into "(?:p\d|a1|i1)"/, 'at the access method\'s refused insert');
 
 # a user's COPY t TO: its header alone, or binary's header and trailer; the query form reads the rows
 my $rc;

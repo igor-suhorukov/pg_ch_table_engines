@@ -390,7 +390,7 @@ claim_unit(ChScanDesc scan)
 		unit.part = scan->part;
 		unit.whole = scan->unit_whole && scan->filter == NULL;
 		unit.rows = 0;
-		unit.deletions = scan->dead_lo < scan->dead_hi;
+		unit.deletions = scan->dead_lo < scan->dead_hi || scan->part->deletes;
 		if (scan->unit_check(scan->unit_check_arg, &unit))
 			return true;
 		scan->counts.units_passed++;
@@ -716,8 +716,11 @@ next_batch(ChScanDesc scan)
 			release_unit(scan);
 			continue;
 		}
-		/* no column to read: the granules' rows, where no deletion leaves some out */
-		if (scan->ncols == 0 && scan->dead_lo == scan->dead_hi)
+		/*
+		 * no column to read: the granules' rows, where no deletion leaves some
+		 * out -- nor an Iceberg data file's delete files (§2.17)
+		 */
+		if (scan->ncols == 0 && scan->dead_lo == scan->dead_hi && !scan->part->deletes)
 		{
 			scan->count_left = scan->unit_rows;
 			continue;
@@ -1361,7 +1364,7 @@ ch_scan_claim_unit(TableScanDesc sscan, ChScanUnit *unit)
 	unit->part = scan->part;
 	unit->whole = scan->unit_whole && scan->filter == NULL;
 	unit->rows = scan->unit_rows;
-	unit->deletions = scan->dead_lo < scan->dead_hi;
+	unit->deletions = scan->dead_lo < scan->dead_hi || scan->part->deletes;
 	return true;
 }
 

@@ -101,6 +101,9 @@ typedef struct ChEngine
 									   size_t, chte_reader **, chte_error *);
 	int			(*file_write_begin) (const char *, const char *, const chte_file_column *, size_t, const char *,
 									 chte_file_writer **, chte_error *);
+	int			(*iceberg_write_begin) (const char *, int, const char *, const chte_file_column *, size_t,
+										const char *, chte_file_writer **, chte_error *);
+	int			(*iceberg_alter) (const char *, const char *, const char *, chte_error *);
 	int			(*file_write_batch) (chte_file_writer *, uint32_t, const chte_vector *, chte_error *);
 	int			(*file_write_finish) (chte_file_writer *, uint64_t *, chte_error *);
 	void		(*file_write_close) (chte_file_writer *);

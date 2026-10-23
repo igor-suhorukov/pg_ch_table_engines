@@ -1,0 +1,577 @@
+-- Tables of Iceberg tables (ch_table_engines.md §2.17, CH7's Iceberg step): an Iceberg table on the local disk,
+-- written by ClickHouse's own Iceberg writers -- a snapshot of rows, a second, a snapshot of position deletes,
+-- two of equality deletes, a renamed column and an added one -- read through the iceberg access method as a heap
+-- table holding the same rows reads them: the plain scan, ChScan, in parallel, and vexec where it is preloaded.
+-- A table's units are its snapshot's data files, each kept or not by its manifest's statistics.
+\! rm -rf /tmp/chte_iceberg && mkdir -p /tmp/chte_iceberg
+SET extra_float_digits = 0;
+CREATE TABLE src (id int8 NOT NULL, k int4, n numeric(18, 4), d date, ts timestamp, tz timestamptz, t text);
+INSERT INTO src
+SELECT g, g % 10, round(g / 7.0, 4), DATE '2001-02-03' + g % 3000, TIMESTAMP '1999-12-31 23:59:59' + g * INTERVAL '37 minutes',
+	   TIMESTAMPTZ '2020-01-01 00:00:00+00' + g * INTERVAL '1 hour', CASE WHEN g % 17 = 0 THEN NULL ELSE 'ice ' || g END
+FROM generate_series(1, 30000) g;
+-- the table, ClickHouse's types of it Iceberg's: long, int, decimal, date, timestamp, string -- and no double,
+-- whose bounds ClickHouse's writer does not keep, nor then any column's
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'create', NULL,
+	'id Int64, k Nullable(Int32), n Nullable(Decimal(18, 4)), d Nullable(Date32), ts Nullable(DateTime64(6)), tz Nullable(DateTime64(6)), t Nullable(String)') > 0 AS created;
+ created 
+---------
+ t
+(1 row)
+
+SELECT ch.external_columns('iceberg', '/tmp/chte_iceberg/t');
+        external_columns         
+---------------------------------
+ id bigint NOT NULL,            +
+ k integer,                     +
+ n numeric(18, 4),              +
+ d date,                        +
+ ts timestamp without time zone,+
+ tz timestamp without time zone,+
+ t text
+(1 row)
+
+CREATE TABLE ice (LIKE src) USING iceberg WITH (location = '/tmp/chte_iceberg/t');
+SELECT count(*) FROM ice;
+ count 
+-------
+     0
+(1 row)
+
+-- its first snapshot: the first 20000 rows, in data files of 8192 rows at most, of row groups of 1024
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'append', 'SELECT * FROM src WHERE id <= 20000 ORDER BY id', NULL,
+						'iceberg_insert_max_rows_in_data_file = 8192, output_format_parquet_row_group_size = 1024') > 0 AS appended;
+ appended 
+----------
+ t
+(1 row)
+
+CREATE TABLE ref AS SELECT * FROM src WHERE id <= 20000;
+SELECT rows, units, first_row FROM ch.external_files('ice'::regclass);
+ rows | units | first_row 
+------+-------+-----------
+ 8192 |     1 |         0
+ 8192 |     1 |      8192
+ 3616 |     1 |     16384
+(3 rows)
+
+-- every row heap's, both ways
+CREATE FUNCTION rows_differ(a text, b text, cols text DEFAULT 'id, k, n, d, ts, tz, t')
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	n bigint;
+BEGIN
+	EXECUTE format('SELECT count(*) FROM ((SELECT %3$s FROM %1$s EXCEPT ALL SELECT %3$s FROM %2$s)
+					UNION ALL (SELECT %3$s FROM %2$s EXCEPT ALL SELECT %3$s FROM %1$s)) diff', a, b, cols) INTO n;
+	RETURN n;
+END $$;
+SELECT rows_differ('ice', 'ref');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+-- the second snapshot, which the table reads from the next statement on
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'append', 'SELECT * FROM src WHERE id > 20000 ORDER BY id', NULL,
+						'iceberg_insert_max_rows_in_data_file = 8192, output_format_parquet_row_group_size = 1024') > 0 AS appended;
+ appended 
+----------
+ t
+(1 row)
+
+INSERT INTO ref SELECT * FROM src WHERE id > 20000;
+SELECT count(*), sum(rows), sum(units) FROM ch.external_files('ice'::regclass);
+ count |  sum  | sum 
+-------+-------+-----
+     5 | 30000 |   5
+(1 row)
+
+SELECT rows_differ('ice', 'ref');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+-- position deletes: the rows at the places of every 97th id, in data files of both snapshots, as their TIDs
+-- place them -- a row's TID its data file's first row's id and its place there
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'position deletes', $$
+	SELECT f.path AS file_path, r.rowid - f.first_row AS pos
+	FROM (SELECT ((ctid::text::point)[0] * 291 + (ctid::text::point)[1] - 1)::bigint AS rowid FROM ice WHERE id % 97 = 3 AND id < 25000) r
+	JOIN ch.external_files('ice'::regclass) f ON r.rowid >= f.first_row AND r.rowid < f.first_row + f.rows$$) > 0 AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+DELETE FROM ref WHERE id % 97 = 3 AND id < 25000;
+SELECT rows_differ('ice', 'ref');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+-- equality deletes: the rows holding these ids, and those holding these pairs of k and d, wherever they are
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'equality deletes', 'SELECT id FROM src WHERE id % 1000 = 7') > 0 AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'equality deletes', 'SELECT k, d FROM src WHERE id % 1201 = 5') > 0 AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+DELETE FROM ref WHERE id % 1000 = 7 OR (k, d) IN (SELECT k, d FROM src WHERE id % 1201 = 5);
+SELECT count(*) FROM ref;
+ count 
+-------
+ 29465
+(1 row)
+
+\! ls /tmp/chte_iceberg/t/metadata/*.metadata.json | wc -l
+6
+-- every row heap's: the plain scan, ChScan
+SET ch.enable_chscan = off;
+SELECT rows_differ('ice', 'ref');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+RESET ch.enable_chscan;
+SELECT rows_differ('ice', 'ref'), rows_differ('ice', 'ref', 'id, t'), rows_differ('ice', 'ref', 'tz, d');
+ rows_differ | rows_differ | rows_differ 
+-------------+-------------+-------------
+           0 |           0 |           0
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT id, t FROM ice WHERE id > 25000;
+         QUERY PLAN          
+-----------------------------
+ Custom Scan (ChScan) on ice
+   Filter: (id > 25000)
+   Columns: id, t
+   Pruning: (id > 25000)
+(4 rows)
+
+-- aggregates, a join
+SELECT 'ice' AS t, count(*), count(k), sum(id), sum(k), sum(n), min(d), max(d), min(ts), max(tz), count(t) FROM ice
+UNION ALL
+SELECT 'ref', count(*), count(k), sum(id), sum(k), sum(n), min(d), max(d), min(ts), max(tz), count(t) FROM ref
+ORDER BY 1;
+  t  | count | count |    sum    |  sum   |      sum      |    min     |    max     |           min            |             max              | count 
+-----+-------+-------+-----------+--------+---------------+------------+------------+--------------------------+------------------------------+-------
+ ice | 29465 | 29465 | 442721764 | 132394 | 63245966.2858 | 02-03-2001 | 04-21-2009 | Sat Jan 01 00:36:59 2000 | Sat Jun 03 17:00:00 2023 PDT | 27732
+ ref | 29465 | 29465 | 442721764 | 132394 | 63245966.2858 | 02-03-2001 | 04-21-2009 | Sat Jan 01 00:36:59 2000 | Sat Jun 03 17:00:00 2023 PDT | 27732
+(2 rows)
+
+SELECT count(*), sum(i.k - r.k) FROM ice i JOIN ref r USING (id) WHERE i.t IS NOT DISTINCT FROM r.t AND i.ts = r.ts;
+ count | sum 
+-------+-----
+ 29465 |   0
+(1 row)
+
+SELECT k, count(*), sum(n) FROM ice GROUP BY k ORDER BY k;
+ k | count |     sum      
+---+-------+--------------
+ 0 |  2955 | 6347122.8572
+ 1 |  2954 | 6338323.4286
+ 2 |  2954 | 6334239.7142
+ 3 |  2955 | 6344132.1427
+ 4 |  2954 | 6338246.5713
+ 5 |  2944 | 6323441.4286
+ 6 |  2946 | 6324405.1429
+ 7 |  2914 | 6253272.5715
+ 8 |  2944 | 6322503.1430
+ 9 |  2945 | 6320279.2858
+(10 rows)
+
+-- a filter on the sorted id: the data files whose manifests' bounds rule it out are not read
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM ice WHERE id BETWEEN 25000 AND 25100;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (ChScan) on ice (actual rows=100.00 loops=1)
+         Filter: ((id >= 25000) AND (id <= 25100))
+         Rows Removed by Filter: 7968
+         Columns: id
+         Pruning: ((id >= 25000) AND (id <= 25100))
+         Data Files: 1 read of 5, files pruned: 4
+(7 rows)
+
+SELECT count(*) FROM ice WHERE id BETWEEN 25000 AND 25100;
+ count 
+-------
+   100
+(1 row)
+
+SELECT count(*) FROM ref WHERE id BETWEEN 25000 AND 25100;
+ count 
+-------
+   100
+(1 row)
+
+-- in parallel: the data files shared out
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(k) FROM ice;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (ChScan) on ice
+                     Columns: k
+(6 rows)
+
+SELECT count(*), sum(k), sum(n), max(t) FROM ice;
+ count |  sum   |      sum      |   max    
+-------+--------+---------------+----------
+ 29465 | 132394 | 63245966.2858 | ice 9999
+(1 row)
+
+SELECT count(*) FROM ice i JOIN src s USING (id) WHERE i.t IS NOT DISTINCT FROM s.t AND i.tz = s.tz;
+ count 
+-------
+ 29465
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM ice WHERE id % 1000 = 0;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Custom Scan (ChScan) on ice (actual rows=10.00 loops=3)
+                     Filter: ((id % '1000'::bigint) = 0)
+                     Rows Removed by Filter: 9812
+                     Columns: id
+                     Data Files: 5 read of 5
+(10 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM ice WHERE id > 26000;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Custom Scan (ChScan) on ice (actual rows=1322.00 loops=3)
+                     Filter: (id > 26000)
+                     Rows Removed by Filter: 1965
+                     Columns: id
+                     Pruning: (id > 26000)
+                     Data Files: 2 read of 5, files pruned: 3
+(11 rows)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+-- with vexec, where it is preloaded: its scans through the source, in both its batch formats
+CREATE FUNCTION vexec_scans(query text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+	found boolean := false;
+BEGIN
+	IF current_setting('shared_preload_libraries') NOT LIKE '%vexec%' THEN
+		RETURN;
+	END IF;
+	FOR line IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
+		found := found OR line LIKE '%Source: iceberg%';
+	END LOOP;
+	IF NOT found THEN
+		RAISE EXCEPTION 'vexec does not scan: %', query;
+	END IF;
+END $$;
+SET vexec.mode = force;
+SET vexec.batch_dictionary = off;
+SET vexec.batch_format = postgres;
+SELECT vexec_scans('SELECT id, k, d, t FROM ice WHERE d > ''2005-06-01''');
+ vexec_scans 
+-------------
+ 
+(1 row)
+
+SELECT rows_differ('ice', 'ref');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+SELECT count(*), count(t), sum(k), sum(n), min(d), max(ts) FROM ice;
+ count | count |  sum   |      sum      |    min     |           max            
+-------+-------+--------+---------------+------------+--------------------------
+ 29465 | 27732 | 132394 | 63245966.2858 | 02-03-2001 | Sat Feb 09 19:59:59 2002
+(1 row)
+
+SET vexec.batch_format = arrow;
+SELECT rows_differ('ice', 'ref');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SELECT count(*), count(t), sum(k), sum(n), min(d), max(ts) FROM ice;
+ count | count |  sum   |      sum      |    min     |           max            
+-------+-------+--------+---------------+------------+--------------------------
+ 29465 | 27732 | 132394 | 63245966.2858 | 02-03-2001 | Sat Feb 09 19:59:59 2002
+(1 row)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+RESET vexec.batch_format;
+RESET vexec.batch_dictionary;
+RESET vexec.mode;
+DROP FUNCTION vexec_scans(text);
+-- TIDs: a data file's rows numbered from its first, deleted ones among them
+SELECT count(*) FROM ice i JOIN ice j ON i.ctid = j.ctid;
+ count 
+-------
+ 29465
+(1 row)
+
+SELECT id FROM ice WHERE ctid = (SELECT ctid FROM ice WHERE id = 12345);
+  id   
+-------
+ 12345
+(1 row)
+
+ANALYZE ice;
+SELECT reltuples > 25000 AS analyzed FROM pg_class WHERE relname = 'ice';
+ analyzed 
+----------
+ t
+(1 row)
+
+-- a snapshot the table's settings pin: the first, its 20000 rows and no deletes
+DO $$
+DECLARE
+	first text;
+BEGIN
+	SELECT j->'snapshots'->0->>'snapshot-id' INTO first
+	FROM (SELECT pg_read_file('/tmp/chte_iceberg/t/metadata/v6.metadata.json')::json AS j) m;
+	EXECUTE format('ALTER TABLE ice SET (settings = %L)', 'iceberg_snapshot_id = ' || first);
+END $$;
+SELECT count(*), sum(id) FROM ice;
+ count |    sum    
+-------+-----------
+ 20000 | 200010000
+(1 row)
+
+ALTER TABLE ice RESET (settings);
+-- the newest, a count of no column reading the data files its deletes apply to
+SELECT count(*) = (SELECT count(*) FROM ref) AS newest FROM ice;
+ newest 
+--------
+ t
+(1 row)
+
+-- the Iceberg table's schema changed: a column renamed, which the table reads as its own once ALTER TABLE
+-- renames it too, its older data files' column found by its field id; a column added, which they hold none of
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'alter', 'RENAME COLUMN t TO note');
+ write_iceberg 
+---------------
+             0
+(1 row)
+
+SELECT count(t) FROM ice;
+ERROR:  listing a table's files: column "t" of "ice" is not in Iceberg table /tmp/chte_iceberg/t's schema 1
+DETAIL:  ClickHouse error code 8.
+ALTER TABLE ice RENAME COLUMN t TO note;
+ALTER TABLE ref RENAME COLUMN t TO note;
+SELECT rows_differ('ice', 'ref', 'id, k, n, d, ts, tz, note');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+-- the rows' ids through the schema transform: a count of no column, a row by its TID
+SELECT count(*) = (SELECT count(*) FROM ref) AS counted FROM ice;
+ counted 
+---------
+ t
+(1 row)
+
+SELECT id, note FROM ice WHERE ctid = (SELECT ctid FROM ice WHERE id = 12345);
+  id   |   note    
+-------+-----------
+ 12345 | ice 12345
+(1 row)
+
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'alter', 'ADD COLUMN extra Nullable(Int64)');
+ write_iceberg 
+---------------
+             0
+(1 row)
+
+SELECT ch.write_iceberg('/tmp/chte_iceberg/t', 'append',
+						'SELECT id + 30000 AS id, k, n, d, ts, tz, note, id * 2 AS extra FROM ref WHERE id <= 1000 ORDER BY id') > 0 AS appended;
+ appended 
+----------
+ t
+(1 row)
+
+ALTER TABLE ice ADD COLUMN extra bigint;
+ALTER TABLE ref ADD COLUMN extra bigint;
+INSERT INTO ref SELECT id + 30000, k, n, d, ts, tz, note, id * 2 FROM ref WHERE id <= 1000;
+SELECT rows_differ('ice', 'ref', 'id, k, n, d, ts, tz, note, extra');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+SELECT count(*), count(extra), sum(extra), count(note) FROM ice;
+ count | count |  sum   | count 
+-------+-------+--------+-------
+ 30443 |   978 | 983920 | 28653
+(1 row)
+
+SET ch.enable_chscan = off;
+SELECT rows_differ('ice', 'ref', 'id, note, extra');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+RESET ch.enable_chscan;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SELECT count(*), count(extra), sum(extra), count(note), sum(k) FROM ice;
+ count | count |  sum   | count |  sum   
+-------+-------+--------+-------+--------
+ 30443 |   978 | 983920 | 28653 | 136794
+(1 row)
+
+-- the workers' pruning, of manifests written under each of the snapshots' schemas
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM ice WHERE id > 30000;
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=978.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Parallel Custom Scan (ChScan) on ice (actual rows=326.00 loops=3)
+               Filter: (id > 30000)
+               Columns: id
+               Pruning: (id > 30000)
+               Data Files: 1 read of 6, files pruned: 5
+(9 rows)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+-- a table partitioned by k, identity: a data file a partition, its k the partition's value, which a filter on k
+-- prunes the other partitions by
+SELECT ch.write_iceberg('/tmp/chte_iceberg/p', 'create', 'k', 'id Int64, k Int32, t Nullable(String)') > 0 AS created;
+ created 
+---------
+ t
+(1 row)
+
+SELECT ch.write_iceberg('/tmp/chte_iceberg/p', 'append', 'SELECT id, k, t FROM src ORDER BY id') > 0 AS appended;
+ appended 
+----------
+ t
+(1 row)
+
+CREATE TABLE part (id bigint NOT NULL, k integer NOT NULL, t text) USING iceberg WITH (location = '/tmp/chte_iceberg/p');
+SELECT count(*), sum(rows) FROM ch.external_files('part'::regclass);
+ count |  sum  
+-------+-------
+    10 | 30000
+(1 row)
+
+SELECT rows_differ('part', 'src', 'id, k, t');
+ rows_differ 
+-------------
+           0
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*), sum(id) FROM part WHERE k = 3;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (ChScan) on part (actual rows=3000.00 loops=1)
+         Filter: (k = 3)
+         Columns: id, k
+         Pruning: (k = 3)
+         Data Files: 1 read of 10, files pruned: 9
+(6 rows)
+
+SELECT count(*), sum(id) FROM part WHERE k = 3;
+ count |   sum    
+-------+----------
+  3000 | 44994000
+(1 row)
+
+SELECT count(*), sum(id) FROM src WHERE k = 3;
+ count |   sum    
+-------+----------
+  3000 | 44994000
+(1 row)
+
+DROP TABLE part;
+-- the checks: a column the table lacks, a type that cannot take its values, no table at a location, a NULL
+-- refused
+CREATE TABLE bad (nope bigint) USING iceberg WITH (location = '/tmp/chte_iceberg/t');
+ERROR:  checking the files of "bad": column "nope" of "bad" is not in Iceberg table /tmp/chte_iceberg/t's schema 2
+DETAIL:  ClickHouse error code 8.
+CREATE TABLE bad (note integer) USING iceberg WITH (location = '/tmp/chte_iceberg/t');
+ERROR:  checking the files of "bad": column "note" of "bad" cannot take the values of Iceberg table /tmp/chte_iceberg/t's schema 2, of ClickHouse's type Nullable(String)
+DETAIL:  ClickHouse error code 53.
+CREATE TABLE bad (id bigint) USING iceberg WITH (location = '/tmp/chte_iceberg');
+ERROR:  checking the files of "bad": The metadata file for Iceberg table with path /tmp/chte_iceberg/ doesn't exist
+DETAIL:  ClickHouse error code 107.
+CREATE TABLE nn (note text NOT NULL) USING iceberg WITH (location = '/tmp/chte_iceberg/t');
+DO $$
+BEGIN
+	PERFORM max(note) FROM nn;
+EXCEPTION WHEN not_null_violation THEN
+	RAISE NOTICE '%', regexp_replace(SQLERRM, 'data-[0-9a-f-]+[.]parquet', 'data-....parquet');
+END $$;
+NOTICE:  reading a file: file /tmp/chte_iceberg/t/data/data-....parquet holds a NULL of column "note", which the table declares NOT NULL
+DROP TABLE nn;
+-- COPY's table form returns no rows; writes refused
+COPY ice (id, note) TO STDOUT WITH (FORMAT csv, HEADER);
+NOTICE:  COPY of ice returns no rows: its rows are those of the files at its location
+HINT:  COPY (SELECT * FROM ice) TO ... reads them.
+id,note
+INSERT INTO ice (id) VALUES (1);
+ERROR:  cannot insert into "ice"
+DETAIL:  A table of access method iceberg reads the files at its location, and is never written.
+DELETE FROM ice;
+ERROR:  cannot delete from "ice"
+DETAIL:  A table of access method iceberg reads the files at its location, and is never written.
+-- the reader started no thread
+SELECT threads FROM ch.engine_info();
+ threads 
+---------
+       5
+(1 row)
+
+DROP TABLE ice, ref, src;
+DROP FUNCTION rows_differ(text, text, text);
+\! rm -rf /tmp/chte_iceberg

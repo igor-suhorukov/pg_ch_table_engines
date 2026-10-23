@@ -133,22 +133,51 @@ uncompressed or compressed with LZ4 frames or zstd, a dictionary-encoded
 column as its values -- through ClickHouse's own Arrow IPC reader, with the
 same options, columns and rules.
 
+`iceberg` reads an Iceberg table on the server's disk -- its `location` the
+table's root, whose `metadata/` holds its metadata files -- through
+ClickHouse's own Iceberg code, on the calling thread:
+
+```sql
+CREATE TABLE events (id bigint NOT NULL, kind integer, at timestamp, note text)
+    USING iceberg WITH (location = '/data/warehouse/db/events');
+```
+
+A statement reads one snapshot: the newest as it starts, or one the table's
+`settings` pin (`iceberg_snapshot_id = ...`, `iceberg_timestamp_ms = ...`).
+Its files are the snapshot's data files, Parquet's, each with the position and
+equality delete files that apply to it, as ClickHouse matches them; a filter
+leaves out the data files whose manifests' statistics and partitions rule it
+out, as ClickHouse's pruning does (`EXPLAIN ANALYZE` counts them), and each
+data file's reader its row groups.  The table's columns are those of the
+snapshot's schema, found as a Parquet table's are, so that a column the
+Iceberg table renames or adds reaches the table by its own ALTER TABLE; a data
+file of an older schema is read by its columns' field ids.  Every data and
+delete file is read under the location.  ClickHouse's equality deletes compare
+with `notIn`, which a NULL never passes: an equality delete file of one column,
+over a column that holds NULLs, deletes the rows whose value is NULL too.
+
 ChScan and vexec's source read them as they read the engines' tables: the
 row groups whose statistics rule a filter out are not read (`EXPLAIN
 ANALYZE` counts them), nor the pages their page index rules out, and vexec's
 aggregates of a whole file come from its statistics; an Arrow file's record
 batches, which carry no statistics, are all read.  A row's TID is its file's
-first row's id and its place there.  INSERT, UPDATE, DELETE, row locks,
-indexes and TABLESAMPLE are refused, and so are partitions of these tables.
+first row's id and its place there -- an Iceberg data file's deleted rows
+counted.  INSERT, UPDATE, DELETE, row locks, indexes and TABLESAMPLE are
+refused, and so are partitions of these tables.
 
 pg_dump leaves their rows out: `COPY t TO ...`, the table form, returns none,
 saying so, and `COPY (SELECT * FROM t) TO ...` reads them; a restored table
 reads its location again.  `pg_dump --inserts` holds the rows, and its restore
 fails at the refused insert.  TRUNCATE leaves the files as they are.
-`ch.external_files(rel)` lists the files a statement reads, and
+`ch.external_files(rel)` lists the files a statement reads;
 `ch.write_file(format, path, query, columns, settings)` writes a query's rows
-to a file by ClickHouse's own writer, as the tests make theirs (a role with
-`pg_write_server_files`'s privileges).
+to a file by ClickHouse's own writer, and `ch.write_iceberg(location, action,
+query, columns, settings)` an Iceberg table -- made, appended to, its rows
+deleted by position or by equality, its schema changed -- by ClickHouse's own
+Iceberg writers, as the tests make theirs (a role with
+`pg_write_server_files`'s privileges).  ClickHouse's Iceberg writer keeps no
+column's bounds in a manifest where one column's cannot be kept, a float's
+among them.
 
 The engine library is built with ClickHouse's Parquet and Arrow IPC formats,
 Avro and their libraries (`engine/submodules.txt`).

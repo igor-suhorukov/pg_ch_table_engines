@@ -309,6 +309,8 @@ ch_engine(void)
 	*(void **) &engine.external_read_begin = dlsym(handle, "chte_external_read_begin");
 	*(void **) &engine.external_read_rows = dlsym(handle, "chte_external_read_rows");
 	*(void **) &engine.file_write_begin = dlsym(handle, "chte_file_write_begin");
+	*(void **) &engine.iceberg_write_begin = dlsym(handle, "chte_iceberg_write_begin");
+	*(void **) &engine.iceberg_alter = dlsym(handle, "chte_iceberg_alter");
 	*(void **) &engine.file_write_batch = dlsym(handle, "chte_file_write_batch");
 	*(void **) &engine.file_write_finish = dlsym(handle, "chte_file_write_finish");
 	*(void **) &engine.file_write_close = dlsym(handle, "chte_file_write_close");

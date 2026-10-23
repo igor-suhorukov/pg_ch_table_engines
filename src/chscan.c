@@ -679,9 +679,13 @@ chscan_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	{
 		ChScanCounts c = s->counts;
 		ChExternalKind kind;
-		/* what a unit and a part are: an engine's granules and parts, a table's of files its files' (§2.17) */
+		/*
+		 * what a unit and a part are: an engine's granules and parts, a table's of files its files', each one's
+		 * row groups or record batches -- an Iceberg table's data files, a unit each (§2.17)
+		 */
 		bool		external = ch_is_external_rel(s->rel, &kind);
-		const char *units = !external ? "Granules" : kind == CH_EXTERNAL_ARROW ? "Record Batches" : "Row Groups";
+		const char *units = !external ? "Granules" : kind == CH_EXTERNAL_ARROW ? "Record Batches" :
+			kind == CH_EXTERNAL_ICEBERG ? "Data Files" : "Row Groups";
 		const char *parts = !external ? "parts" : "files";
 
 		if (s->scan && !s->counted)

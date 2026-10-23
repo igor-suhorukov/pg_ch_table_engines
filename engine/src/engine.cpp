@@ -9,6 +9,7 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Common/DateLUT.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTrackerBlockerInThread.h>
 #include <Common/register_objects.h>
@@ -244,6 +245,10 @@ extern "C" int chte_init(const chte_init_options * options, chte_error * error)
         engine->global->setPrimaryIndexCache("SLRU", 16 << 20, 0.5);
 
         applySingleThreadedSettings(engine->global);
+        /// ClickHouse's time zone where a type names none, UTC, whatever the host's TZ or /etc/localtime says:
+        /// the shim's timestamps are UTC's, and an Iceberg table's day, month and hour partitions of a
+        /// timestamp without a zone are UTC's too, which the manifests' pruning computes in it (CH7)
+        DateLUT::setDefaultTimezone("UTC");
         applySettings(engine->global, options->settings);
 
         /// MergeTreeData's constructor initializes the global background executors

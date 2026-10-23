@@ -43,6 +43,9 @@
 #   run.sh hits          10M ClickBench rows by COPY into heap and mergetree
 #                        in both stores, their answers compared, and six
 #                        reads timed
+#   run.sh hits-parquet  ClickBench's hits.parquet and its 100 partitioned files
+#                        as parquet tables, beside the hits leg's loads: rows,
+#                        checksums and queries compared, nothing timed
 #   run.sh merges        the 10M rows into mergetree in small batches, the
 #                        merge workers merging beside: parts over time, write
 #                        amplification, the answers compared
@@ -215,6 +218,10 @@ case "${1:-}" in
 		[ -f "$CHTE_CLICKBENCH/hits_10m.tsv" ] ||
 			die "no hits_10m.tsv in $CHTE_CLICKBENCH: pg_accel's test/clickbench/run.sh fetch, then its subsets"
 		CHTE_DATA="$CHTE_CLICKBENCH" leg hits /src/test/hits.sh ;;
+	hits-parquet)
+		[ -f "$CHTE_CLICKBENCH/parquet/hits.parquet" ] ||
+			die "no parquet/hits.parquet in $CHTE_CLICKBENCH: ClickBench's lib/download-hits-parquet-single into it, -partitioned into parquet/partitioned"
+		CHTE_DATA="$CHTE_CLICKBENCH" leg hits-parquet /src/test/hits-parquet.sh ;;
 	merges)
 		[ -f "$CHTE_CLICKBENCH/hits_10m.tsv" ] ||
 			die "no hits_10m.tsv in $CHTE_CLICKBENCH: pg_accel's test/clickbench/run.sh fetch, then its subsets"

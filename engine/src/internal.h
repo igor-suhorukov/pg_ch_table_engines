@@ -460,6 +460,8 @@ struct chte_filter
     std::vector<std::shared_ptr<std::string>> names;
     std::vector<DB::ColumnPtr> values;
     std::map<DB::String, std::vector<uint8_t>> kept_units;
+    /// an Iceberg table's (iceberg.cpp): per snapshot, the data files its manifests' statistics keep
+    std::map<DB::String, std::set<DB::String>> kept_files;
 };
 
 struct chte_reader

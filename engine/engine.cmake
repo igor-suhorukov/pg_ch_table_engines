@@ -12,7 +12,8 @@ add_library(chte_engine SHARED
     "${CHTE_ENGINE_DIR}/src/rewrite.cpp"
     "${CHTE_ENGINE_DIR}/src/merge.cpp"
     "${CHTE_ENGINE_DIR}/src/external.cpp"
-    "${CHTE_ENGINE_DIR}/src/arrow.cpp")
+    "${CHTE_ENGINE_DIR}/src/arrow.cpp"
+    "${CHTE_ENGINE_DIR}/src/iceberg.cpp")
 target_include_directories(chte_engine PRIVATE "${CHTE_ENGINE_DIR}/../include")
 target_link_libraries(chte_engine PRIVATE
     dbms
@@ -21,12 +22,16 @@ target_link_libraries(chte_engine PRIVATE
     clickhouse_parsers
     clickhouse_common_io)
 # CH7's readers of files (§2.17): ClickHouse's Parquet reader, whose headers name Arrow's and its
-# thrift types', which dbms takes privately; and Arrow IPC's FlatBuffers metadata
+# thrift types', which dbms takes privately; Arrow IPC's FlatBuffers metadata; and Avro, Iceberg's
+# manifests' format, whose headers the tests' writer of Iceberg tables names
 if (TARGET ch_contrib::parquet)
     target_link_libraries(chte_engine PRIVATE ch_contrib::parquet)
 endif ()
 if (TARGET ch_contrib::arrow_ipc_metadata)
     target_link_libraries(chte_engine PRIVATE ch_contrib::arrow_ipc_metadata)
+endif ()
+if (TARGET ch_contrib::avrocpp)
+    target_link_libraries(chte_engine PRIVATE ch_contrib::avrocpp)
 endif ()
 set_target_properties(chte_engine PROPERTIES
     CXX_VISIBILITY_PRESET hidden

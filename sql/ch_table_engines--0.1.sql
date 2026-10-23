@@ -218,14 +218,15 @@ CREATE FUNCTION ch.external_columns(am text, location text, settings text DEFAUL
 	AS 'MODULE_PATHNAME', 'ch_external_columns' LANGUAGE C CALLED ON NULL INPUT VOLATILE;
 
 -- The files a table of files reads in this statement, as it lists them: each
--- one's bytes, rows, units -- Parquet's row groups -- and its first row's id.
+-- one's bytes, rows, units -- Parquet's row groups, Arrow's record batches, an
+-- Iceberg table's data file one -- and its first row's id.
 CREATE FUNCTION ch.external_files(rel regclass,
 	OUT path text, OUT bytes bigint, OUT rows bigint, OUT units integer, OUT first_row bigint)
 	RETURNS SETOF record
 	AS 'MODULE_PATHNAME', 'ch_external_files' LANGUAGE C STRICT VOLATILE;
 
 -- A query's rows written to a file by ClickHouse's own writer of the format,
--- 'Parquet', as the tests make their tables' files (§2.17): columns,
+-- 'Parquet' or 'Arrow', as the tests make their tables' files (§2.17): columns,
 -- ClickHouse's "name type, ..." of the file -- by default the query's columns,
 -- Nullable -- and settings, ClickHouse's for the format.  Its caller may write
 -- the server's files (pg_write_server_files).  Returns the file's bytes.
@@ -233,3 +234,17 @@ CREATE FUNCTION ch.write_file(format text, path text, query text, columns text D
 							  settings text DEFAULT NULL) RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_write_file' LANGUAGE C CALLED ON NULL INPUT VOLATILE;
 REVOKE ALL ON FUNCTION ch.write_file(text, text, text, text, text) FROM PUBLIC;
+
+-- An Iceberg table at a location written by ClickHouse's own Iceberg writers,
+-- as the tests make theirs (§2.17), a snapshot an action: 'create' a table of
+-- columns, ClickHouse's "name type, ...", partitioned by a spec in the query's
+-- place, as ClickHouse's PARTITION BY names one; 'append' the query's rows; 'position
+-- deletes' the rows at the query's file_path and pos; 'equality deletes' the
+-- rows holding the query's values in its columns; 'alter' its schema changed
+-- by a command of ClickHouse's ALTER, the query's place -- and settings,
+-- ClickHouse's.  Its caller may write the server's files.  Returns the bytes
+-- of the files added.
+CREATE FUNCTION ch.write_iceberg(location text, action text, query text DEFAULT NULL, columns text DEFAULT NULL,
+								 settings text DEFAULT NULL) RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_write_iceberg' LANGUAGE C CALLED ON NULL INPUT VOLATILE;
+REVOKE ALL ON FUNCTION ch.write_iceberg(text, text, text, text, text) FROM PUBLIC;

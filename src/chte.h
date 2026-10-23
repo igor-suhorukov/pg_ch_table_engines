@@ -243,6 +243,8 @@ typedef struct ChPart
 	 */
 	struct ChListing *listing;
 	int32		file;
+	/* an Iceberg data file's delete files apply to it: not all its rows are live */
+	bool		deletes;
 } ChPart;
 
 extern Oid	ch_catalog_relid(const char *name, bool unlogged);
