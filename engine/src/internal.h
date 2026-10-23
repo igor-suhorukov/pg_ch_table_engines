@@ -15,6 +15,7 @@
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipeline.h>
 #include <Storages/MarkCache.h>
+#include <Storages/MergeTree/KeyCondition.h>
 #include <Storages/MergeTree/MarkRange.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
@@ -142,6 +143,11 @@ Engine & engine();
 /// Throws QUERY_WAS_CANCELLED when the caller's interrupted() callback says so.
 void checkInterrupted();
 
+/// Settings that keep a query, an insert, a merge and a format's reader on the calling thread.
+void applySingleThreadedSettings(ContextMutablePtr & context);
+/// ClickHouse settings, "name = value, ...", into a context.
+void applySettings(ContextMutablePtr & context, const char * settings);
+
 /// ClickHouse's functions a process has (VC12): chte_init registers those the filters and ClickHouse's
 /// analysis of them use; the others, and the aggregate functions, as a table's definition, a write, a
 /// merge or a rewrite first needs them.  Each is a no-op once done.
@@ -172,8 +178,21 @@ int guarded(chte_error * error, F && f) noexcept
         std::string message;
         try
         {
-            code = getCurrentExceptionCode();
-            message = getCurrentExceptionMessage(/* with_stacktrace= */ false);
+            /// ClickHouse's own message, without its code and release around it: the caller reports the code apart
+            try
+            {
+                throw;
+            }
+            catch (const Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+            catch (...)
+            {
+                code = getCurrentExceptionCode();
+                message = getCurrentExceptionMessage(/* with_stacktrace= */ false);
+            }
         }
         catch (...)
         {
@@ -327,6 +346,9 @@ struct chte_table;
 namespace chte
 {
 
+/// An external table (external.cpp): files PostgreSQL does not own, read by ClickHouse's input formats.
+class ExternalTable;
+
 /// A reader of a part's named columns over mark_ranges (none: every granule), as chte_read_begin opens.
 std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
                                         std::optional<MarkRanges> mark_ranges);
@@ -393,6 +415,53 @@ struct chte_writer
     std::map<size_t, std::string> summaries;
 };
 
+namespace chte
+{
+
+/// Where a filter's leaves find their columns (select.cpp): an engine's table's, by their names and types in
+/// its metadata; an external table's, in one file, by the file's names and the types they are read as, the
+/// leaves' constants converted (external.cpp).
+class FilterColumns
+{
+public:
+    virtual ~FilterColumns() = default;
+    /// The input a leaf on the caller's column reads: its name and type
+    virtual DB::NameAndTypePair input(const DB::String & name) const = 0;
+    /// Value i of a leaf on the caller's column, of the caller's type, as a constant of the input's type
+    /// without Nullable and LowCardinality
+    virtual DB::ColumnWithTypeAndName constant(const DB::String & name, const chte_vector & values, uint32_t i) const = 0;
+};
+
+/// A filter's predicate, built into dag
+const DB::ActionsDAG::Node & buildFilter(DB::ActionsDAG & dag, const chte_filter_node * nodes, size_t nnodes,
+                                         DB::ContextPtr context, const FilterColumns & columns);
+
+/// An external table's filter: its nodes kept, their names and values copied (external.cpp)
+void keepExternalFilter(chte_filter & filter, const chte_filter_node * nodes, size_t nnodes);
+
+}
+
+struct chte_filter
+{
+    chte_table * table = nullptr;
+    DB::ActionsDAG dag;
+    const DB::ActionsDAG::Node * predicate = nullptr;
+    std::optional<DB::KeyCondition> key_condition;
+    /// the filter over the columns it names that have statistics, in this order
+    DB::NamesAndTypesList stats_columns;
+    std::optional<DB::KeyCondition> stats_condition;
+    /// each part's granules the filter keeps, worked out once
+    std::map<DB::String, DB::MarkRanges> selected;
+
+    /// an external table's (external.cpp): the nodes, their names and values the filter's own, from which
+    /// each file's DAG is built over its names and types; and per file, by its identity, the units the
+    /// filter keeps
+    std::vector<chte_filter_node> nodes;
+    std::vector<std::shared_ptr<std::string>> names;
+    std::vector<DB::ColumnPtr> values;
+    std::map<DB::String, std::vector<uint8_t>> kept_units;
+};
+
 struct chte_reader
 {
     chte_table * table = nullptr;
@@ -435,6 +504,11 @@ struct chte_reader
     DB::MarkCachePtr mark_cache;
     DB::ReadStepPerformanceCountersPtr counters;
 
+    /// An external table's reader (external.cpp): its blocks, converted and their row ids added, in place
+    /// of the runs'; and what they are read through
+    std::function<bool(DB::Block &)> next_block;
+    std::shared_ptr<void> external_state;
+
     /// The next block of the runs, the next run's source opened when one is done: false at the end
     bool pull(DB::Block & block);
 };
@@ -449,4 +523,6 @@ struct chte_table
     /// the last part an insert's writer made: per column, its bytes a row, a string's chars
     /// alone (chte_write_reserve, VC18)
     std::vector<double> last_bytes_per_row;
+    /// an external table's (§2.17), its storage and metadata then none
+    std::shared_ptr<chte::ExternalTable> external;
 };

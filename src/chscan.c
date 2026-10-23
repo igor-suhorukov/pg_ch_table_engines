@@ -355,7 +355,7 @@ add_chscan_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		if (IsA(((RestrictInfo *) lfirst(lc))->clause, CurrentOfExpr))
 			return;
 	relation = table_open(rte->relid, NoLock);
-	if (!ch_is_engine_rel(relation, NULL) || !needed_attrs(rel, &attnums, &need_tid, &whole_row))
+	if (!ch_is_scan_rel(relation) || !needed_attrs(rel, &attnums, &need_tid, &whole_row))
 	{
 		table_close(relation, NoLock);
 		return;
@@ -678,6 +678,11 @@ chscan_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	if (es->analyze)
 	{
 		ChScanCounts c = s->counts;
+		ChExternalKind kind;
+		/* what a unit and a part are: an engine's granules and parts, a table's of files its files' (§2.17) */
+		bool		external = ch_is_external_rel(s->rel, &kind);
+		const char *units = !external ? "Granules" : kind == CH_EXTERNAL_ARROW ? "Record Batches" : "Row Groups";
+		const char *parts = !external ? "parts" : "files";
 
 		if (s->scan && !s->counted)
 			c = *ch_scan_counts(s->scan);
@@ -688,16 +693,16 @@ chscan_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			ExplainIndentText(es);
-			appendStringInfo(es->str, "Granules: %lld read of %lld", (long long) c.marks_read, (long long) c.marks);
+			appendStringInfo(es->str, "%s: %lld read of %lld", units, (long long) c.marks_read, (long long) c.marks);
 			if (c.parts_pruned > 0)
-				appendStringInfo(es->str, ", parts pruned: %lld", (long long) c.parts_pruned);
+				appendStringInfo(es->str, ", %s pruned: %lld", parts, (long long) c.parts_pruned);
 			appendStringInfoChar(es->str, '\n');
 		}
 		else
 		{
-			ExplainPropertyInteger("Granules Read", NULL, c.marks_read, es);
-			ExplainPropertyInteger("Granules", NULL, c.marks, es);
-			ExplainPropertyInteger("Parts Pruned", NULL, c.parts_pruned, es);
+			ExplainPropertyInteger(psprintf("%s Read", units), NULL, c.marks_read, es);
+			ExplainPropertyInteger(units, NULL, c.marks, es);
+			ExplainPropertyInteger(external ? "Files Pruned" : "Parts Pruned", NULL, c.parts_pruned, es);
 		}
 	}
 }

@@ -35,6 +35,18 @@ typedef enum ChEngineKind
 	CH_ENGINE_COUNT
 } ChEngineKind;
 
+/*
+ * The read-only access methods of files PostgreSQL does not own (§2.17,
+ * CH7), each a format of the engine library's readers
+ */
+typedef enum ChExternalKind
+{
+	CH_EXTERNAL_PARQUET,
+	CH_EXTERNAL_ARROW,
+	CH_EXTERNAL_ICEBERG,
+	CH_EXTERNAL_COUNT
+} ChExternalKind;
+
 typedef enum ChStorage
 {
 	CH_STORAGE_FILES,
@@ -58,6 +70,8 @@ typedef struct ChOptions
 	char	   *sum_columns;
 	/* columns kept as ClickHouse's LowCardinality: a dictionary a part's granules share */
 	char	   *low_cardinality;
+	/* an external table's (§2.17): where its files are -- a file, a glob or a directory */
+	char	   *location;
 } ChOptions;
 
 /*
@@ -109,11 +123,19 @@ extern bool ch_is_engine_rel(Relation rel, ChEngineKind *kind);
 extern const char *ch_engine_name(ChEngineKind kind);
 extern bool ch_am_name_kind(const char *amname, ChEngineKind *kind);
 extern void ch_relation_dropped(Oid relid);
+extern const TableAmRoutine *ch_external_routine(ChExternalKind kind);
+extern bool ch_is_external_rel(Relation rel, ChExternalKind *kind);
+extern bool ch_is_external_am(Oid amoid, ChExternalKind *kind);
+extern bool ch_external_am_name_kind(const char *amname, ChExternalKind *kind);
+extern const char *ch_external_name(ChExternalKind kind);
+/* a table of an engine, or an external one: what scan.c, ChScan and vexec's source read */
+extern bool ch_is_scan_rel(Relation rel);
 
 /* options.c */
 extern void ch_options_init(void);
 extern bool ch_is_option_name(const char *name);
 extern void ch_options_validate(List *defs, ChEngineKind kind);
+extern void ch_external_options_validate(List *defs, ChExternalKind kind, bool creating);
 extern void ch_options_parse(Datum reloptions, ChOptions *opts);
 extern void ch_relation_options(Relation rel, ChOptions *opts);
 extern void ch_options_bind(Oid relid, List *defs);
@@ -166,6 +188,10 @@ typedef struct ChTable
 	struct HTAB *attached;		/* the pages store's: parts whose files the library has */
 	int			refcount;		/* scans and write buffers using it */
 	bool		stale;			/* out of the cache, freed with its last pin */
+	/* an external table's (§2.17): its kind, and the running statement's listing of its files */
+	bool		external;
+	ChExternalKind ext_kind;
+	struct ChListing *listing;
 } ChTable;
 
 extern void ch_storage_id(Relation rel, const RelFileLocator *locator, ChStorageId *id);
@@ -211,6 +237,12 @@ typedef struct ChPart
 								 * (VC20's B6): as stored until read (ch_part_summary());
 								 * NULL where none was kept */
 	TransactionId xmin;			/* its catalog row's inserter, as listed (ch_parts_visible()) */
+	/*
+	 * An external table's file, as its statement's listing has it (§2.17):
+	 * marks its units, min_rowid its first row's id; NULL for a part
+	 */
+	struct ChListing *listing;
+	int32		file;
 } ChPart;
 
 extern Oid	ch_catalog_relid(const char *name, bool unlogged);
@@ -301,6 +333,35 @@ extern bytea *ch_pages_store_part(Relation rel, ChTable *t, const char *part_dir
 extern bytea *ch_pages_store_part_files(Relation rel, ChTable *t, const chte_part_file *files, size_t nfiles,
 										ChPart *part, CommandId cid);
 extern void ch_pages_raise_pending(void);
+
+/* external.c: external tables (§2.17) */
+typedef struct ChListing
+{
+	chte_external_listing *handle;
+	List	   *parts;			/* ChPart, a file each, in the listing's order */
+	int			refcount;		/* its table's, and the scans' reading it */
+	TimestampTz stmt;			/* the statement it was listed for */
+	LocalTransactionId lxid;
+	MemoryContext cxt;			/* where its parts are */
+} ChListing;
+
+extern void ch_external_columns_for(Relation rel, TupleDesc desc, MemoryContext cxt, chte_external_column **columns,
+									int *ncolumns);
+extern ChListing *ch_external_listing(Relation rel, ChTable *t);
+extern ChListing *ch_external_listing_load(ChTable *t, const void *bytes, Size size);
+extern void ch_listing_pin(ChListing *l);
+extern void ch_listing_unpin(ChListing *l);
+extern void ch_external_xact_end(void);
+extern void ch_external_check(Relation rel);
+extern bool ch_external_rewrite_target(Relation rel);
+extern Node *ch_external_copy_to(CopyStmt *stmt, Oid relid);
+extern void ch_external_truncated(Relation rel);
+extern void ch_external_totals(Relation rel, double *rows, uint64 *bytes);
+extern bool ch_unit_select(ChTable *t, ChPart *p, chte_filter *filter, uint32 begin, uint32 end,
+						   chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows);
+extern void ch_unit_column_bytes(ChTable *t, ChPart *p, const char *columns, uint64 *compressed,
+								 uint64 *uncompressed);
+extern void ch_unit_stats(ChTable *t, const ChPart *p, const char *column, chte_column_stats *stats);
 
 /* scan.c */
 extern TableScanDesc ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,

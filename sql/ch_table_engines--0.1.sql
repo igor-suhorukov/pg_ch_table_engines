@@ -140,6 +140,24 @@ CREATE FUNCTION ch.coalescingmergetree_handler(internal) RETURNS table_am_handle
 CREATE ACCESS METHOD coalescingmergetree TYPE TABLE HANDLER ch.coalescingmergetree_handler;
 COMMENT ON ACCESS METHOD coalescingmergetree IS 'ClickHouse''s CoalescingMergeTree';
 
+-- Tables of files PostgreSQL does not own, read by ClickHouse's own readers
+-- and never written (ch_table_engines.md §2.17): WITH (location = '...'), a
+-- file, a glob or a directory, and settings, ClickHouse's for the format.
+CREATE FUNCTION ch.parquet_handler(internal) RETURNS table_am_handler
+	AS 'MODULE_PATHNAME', 'ch_parquet_handler' LANGUAGE C STRICT;
+CREATE ACCESS METHOD parquet TYPE TABLE HANDLER ch.parquet_handler;
+COMMENT ON ACCESS METHOD parquet IS 'Parquet files, read by ClickHouse''s Parquet reader';
+
+CREATE FUNCTION ch.arrow_handler(internal) RETURNS table_am_handler
+	AS 'MODULE_PATHNAME', 'ch_arrow_handler' LANGUAGE C STRICT;
+CREATE ACCESS METHOD arrow TYPE TABLE HANDLER ch.arrow_handler;
+COMMENT ON ACCESS METHOD arrow IS 'Arrow IPC files, read by ClickHouse''s Arrow IPC reader';
+
+CREATE FUNCTION ch.iceberg_handler(internal) RETURNS table_am_handler
+	AS 'MODULE_PATHNAME', 'ch_iceberg_handler' LANGUAGE C STRICT;
+CREATE ACCESS METHOD iceberg TYPE TABLE HANDLER ch.iceberg_handler;
+COMMENT ON ACCESS METHOD iceberg IS 'Iceberg tables, read by ClickHouse''s Iceberg code';
+
 -- What a table's parts are, as the snapshot sees them.
 CREATE FUNCTION ch.parts(rel regclass,
 	OUT name text, OUT rows bigint, OUT bytes bigint,
@@ -192,3 +210,26 @@ CREATE FUNCTION ch.remove_orphans(rel regclass) RETURNS integer
 -- distributed DDL statement (CH6).  The merge workers' passes end with it.
 CREATE FUNCTION ch.remove_orphans() RETURNS integer
 	AS 'MODULE_PATHNAME', 'ch_remove_orphans_database' LANGUAGE C STRICT VOLATILE;
+
+-- The columns of the first file a location names, as a column list to start
+-- a CREATE TABLE ... USING am from (§2.17); a column no table of files reads,
+-- a comment.  Its caller may read the server's files (pg_read_server_files).
+CREATE FUNCTION ch.external_columns(am text, location text, settings text DEFAULT NULL) RETURNS text
+	AS 'MODULE_PATHNAME', 'ch_external_columns' LANGUAGE C CALLED ON NULL INPUT VOLATILE;
+
+-- The files a table of files reads in this statement, as it lists them: each
+-- one's bytes, rows, units -- Parquet's row groups -- and its first row's id.
+CREATE FUNCTION ch.external_files(rel regclass,
+	OUT path text, OUT bytes bigint, OUT rows bigint, OUT units integer, OUT first_row bigint)
+	RETURNS SETOF record
+	AS 'MODULE_PATHNAME', 'ch_external_files' LANGUAGE C STRICT VOLATILE;
+
+-- A query's rows written to a file by ClickHouse's own writer of the format,
+-- 'Parquet', as the tests make their tables' files (§2.17): columns,
+-- ClickHouse's "name type, ..." of the file -- by default the query's columns,
+-- Nullable -- and settings, ClickHouse's for the format.  Its caller may write
+-- the server's files (pg_write_server_files).  Returns the file's bytes.
+CREATE FUNCTION ch.write_file(format text, path text, query text, columns text DEFAULT NULL,
+							  settings text DEFAULT NULL) RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_write_file' LANGUAGE C CALLED ON NULL INPUT VOLATILE;
+REVOKE ALL ON FUNCTION ch.write_file(text, text, text, text, text) FROM PUBLIC;

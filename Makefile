@@ -11,6 +11,7 @@ OBJS = \
 	src/convert.o \
 	src/dml.o \
 	src/engine.o \
+	src/external.o \
 	src/fetch.o \
 	src/filter.o \
 	src/functions.o \

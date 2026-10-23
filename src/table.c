@@ -66,6 +66,9 @@ static List *stale = NIL;		/* of ChTable, in TopMemoryContext */
 static void
 table_free(ChTable *t)
 {
+	if (t->listing)
+		ch_listing_unpin(t->listing);
+	t->listing = NULL;
 	if (t->handle)
 		ch_engine()->table_close(t->handle);
 	MemoryContextDelete(t->own_cxt);
@@ -124,12 +127,18 @@ ch_tables_xact_end(void)
 		table_free(lfirst(lc));
 	list_free(stale);
 	stale = NIL;
-	if (tables == NULL)
-		return;
-	hash_seq_init(&status, tables);
-	while ((entry = hash_seq_search(&status)) != NULL)
-		if (entry->table)
-			entry->table->refcount = 0;
+	if (tables != NULL)
+	{
+		hash_seq_init(&status, tables);
+		while ((entry = hash_seq_search(&status)) != NULL)
+			if (entry->table)
+			{
+				entry->table->refcount = 0;
+				/* an external table's listing is its last statement's: gone below */
+				entry->table->listing = NULL;
+			}
+	}
+	ch_external_xact_end();
 }
 
 void
@@ -603,13 +612,77 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 	return buf.data;
 }
 
+/*
+ * An external table's (§2.17): its columns, as the engine library reads them
+ * from the files, and their kinds as an engine's table keeps them (§2.5),
+ * which scan.c, ChScan and vexec's source read alike
+ */
+static ChTable *
+open_external(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cxt, ChExternalKind kind)
+{
+	static const int32 formats[CH_EXTERNAL_COUNT] = {
+		CHTE_EXTERNAL_PARQUET, CHTE_EXTERNAL_ARROW, CHTE_EXTERNAL_ICEBERG,
+	};
+	const ChEngine *eng = ch_engine();
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	ChTable    *t;
+	chte_external_def def;
+	chte_external_column *columns;
+	int			ncolumns;
+	StringInfoData cols;
+
+	t = palloc0(sizeof(ChTable));
+	t->relid = RelationGetRelid(rel);
+	t->storage = *id;
+	t->external = true;
+	t->ext_kind = kind;
+	ch_relation_options(rel, &t->options);
+	t->natts = desc->natts;
+	t->columns = palloc0(sizeof(ChColumn) * Max(desc->natts, 1));
+	initStringInfo(&cols);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		ch_column_for_attribute(TupleDescAttr(desc, i), &t->columns[i]);
+		if (t->columns[i].kind != CH_COL_DROPPED)
+			appendStringInfo(&cols, "%s, ", column_name(TupleDescAttr(desc, i)->attnum));
+	}
+	appendStringInfoString(&cols, CH_ROWID_COLUMN);
+	t->all_columns = cols.data;
+	ch_external_columns_for(rel, desc, cxt, &columns, &ncolumns);
+	MemoryContextSwitchTo(old);
+
+	if (eng->external_open == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the engine library reads no external files"),
+				 errdetail("It was built before CH7 (ch_table_engines.md §2.17).")));
+	if (t->options.location == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("table \"%s\" has no location", RelationGetRelationName(rel))));
+	memset(&def, 0, sizeof(def));
+	def.format = formats[kind];
+	def.name = RelationGetRelationName(rel);
+	def.location = t->options.location;
+	def.settings = t->options.settings;
+	def.columns = columns;
+	def.ncolumns = ncolumns;
+	CH_CALL("opening the table in the engine library", eng->external_open(&def, &t->handle, CH_ERR));
+	return t;
+}
+
 static ChTable *
 open_table(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cxt)
 {
 	ChTable    *t;
-	MemoryContext old = MemoryContextSwitchTo(cxt);
+	MemoryContext old;
 	chte_table_def def;
 	StringInfoData cols;
+	ChExternalKind ext_kind;
+
+	if (ch_is_external_rel(rel, &ext_kind))
+		return open_external(rel, id, desc, cxt, ext_kind);
+	old = MemoryContextSwitchTo(cxt);
 
 	t = palloc0(sizeof(ChTable));
 	t->relid = RelationGetRelid(rel);
@@ -738,6 +811,8 @@ ch_table_private(Relation rel, const ChStorageId *id, TupleDesc desc)
 void
 ch_table_private_close(ChTable *t)
 {
+	if (t->listing)
+		ch_listing_unpin(t->listing);
 	if (t->handle)
 		ch_engine()->table_close(t->handle);
 	MemoryContextDelete(t->private_cxt);

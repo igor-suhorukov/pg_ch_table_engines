@@ -1,0 +1,1389 @@
+/*
+ * External tables (ch_table_engines.md §2.17, CH7): files PostgreSQL does not own, read by ClickHouse's
+ * own input formats on the calling thread -- Parquet's v3 reader (ParquetV3BlockInputFormat) -- and
+ * never written but by the tests' writer below.
+ *
+ * A table is its format, its location and its columns: each the caller's name ("c<attnum>"), the
+ * files' name of it, the ClickHouse type the caller takes it as (§2.5's) and how its values become
+ * that type.  The reader is asked for each column under the file's own name, in the type it reads
+ * the caller's as -- the caller's own, cast by the reader where the file's differs (a widened
+ * integer, a decimal of another scale), Date32 for a date, DateTime64(6, 'UTC') for a timestamp --
+ * Nullable where the file may hold NULLs; the shim then shifts dates and timestamps to PostgreSQL's
+ * epoch, refuses a NULL of a column the caller declared NOT NULL and a string that is not UTF-8, and
+ * adds each row's id, its file's first row's id and its place in the file, from the row numbers the
+ * reader hands with its chunks (ChunkInfoRowNumbers).
+ *
+ * A listing is the files a location names, each one's footer read -- kept in the process by path,
+ * size and modification time -- and its columns resolved and checked.  A file's units are its row
+ * groups, which a filter prunes by their statistics as the reader itself does
+ * (Parquet::Reader::prefilterAndInitRowGroups()); a read of units hands the reader the filter too,
+ * so that its page index, bloom filters and dictionaries pass over what they rule out.
+ */
+#include "internal.h"
+
+#include <Columns/ColumnDecimal.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
+#include <Common/ErrnoException.h>
+#include <Common/Exception.h>
+#include <Common/FieldAccurateComparison.h>
+#include <Common/isValidUTF8.h>
+#include <Common/parseGlobs.h>
+#include <Core/Settings.h>
+#include <DataTypes/DataTypeDate32.h>
+#include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeFixedString.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Formats/FormatFactory.h>
+#include <Formats/FormatFilterInfo.h>
+#include <Formats/FormatParserSharedResources.h>
+#include <IO/ReadBufferFromFile.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromFile.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Interpreters/ActionsDAG.h>
+#include <Interpreters/castColumn.h>
+#include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Processors/Formats/IInputFormat.h>
+#include <Processors/Formats/IOutputFormat.h>
+#include <Processors/Formats/Impl/Parquet/Prefetcher.h>
+#include <Processors/Formats/Impl/Parquet/Reader.h>
+#include <Processors/Formats/Impl/Parquet/SchemaConverter.h>
+#include <Processors/Formats/Impl/ParquetV3BlockInputFormat.h>
+#include <QueryPipeline/Pipe.h>
+#include <QueryPipeline/QueryPipeline.h>
+
+#include <boost/algorithm/string/case_conv.hpp>
+#include <re2/re2.h>
+
+#include <filesystem>
+#include <set>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace DB
+{
+void registerOutputFormatParquet(FormatFactory & factory);
+}
+
+namespace DB::ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_FSTAT;
+    extern const int CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN;
+    extern const int CANNOT_STAT;
+    extern const int FILE_CHANGED_DURING_READ;
+    extern const int FILE_DOESNT_EXIST;
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
+    extern const int THERE_IS_NO_COLUMN;
+    extern const int TYPE_MISMATCH;
+    extern const int UNICODE_ERROR;
+}
+
+namespace fs = std::filesystem;
+
+namespace chte
+{
+
+namespace
+{
+
+/// PostgreSQL's epoch, 2000-01-01, in days and microseconds from 1970-01-01
+constexpr Int32 PG_EPOCH_DAYS = 10957;
+constexpr Int64 PG_EPOCH_MICROSECONDS = Int64(PG_EPOCH_DAYS) * 86400 * 1000000;
+
+/// The row id column every reader may be asked for (chte.h's CH_ROWID_COLUMN)
+constexpr const char * ROWID = "_pg_rowid";
+
+/// Footers kept in the process, at most this many: a listing's first read of a file costs its footer
+constexpr size_t MAX_FOOTERS = 4096;
+
+}
+
+/// A column of an external table
+struct ExternalColumn
+{
+    String name;            /// the caller's
+    String file_name;       /// the files', as the caller gave it
+    DataTypePtr type;       /// the caller's, without Nullable
+    DataTypePtr read_type;  /// what the reader is asked for, without Nullable
+    int convert = CHTE_CONVERT_NONE;
+    bool not_null = false;
+    bool check_utf8 = false;
+};
+
+/// A file's footer, as read once in the process for a path, a size and a modification time
+struct ExternalFooter
+{
+    UInt64 size = 0;
+    Int64 mtime = 0;
+    std::shared_ptr<const parquet::format::FileMetaData> parquet;
+    /// each unit's rows, and their sum
+    std::vector<UInt64> unit_rows;
+    UInt64 rows = 0;
+};
+
+/// A file as a table reads it: its footer, and each of the table's columns resolved in it
+struct ResolvedFile
+{
+    std::shared_ptr<const ExternalFooter> footer;
+    NamesAndTypesList schema;               /// as ClickHouse infers it
+    std::vector<String> names;              /// per table column: the file's name of it
+    std::vector<DataTypePtr> file_types;    /// and its type there, Nullable where it may hold NULLs
+    std::vector<uint8_t> nullable;
+};
+
+/// A file of a listing
+struct ListedFile
+{
+    String path;
+    UInt64 size = 0;
+    Int64 mtime = 0;
+    UInt64 first_row = 0;
+    std::shared_ptr<const ResolvedFile> resolved;
+};
+
+class ExternalTable
+{
+public:
+    int format = CHTE_EXTERNAL_PARQUET;
+    String name;
+    String location;
+    ContextMutablePtr context;
+    FormatSettings format_settings;
+    Parquet::ReadOptions read_options;
+    std::vector<ExternalColumn> columns;
+    std::unordered_map<String, size_t> by_name;
+    /// the files this table has resolved, by path: each one's identity checked at a listing
+    std::map<String, std::shared_ptr<const ResolvedFile>> resolved;
+    /// chte_external_schema's, until the next call
+    NamesAndTypesList schema;
+    std::vector<String> schema_types;
+    std::vector<chte_external_field> fields;
+
+    const ExternalColumn & column(const String & caller_name) const
+    {
+        auto it = by_name.find(caller_name);
+        if (it == by_name.end())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} has no column {}", name, caller_name);
+        return columns[it->second];
+    }
+
+    size_t columnIndex(const String & caller_name) const
+    {
+        auto it = by_name.find(caller_name);
+        if (it == by_name.end())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} has no column {}", name, caller_name);
+        return it->second;
+    }
+};
+
+}
+
+struct chte_external_listing
+{
+    std::shared_ptr<chte::ExternalTable> table;
+    std::vector<chte::ListedFile> files;
+    std::string bytes;
+};
+
+struct chte_file_writer
+{
+    std::string path;
+    std::string temp_path;
+    DB::ContextMutablePtr context;
+    std::vector<DB::DataTypePtr> types;         /// the file's
+    std::vector<DB::DataTypePtr> sources;       /// the batches', Nullable
+    std::vector<int32_t> converts;
+    DB::Block header;
+    std::unique_ptr<DB::WriteBufferFromFile> out;
+    DB::OutputFormatPtr format;
+    bool finished = false;
+};
+
+using namespace chte;
+
+namespace chte
+{
+
+namespace
+{
+
+/// The format settings of an external table's reads: the caller's, then what keeps the reader on the calling
+/// thread and its columns' types the ones the extension takes (JSON and geometry as their strings).
+void forceFormatSettings(FormatSettings & settings)
+{
+    settings.parquet.enable_row_group_prefetch = false;
+    settings.parquet.enable_json_parsing = false;
+    settings.parquet.allow_geoparquet_parser = false;
+    settings.parquet.case_insensitive_column_matching = false;
+    settings.parquet.parallel_encoding = false;
+    settings.max_threads = 1;
+}
+
+Parquet::ReadOptions readOptions(const FormatSettings & settings)
+{
+    /// as ParquetV3BlockInputFormat's convertReadOptions(), nullability as the file has it
+    Parquet::ReadOptions options;
+    options.format = settings;
+    options.schema_inference_force_nullable = false;
+    options.schema_inference_force_not_nullable = false;
+    options.dictionary_filter_limit_bytes = settings.parquet.dictionary_filter_push_down;
+    options.min_bytes_for_seek = settings.parquet.local_read_min_bytes_for_seek;
+    options.bytes_per_read_task = settings.parquet.local_read_min_bytes_for_seek * 4;
+    return options;
+}
+
+/// Shared resources of one reader that start no thread: parsing on the caller (max_parsing_threads 1 is
+/// ParquetV3BlockInputFormat's "no pool"), no prefetching pool (max_io_threads 0)
+FormatParserSharedResourcesPtr singleThreadedResources(const ContextPtr & context)
+{
+    auto resources = FormatParserSharedResources::singleThreaded(context->getSettingsRef());
+    const_cast<size_t &>(resources->max_io_threads) = 0;
+    return resources;
+}
+
+/// A file's identity: its size and modification time in nanoseconds
+std::pair<UInt64, Int64> statIdentity(const struct stat & st)
+{
+    return {static_cast<UInt64>(st.st_size), Int64(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec};
+}
+
+/// A listed file opened for reading, its identity checked against the listing's
+std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 size, Int64 mtime)
+{
+    auto buf = std::make_unique<ReadBufferFromFilePRead>(path, DBMS_DEFAULT_BUFFER_SIZE, -1, nullptr, 0, size);
+    struct stat st;
+    if (fstat(buf->getFD(), &st) != 0)
+        throw ErrnoException(ErrorCodes::CANNOT_FSTAT, "Cannot fstat {}", path);
+    auto [now_size, now_mtime] = statIdentity(st);
+    if (now_size != size || now_mtime != mtime)
+        throw Exception(ErrorCodes::FILE_CHANGED_DURING_READ,
+                        "file {} changed since the statement listed it: {} bytes where {} were", path, now_size, size);
+    return buf;
+}
+
+/// Footers kept in the process (MAX_FOOTERS), by path
+std::map<String, std::shared_ptr<const ExternalFooter>> footers;
+
+std::shared_ptr<const ExternalFooter> parquetFooter(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
+{
+    auto it = footers.find(path);
+    if (it != footers.end() && it->second->size == size && it->second->mtime == mtime)
+        return it->second;
+    auto buf = openListed(path, size, mtime);
+    Parquet::Prefetcher prefetcher;
+    prefetcher.init(buf.get(), table.read_options, /* parser_shared_resources_= */ nullptr);
+    auto footer = std::make_shared<ExternalFooter>();
+    footer->size = size;
+    footer->mtime = mtime;
+    auto metadata = std::make_shared<parquet::format::FileMetaData>(Parquet::Reader::readFileMetaData(prefetcher));
+    for (const auto & row_group : metadata->row_groups)
+    {
+        footer->unit_rows.push_back(static_cast<UInt64>(std::max<Int64>(row_group.num_rows, 0)));
+        footer->rows += footer->unit_rows.back();
+    }
+    footer->parquet = std::move(metadata);
+    if (footers.size() >= MAX_FOOTERS)
+        footers.clear();
+    footers[path] = footer;
+    return footer;
+}
+
+/// Whether a value of the file's type, Nullable and LowCardinality left out, is one of the caller's
+/// column exactly, its read type cast as ClickHouse casts it
+bool takes(const ExternalColumn & column, const DataTypePtr & file_type)
+{
+    WhichDataType file(file_type);
+    WhichDataType caller(column.type);
+    switch (column.convert)
+    {
+        case CHTE_CONVERT_DATE:
+            return file.isDate() || file.isDate32();
+        case CHTE_CONVERT_TIMESTAMP:
+            return file.isDateTime() || file.isDateTime64();
+        default:
+            break;
+    }
+    if (caller.isInt16())
+        return file.isInt8() || file.isUInt8() || file.isInt16();
+    if (caller.isInt32())
+        return file.isInt8() || file.isUInt8() || file.isInt16() || file.isUInt16() || file.isInt32();
+    if (caller.isInt64())
+        return file.isInt8() || file.isUInt8() || file.isInt16() || file.isUInt16() || file.isInt32() || file.isUInt32()
+            || file.isInt64();
+    if (caller.isUInt32())
+        return file.isUInt8() || file.isUInt16() || file.isUInt32();
+    if (caller.isFloat32())
+        return file.isFloat32();
+    if (caller.isFloat64())
+        return file.isFloat32() || file.isFloat64();
+    if (isBool(column.type))
+        return isBool(file_type);
+    if (caller.isDecimal())
+    {
+        UInt32 precision = getDecimalPrecision(*column.type);
+        UInt32 scale = getDecimalScale(*column.type);
+        if (file.isDecimal())
+        {
+            UInt32 file_precision = getDecimalPrecision(*file_type);
+            UInt32 file_scale = getDecimalScale(*file_type);
+            return file_scale <= scale && file_precision - file_scale <= precision - scale;
+        }
+        size_t digits = file.isInt8() || file.isUInt8() ? 3 : file.isInt16() || file.isUInt16() ? 5
+            : file.isInt32() || file.isUInt32() ? 10 : file.isInt64() ? 19 : 0;
+        return digits > 0 && digits <= precision - scale;
+    }
+    if (caller.isString())
+        return file.isString() || file.isFixedString();
+    if (caller.isFixedString())
+        return file.isFixedString() && file_type->getSizeOfValueInMemory() == column.type->getSizeOfValueInMemory();
+    return false;
+}
+
+/// The column of a file's schema that is the caller's column: by its name exactly, else regardless of
+/// case where one alone matches so (*ambiguous where more do)
+const NameAndTypePair * findColumn(const NamesAndTypesList & schema, const String & name, bool & ambiguous)
+{
+    ambiguous = false;
+    for (const auto & column : schema)
+        if (column.name == name)
+            return &column;
+    const NameAndTypePair * found = nullptr;
+    String lower = boost::algorithm::to_lower_copy(name);
+    for (const auto & column : schema)
+        if (boost::algorithm::to_lower_copy(column.name) == lower)
+        {
+            if (found)
+            {
+                ambiguous = true;
+                return nullptr;
+            }
+            found = &column;
+        }
+    return found;
+}
+
+/// A file as the table reads it, its columns checked against the table's
+std::shared_ptr<const ResolvedFile> resolve(ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
+{
+    auto it = table.resolved.find(path);
+    if (it != table.resolved.end() && it->second->footer->size == size && it->second->footer->mtime == mtime)
+        return it->second;
+
+    auto file = std::make_shared<ResolvedFile>();
+    file->footer = parquetFooter(table, path, size, mtime);
+    Parquet::SchemaConverter schemer(*file->footer->parquet, table.read_options, /* sample_block= */ nullptr);
+    file->schema = schemer.inferSchema();
+    for (const auto & column : table.columns)
+    {
+        bool ambiguous;
+        const auto * in_file = findColumn(file->schema, column.file_name, ambiguous);
+        if (!in_file && ambiguous)
+            throw Exception(ErrorCodes::THERE_IS_NO_COLUMN,
+                            "column \"{}\" of \"{}\" names more than one column of file {} regardless of case, and none exactly",
+                            column.file_name, table.name, path);
+        if (!in_file)
+            throw Exception(ErrorCodes::THERE_IS_NO_COLUMN, "column \"{}\" of \"{}\" is not in file {}", column.file_name,
+                            table.name, path);
+        DataTypePtr bare = removeLowCardinalityAndNullable(in_file->type);
+        if (!takes(column, bare))
+            throw Exception(ErrorCodes::TYPE_MISMATCH,
+                            "column \"{}\" of \"{}\" cannot take the values of file {}, of ClickHouse's type {}", column.file_name,
+                            table.name, path, in_file->type->getName());
+        file->names.push_back(in_file->name);
+        file->file_types.push_back(in_file->type);
+        file->nullable.push_back(isNullableOrLowCardinalityNullable(in_file->type) ? 1 : 0);
+    }
+    table.resolved[path] = file;
+    return file;
+}
+
+/// The files a glob names: its path's segments matched one by one, "**" any number of directories; a name
+/// beginning with '.' only where the segment matching it does
+void globSegments(const String & dir, const std::vector<String> & segments, size_t i, std::set<String> & out, size_t depth)
+{
+    if (i == segments.size() || depth > 1000)
+        return;
+    const String & segment = segments[i];
+    bool last = i + 1 == segments.size();
+    std::error_code ec;
+    if (segment == "**")
+    {
+        globSegments(dir, segments, i + 1, out, depth + 1);
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        {
+            String name = it->path().filename();
+            if (!name.starts_with('.') && it->is_directory(ec))
+                globSegments(dir + name + "/", segments, i, out, depth + 1);
+        }
+        return;
+    }
+    if (segment.find_first_of("*?{") == String::npos)
+    {
+        String path = dir + segment;
+        if (last ? fs::is_regular_file(path, ec) : fs::is_directory(path, ec))
+        {
+            if (last)
+                out.insert(path);
+            else
+                globSegments(path + "/", segments, i + 1, out, depth + 1);
+        }
+        return;
+    }
+    re2::RE2 matcher(makeRegexpPatternFromGlobs("/" + segment));
+    if (!matcher.ok())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "cannot match the glob {}: {}", segment, matcher.error());
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+    {
+        String name = it->path().filename();
+        if (name.starts_with('.') && !segment.starts_with('.'))
+            continue;
+        if (!re2::RE2::FullMatch("/" + name, matcher))
+            continue;
+        if (last && it->is_regular_file(ec))
+            out.insert(dir + name);
+        else if (!last && it->is_directory(ec))
+            globSegments(dir + name + "/", segments, i + 1, out, depth + 1);
+    }
+}
+
+/// The files of a directory and those below it, but those whose names begin with '.' or '_', Spark's and
+/// Hadoop's markers among them
+void walkDirectory(const String & dir, std::set<String> & out, size_t depth)
+{
+    std::error_code ec;
+    if (depth > 1000)
+        return;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+    {
+        String name = it->path().filename();
+        if (name.starts_with('.') || name.starts_with('_'))
+            continue;
+        if (it->is_directory(ec))
+            walkDirectory(dir + name + "/", out, depth + 1);
+        else if (it->is_regular_file(ec))
+            out.insert(dir + name);
+    }
+}
+
+/// The files a location names, in their paths' order: a glob's, a directory's, or the file itself
+std::vector<String> locationFiles(const String & location)
+{
+    std::set<String> files;
+    if (location.find_first_of("*?{") != String::npos)
+    {
+        std::vector<String> segments;
+        size_t start = 1;
+        while (start <= location.size())
+        {
+            size_t slash = location.find('/', start);
+            if (slash == String::npos)
+                slash = location.size();
+            if (slash > start)
+                segments.push_back(location.substr(start, slash - start));
+            start = slash + 1;
+        }
+        globSegments("/", segments, 0, files, 0);
+        return {files.begin(), files.end()};
+    }
+    std::error_code ec;
+    auto status = fs::status(location, ec);
+    if (ec || !fs::exists(status))
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "location {} does not exist", location);
+    if (fs::is_directory(status))
+    {
+        walkDirectory(location.ends_with('/') ? location : location + "/", files, 0);
+        return {files.begin(), files.end()};
+    }
+    return {location};
+}
+
+/// A listing of the files, their first rows' ids the rows of the files before them
+void listFiles(chte_external_listing & listing, const std::vector<std::tuple<String, UInt64, Int64>> & files)
+{
+    UInt64 first_row = 0;
+    for (const auto & [path, size, mtime] : files)
+    {
+        ListedFile file;
+        file.path = path;
+        file.size = size;
+        file.mtime = mtime;
+        file.first_row = first_row;
+        file.resolved = resolve(*listing.table, path, size, mtime);
+        first_row += file.resolved->footer->rows;
+        listing.files.push_back(std::move(file));
+    }
+}
+
+const ListedFile & listedFile(const chte_external_listing & listing, size_t file)
+{
+    if (file >= listing.files.size())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "a listing of {} files has no file {}", listing.files.size(), file);
+    return listing.files[file];
+}
+
+/// A listed file as a table reads it: as the listing resolved it, or, for another handle of the table -- a
+/// rewrite's, of the descriptor the old rows were written with -- resolved again for its own columns
+std::shared_ptr<const ResolvedFile> resolvedFor(ExternalTable & table, const chte_external_listing & listing, const ListedFile & file)
+{
+    if (listing.table.get() == &table)
+        return file.resolved;
+    return resolve(table, file.path, file.size, file.mtime);
+}
+
+/// A filter's columns in one file: its names of them, and the types they are read as there
+class FileColumns final : public FilterColumns
+{
+public:
+    FileColumns(const ExternalTable & table_, const ResolvedFile & file_) : table(table_), file(file_) { }
+
+    NameAndTypePair input(const String & name) const override
+    {
+        size_t i = table.columnIndex(name);
+        const auto & column = table.columns[i];
+        DataTypePtr type = file.nullable[i] ? makeNullable(column.read_type) : column.read_type;
+        return {file.names[i], type};
+    }
+
+    ColumnWithTypeAndName constant(const String & name, const chte_vector & values, uint32_t i) const override
+    {
+        const auto & column = table.column(name);
+        auto value = column.type->createColumn();
+        appendValue(*value, values, i);
+        switch (column.convert)
+        {
+            case CHTE_CONVERT_DATE:
+            {
+                /// days from 2000-01-01 as Date32's from 1970-01-01
+                auto date = ColumnInt32::create();
+                date->insertValue(assert_cast<const ColumnInt32 &>(*value).getData()[0] + PG_EPOCH_DAYS);
+                return {std::move(date), column.read_type, ""};
+            }
+            case CHTE_CONVERT_TIMESTAMP:
+            {
+                /// microseconds from 2000-01-01 as DateTime64(6)'s from 1970-01-01
+                auto timestamp = ColumnDecimal<DateTime64>::create(0, 6);
+                timestamp->insertValue(DateTime64(assert_cast<const ColumnInt64 &>(*value).getData()[0] + PG_EPOCH_MICROSECONDS));
+                return {std::move(timestamp), column.read_type, ""};
+            }
+            default:
+                return {std::move(value), column.type, ""};
+        }
+    }
+
+private:
+    const ExternalTable & table;
+    const ResolvedFile & file;
+};
+
+/// The filter as a reader of a file takes it, over the columns of keys, its header: none where the filter
+/// names a column the header lacks, which only prunes (the caller evaluates its quals on what is read)
+FormatFilterInfoPtr formatFilter(const chte_filter & filter, const ExternalTable & table, const ResolvedFile & file,
+                                 const Block & keys)
+{
+    auto dag = std::make_shared<ActionsDAG>();
+    const auto & predicate = buildFilter(*dag, filter.nodes.data(), filter.nodes.size(), table.context, FileColumns(table, file));
+    dag->getOutputs() = {&predicate};
+    for (const auto & name : dag->getRequiredColumnsNames())
+        if (!keys.has(name))
+            return nullptr;
+    auto info = std::make_shared<FormatFilterInfo>(dag, table.context, nullptr, nullptr, nullptr);
+    info->initKeyConditionOnce(keys);
+    return info;
+}
+
+/// A header of a file's columns: per caller name, the file's name and the type it is read as there
+Block fileHeader(const ExternalTable & table, const ResolvedFile & file, const Names & names)
+{
+    Block header;
+    for (const auto & name : names)
+    {
+        size_t i = table.columnIndex(name);
+        DataTypePtr type = file.nullable[i] ? makeNullable(table.columns[i].read_type) : table.columns[i].read_type;
+        header.insert({type->createColumn(), type, file.names[i]});
+    }
+    return header;
+}
+
+/// The filter's columns, as a header of the file's
+Block filterKeys(const chte_filter & filter, const ExternalTable & table, const ResolvedFile & file)
+{
+    Names names;
+    for (const auto & node : filter.nodes)
+        if (node.column && std::find(names.begin(), names.end(), node.column) == names.end())
+            names.emplace_back(node.column);
+    return fileHeader(table, file, names);
+}
+
+/// The row groups of a file the filter keeps by their statistics, as the reader keeps them
+/// (Parquet::Reader::prefilterAndInitRowGroups()), worked out once a filter and a file
+const std::vector<uint8_t> & keptUnits(chte_filter & filter, const ExternalTable & table, const ListedFile & file,
+                                       const ResolvedFile & resolved)
+{
+    String key = fmt::format("{}\n{}\n{}", file.path, file.size, file.mtime);
+    auto it = filter.kept_units.find(key);
+    if (it != filter.kept_units.end())
+        return it->second;
+
+    const auto & footer = *resolved.footer;
+    std::vector<uint8_t> kept(footer.unit_rows.size(), 1);
+    Block keys = filterKeys(filter, table, resolved);
+    auto info = keys.columns() > 0 ? formatFilter(filter, table, resolved, keys) : nullptr;
+    if (info && info->key_condition)
+    {
+        auto buf = openListed(file.path, file.size, file.mtime);
+        Parquet::Reader reader;
+        reader.prefetcher.init(buf.get(), table.read_options, /* parser_shared_resources_= */ nullptr);
+        reader.file_metadata = *footer.parquet;
+        reader.init(table.read_options, keys, info);
+        reader.prefilterAndInitRowGroups(std::nullopt);
+        std::fill(kept.begin(), kept.end(), 0);
+        for (const auto & row_group : reader.row_groups)
+            kept.at(row_group.row_group_idx) = 1;
+    }
+    return filter.kept_units.emplace(std::move(key), std::move(kept)).first->second;
+}
+
+/// A column as the reader hands it, as the caller takes it
+ColumnPtr convertColumn(const ExternalColumn & column, ColumnPtr col, const String & path)
+{
+    col = col->convertToFullColumnIfConst()->convertToFullColumnIfSparse();
+    if (column.not_null)
+        if (const auto * nullable = typeid_cast<const ColumnNullable *>(col.get()))
+        {
+            const auto & map = nullable->getNullMapData();
+            if (memchr(map.data(), 1, map.size()))
+                throw Exception(ErrorCodes::CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN,
+                                "file {} holds a NULL of column \"{}\", which the table declares NOT NULL", path, column.file_name);
+            col = nullable->getNestedColumnPtr();
+        }
+    if (column.convert != CHTE_CONVERT_NONE)
+    {
+        auto mutable_col = IColumn::mutate(std::move(col));
+        IColumn * values = mutable_col.get();
+        if (auto * nullable = typeid_cast<ColumnNullable *>(values))
+            values = &nullable->getNestedColumn();
+        if (column.convert == CHTE_CONVERT_DATE)
+            for (auto & v : assert_cast<ColumnInt32 &>(*values).getData())
+                v -= PG_EPOCH_DAYS;
+        else
+            for (auto & v : assert_cast<ColumnDecimal<DateTime64> &>(*values).getData())
+                v.value -= PG_EPOCH_MICROSECONDS;
+        col = std::move(mutable_col);
+    }
+    if (column.check_utf8)
+    {
+        const IColumn * values = col.get();
+        if (const auto * nullable = typeid_cast<const ColumnNullable *>(values))
+            values = &nullable->getNestedColumn();
+        const auto & strings = assert_cast<const ColumnString &>(*values);
+        const auto & chars = strings.getChars();
+        const auto & offsets = strings.getOffsets();
+        size_t prev = 0;
+        for (size_t i = 0; i < offsets.size(); ++i)
+        {
+            const UInt8 * data = chars.data() + prev;
+            size_t len = offsets[i] - prev;
+            if (memchr(data, 0, len) || !UTF8::isValidUTF8(data, len))
+                throw Exception(ErrorCodes::UNICODE_ERROR, "file {} holds a value of column \"{}\" that is not valid UTF-8 text",
+                                path, column.file_name);
+            prev = offsets[i];
+        }
+    }
+    return col;
+}
+
+/// What a reader of a file reads through, kept with it
+struct ExternalRead
+{
+    std::shared_ptr<ExternalTable> table;
+    std::shared_ptr<const ResolvedFile> resolved;
+    String path;
+    UInt64 first_row = 0;
+    std::unique_ptr<ReadBufferFromFilePRead> buf;
+    QueryPipeline pipeline;
+    std::unique_ptr<PullingPipelineExecutor> executor;
+    /// per column asked for: the table's column, or SIZE_MAX the row id; and its place in the reader's header
+    std::vector<size_t> columns;
+    std::vector<size_t> positions;
+
+    bool next(Block & block)
+    {
+        Chunk chunk;
+        while (executor->pull(chunk))
+        {
+            checkInterrupted();
+            size_t rows = chunk.getNumRows();
+            if (rows == 0)
+                continue;
+            ColumnsWithTypeAndName out;
+            const auto & in = chunk.getColumns();
+            for (size_t c = 0; c < columns.size(); ++c)
+            {
+                if (columns[c] == SIZE_MAX)
+                {
+                    auto info = chunk.getChunkInfos().get<ChunkInfoRowNumbers>();
+                    if (!info)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "the reader of {} handed rows without their numbers", path);
+                    auto ids = ColumnUInt64::create(rows);
+                    auto & data = ids->getData();
+                    UInt64 base = first_row + info->row_num_offset;
+                    if (info->applied_filter)
+                    {
+                        const auto & filter = *info->applied_filter;
+                        size_t k = 0;
+                        for (size_t i = 0; i < filter.size() && k < rows; ++i)
+                            if (filter[i])
+                                data[k++] = base + i;
+                    }
+                    else
+                        for (size_t i = 0; i < rows; ++i)
+                            data[i] = base + i;
+                    out.emplace_back(std::move(ids), std::make_shared<DataTypeUInt64>(), ROWID);
+                    continue;
+                }
+                const auto & column = table->columns[columns[c]];
+                out.emplace_back(convertColumn(column, in.at(positions[c]), path), column.type, column.name);
+            }
+            block = Block(std::move(out));
+            return true;
+        }
+        return false;
+    }
+};
+
+/// A reader of a listed file's units (none: all of them), or of its rows at offsets; the filter, where given,
+/// for the reader's own pruning
+std::unique_ptr<chte_reader> openExternalReader(chte_table & table, const chte_external_listing & listing, size_t file,
+                                                const chte_filter * filter, const Names & names,
+                                                std::optional<std::vector<size_t>> units,
+                                                std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read)
+{
+    auto & ext = *table.external;
+    const auto & listed = listedFile(listing, file);
+    auto state = std::make_shared<ExternalRead>();
+    state->table = table.external;
+    state->resolved = resolvedFor(ext, listing, listed);
+    state->path = listed.path;
+    state->first_row = listed.first_row;
+
+    Names read;
+    for (const auto & name : names)
+    {
+        if (name == ROWID)
+        {
+            state->columns.push_back(SIZE_MAX);
+            state->positions.push_back(SIZE_MAX);
+            continue;
+        }
+        state->columns.push_back(ext.columnIndex(name));
+        auto at = std::find(read.begin(), read.end(), name);
+        state->positions.push_back(at - read.begin());
+        if (at == read.end())
+            read.push_back(name);
+    }
+    auto header = std::make_shared<const Block>(fileHeader(ext, *state->resolved, read));
+
+    FormatFilterInfoPtr info;
+    if (filter && !filter->nodes.empty())
+        info = formatFilter(*filter, ext, *state->resolved, *header);
+    if (rows_to_read)
+    {
+        if (!info)
+            info = std::make_shared<FormatFilterInfo>();
+        info->rows_to_read = std::move(rows_to_read);
+    }
+
+    state->buf = openListed(listed.path, listed.size, listed.mtime);
+    auto format = std::make_shared<ParquetV3BlockInputFormat>(
+        *state->buf, header, ext.format_settings, singleThreadedResources(ext.context), info,
+        ext.format_settings.parquet.local_read_min_bytes_for_seek);
+    if (units)
+        format->setBucketsToRead(std::make_shared<ParquetFileBucketInfo>(*units));
+    state->pipeline = QueryPipeline(Pipe(format));
+    state->executor = std::make_unique<PullingPipelineExecutor>(state->pipeline);
+
+    auto r = std::make_unique<chte_reader>();
+    r->table = &table;
+    r->present.assign(names.size(), 1);
+    r->next_block = [raw = state.get()](Block & block) { return raw->next(block); };
+    r->external_state = std::move(state);
+    return r;
+}
+
+ExternalTable & externalOf(chte_table * table)
+{
+    if (!table || !table->external)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "not an external table");
+    return *table->external;
+}
+
+/// A file's column statistics, from its footer: the column's chunk in each row group, decoded as the reader
+/// decodes them (Parquet::Reader::getHyperrectangleForRowGroup()) into the type it reads the column as
+void parquetStats(chte_table & table, const ExternalTable & ext, const ListedFile & file, const ResolvedFile & resolved,
+                  const String & name, chte_column_stats * stats)
+{
+    *stats = {};
+    table.scratch.clear();
+    size_t i = ext.columnIndex(name);
+    const auto & column = ext.columns[i];
+    const auto & metadata = *resolved.footer->parquet;
+
+    Block sample = fileHeader(ext, resolved, {name});
+    Parquet::SchemaConverter schemer(metadata, ext.read_options, &sample);
+    schemer.prepareForReading();
+    if (schemer.primitive_columns.size() != 1)
+        return;
+    const auto & primitive = schemer.primitive_columns.front();
+    const IDataType & output_type = *sample.getByPosition(0).type;
+    bool nullable = resolved.nullable[i];
+
+    UInt64 rows = 0;
+    UInt64 nulls = 0;
+    bool counted = true;
+    bool bounded = primitive.decoder.allow_stats;
+    Field min;
+    Field max;
+    for (const auto & row_group : metadata.row_groups)
+    {
+        if (row_group.num_rows <= 0)
+            continue;
+        rows += static_cast<UInt64>(row_group.num_rows);
+        const auto & meta = row_group.columns.at(primitive.column_idx).meta_data;
+        if (!meta.__isset.statistics)
+        {
+            counted = bounded = false;
+            break;
+        }
+        const auto & statistics = meta.statistics;
+        UInt64 group_nulls = 0;
+        if (statistics.__isset.null_count)
+            group_nulls = static_cast<UInt64>(statistics.null_count);
+        else if (nullable)
+            counted = false;
+        nulls += group_nulls;
+        if (group_nulls == static_cast<UInt64>(row_group.num_rows))
+            continue;			/* every value NULL: no bound of its */
+        if (!bounded || !statistics.__isset.min_value || !statistics.__isset.max_value
+            || (statistics.__isset.is_min_value_exact && !statistics.is_min_value_exact)
+            || (statistics.__isset.is_max_value_exact && !statistics.is_max_value_exact))
+        {
+            bounded = false;
+            continue;
+        }
+        Field group_min;
+        Field group_max;
+        primitive.decoder.decodeField(statistics.min_value, /* is_max= */ false, *primitive.decoded_type, output_type, group_min);
+        primitive.decoder.decodeField(statistics.max_value, /* is_max= */ true, *primitive.decoded_type, output_type, group_max);
+        if (group_min.isNull() || group_max.isNull() || accurateLess(group_max, group_min))
+        {
+            bounded = false;
+            continue;
+        }
+        if (min.isNull() || accurateLess(group_min, min))
+            min = group_min;
+        if (max.isNull() || accurateLess(max, group_max))
+            max = group_max;
+    }
+    if (!counted)
+        return;
+    stats->has_stats = 1;
+    stats->has_null_count = 1;
+    stats->rows = rows;
+    stats->null_count = nulls;
+    if (!bounded || min.isNull() || max.isNull())
+        return;
+    auto bound = [&](const Field & value) -> ColumnPtr
+    {
+        auto read = column.read_type->createColumn();
+        read->insert(value);
+        auto as_read = ColumnWithTypeAndName(std::move(read), column.read_type, "");
+        ExternalColumn plain = column;
+        plain.not_null = false;
+        plain.check_utf8 = false;
+        return convertColumn(plain, as_read.column, file.path);
+    };
+    table.scratch.push_back(bound(min));
+    table.scratch.push_back(bound(max));
+    stats->min = vectorOf(*table.scratch[0]);
+    stats->max = vectorOf(*table.scratch[1]);
+    stats->has_minmax = 1;
+}
+
+DataTypePtr readType(const ExternalColumn & column)
+{
+    switch (column.convert)
+    {
+        case CHTE_CONVERT_DATE:
+            return std::make_shared<DataTypeDate32>();
+        case CHTE_CONVERT_TIMESTAMP:
+            return std::make_shared<DataTypeDateTime64>(6, "UTC");
+        default:
+            return column.type;
+    }
+}
+
+}
+
+void keepExternalFilter(chte_filter & filter, const chte_filter_node * nodes, size_t nnodes)
+{
+    const auto & ext = *filter.table->external;
+    for (size_t i = 0; i < nnodes; ++i)
+    {
+        chte_filter_node node = nodes[i];
+        if (node.column)
+        {
+            filter.names.push_back(std::make_shared<std::string>(node.column));
+            node.column = filter.names.back()->c_str();
+        }
+        if (node.nvalues > 0)
+        {
+            /// the values in a column of the caller's type, which the node then points into
+            auto values = ext.column(node.column).type->createColumn();
+            appendVector(*values, node.nvalues, node.values);
+            node.values = vectorOf(*values);
+            filter.values.push_back(std::move(values));
+        }
+        filter.nodes.push_back(node);
+    }
+}
+
+}
+
+extern "C" int chte_external_open(const chte_external_def * def, chte_table ** table, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & e = engine();
+        if (!def || !def->location)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: location is required");
+        if (def->format != CHTE_EXTERNAL_PARQUET)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "external tables of format {} are not supported", def->format);
+        auto ext = std::make_shared<ExternalTable>();
+        ext->format = def->format;
+        ext->name = def->name && *def->name ? def->name : "table";
+        ext->location = def->location;
+        if (ext->location.empty() || ext->location.front() != '/')
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "location {} is not an absolute path", ext->location);
+        ext->context = Context::createCopy(e.global);
+        applySettings(ext->context, def->settings);
+        /// whatever the caller's settings say, nothing starts a thread
+        applySingleThreadedSettings(ext->context);
+        ext->format_settings = getFormatSettings(ext->context);
+        forceFormatSettings(ext->format_settings);
+        ext->read_options = readOptions(ext->format_settings);
+        for (size_t i = 0; i < def->ncolumns; ++i)
+        {
+            const auto & c = def->columns[i];
+            if (!c.name || !c.type)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: column {} has no name or type", i);
+            ExternalColumn column;
+            column.name = c.name;
+            column.file_name = c.file_name && *c.file_name ? c.file_name : c.name;
+            column.type = DataTypeFactory::instance().get(c.type);
+            column.convert = c.convert;
+            column.not_null = c.not_null != 0;
+            column.check_utf8 = c.check_utf8 != 0;
+            column.read_type = readType(column);
+            if ((column.convert == CHTE_CONVERT_DATE && !WhichDataType(column.type).isInt32())
+                || (column.convert == CHTE_CONVERT_TIMESTAMP && !WhichDataType(column.type).isInt64())
+                || (column.check_utf8 && !WhichDataType(column.type).isString()))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: column {} of type {} cannot be converted so",
+                                column.name, column.type->getName());
+            ext->by_name.emplace(column.name, ext->columns.size());
+            ext->columns.push_back(std::move(column));
+        }
+        auto t = std::make_unique<chte_table>();
+        t->context = ext->context;
+        t->external = std::move(ext);
+        *table = t.release();
+    });
+}
+
+extern "C" int chte_external_list(chte_table * table, chte_external_listing ** listing, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = externalOf(table);
+        std::vector<std::tuple<String, UInt64, Int64>> files;
+        for (const auto & path : locationFiles(ext.location))
+        {
+            struct stat st;
+            if (stat(path.c_str(), &st) != 0)
+                throw ErrnoException(ErrorCodes::CANNOT_STAT, "Cannot stat {}", path);
+            auto [size, mtime] = statIdentity(st);
+            files.emplace_back(path, size, mtime);
+        }
+        auto l = std::make_unique<chte_external_listing>();
+        l->table = table->external;
+        listFiles(*l, files);
+        *listing = l.release();
+    });
+}
+
+extern "C" int chte_external_listing_bytes(chte_external_listing * listing, const void ** bytes, size_t * size, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (listing->bytes.empty())
+        {
+            WriteBufferFromOwnString out;
+            writeVarUInt(listing->files.size(), out);
+            for (const auto & file : listing->files)
+            {
+                writeStringBinary(file.path, out);
+                writeVarUInt(file.size, out);
+                writeVarInt(file.mtime, out);
+            }
+            out.finalize();
+            listing->bytes = std::move(out.str());
+        }
+        *bytes = listing->bytes.data();
+        *size = listing->bytes.size();
+    });
+}
+
+extern "C" int chte_external_listing_load(chte_table * table, const void * bytes, size_t size, chte_external_listing ** listing,
+                                          chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        externalOf(table);
+        ReadBufferFromMemory in(static_cast<const char *>(bytes), size);
+        UInt64 n;
+        readVarUInt(n, in);
+        std::vector<std::tuple<String, UInt64, Int64>> files;
+        for (UInt64 i = 0; i < n; ++i)
+        {
+            String path;
+            UInt64 file_size;
+            Int64 mtime;
+            readStringBinary(path, in);
+            readVarUInt(file_size, in);
+            readVarInt(mtime, in);
+            files.emplace_back(std::move(path), file_size, mtime);
+        }
+        auto l = std::make_unique<chte_external_listing>();
+        l->table = table->external;
+        /// each file's footer read, or found kept, for the identity the listing has: one changed since fails
+        listFiles(*l, files);
+        *listing = l.release();
+    });
+}
+
+extern "C" void chte_external_listing_free(chte_external_listing * listing)
+{
+    delete listing;
+}
+
+extern "C" size_t chte_external_files(chte_external_listing * listing)
+{
+    return listing ? listing->files.size() : 0;
+}
+
+extern "C" int chte_external_file_info(chte_external_listing * listing, size_t file, chte_external_file * info, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        const auto & f = listedFile(*listing, file);
+        *info = {};
+        info->path = f.path.c_str();
+        info->size = f.size;
+        info->mtime = f.mtime;
+        info->rows = f.resolved->footer->rows;
+        info->units = static_cast<uint32_t>(f.resolved->footer->unit_rows.size());
+        info->first_row = f.first_row;
+    });
+}
+
+extern "C" int chte_external_schema(chte_table * table, const chte_external_field ** fields, size_t * nfields, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = externalOf(table);
+        ext.schema.clear();
+        ext.schema_types.clear();
+        ext.fields.clear();
+        auto files = locationFiles(ext.location);
+        if (!files.empty())
+        {
+            struct stat st;
+            if (stat(files.front().c_str(), &st) != 0)
+                throw ErrnoException(ErrorCodes::CANNOT_STAT, "Cannot stat {}", files.front());
+            auto [size, mtime] = statIdentity(st);
+            auto footer = parquetFooter(ext, files.front(), size, mtime);
+            Parquet::SchemaConverter schemer(*footer->parquet, ext.read_options, /* sample_block= */ nullptr);
+            ext.schema = schemer.inferSchema();
+        }
+        for (const auto & column : ext.schema)
+            ext.schema_types.push_back(column.type->getName());
+        size_t k = 0;
+        for (const auto & column : ext.schema)
+            ext.fields.push_back({column.name.c_str(), ext.schema_types[k++].c_str()});
+        *fields = ext.fields.data();
+        *nfields = ext.fields.size();
+    });
+}
+
+extern "C" int chte_external_select(chte_table * table, chte_external_listing * listing, size_t file, chte_filter * filter,
+                                    uint32_t begin, uint32_t end, chte_mark_range * ranges, size_t max_ranges, size_t * nranges,
+                                    uint64_t * rows, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = externalOf(table);
+        const auto & f = listedFile(*listing, file);
+        auto resolved = resolvedFor(ext, *listing, f);
+        const auto & unit_rows = resolved->footer->unit_rows;
+        size_t last = end == 0 ? unit_rows.size() : std::min<size_t>(end, unit_rows.size());
+        size_t first = std::min<size_t>(begin, last);
+        const std::vector<uint8_t> * kept = filter && !filter->nodes.empty() ? &keptUnits(*filter, ext, f, *resolved) : nullptr;
+
+        size_t n = 0;
+        uint64_t total = 0;
+        for (size_t u = first; u < last;)
+        {
+            if ((kept && !(*kept)[u]) || unit_rows[u] == 0)
+            {
+                ++u;
+                continue;
+            }
+            size_t run = u;
+            while (run < last && (!kept || (*kept)[run]) && unit_rows[run] > 0)
+                total += unit_rows[run++];
+            if (n < max_ranges)
+                ranges[n] = chte_mark_range{static_cast<uint32_t>(u), static_cast<uint32_t>(run)};
+            ++n;
+            u = run;
+        }
+        *nranges = n;
+        *rows = total;
+    });
+}
+
+extern "C" int chte_external_column_bytes(chte_table * table, chte_external_listing * listing, size_t file, const char * columns,
+                                          uint64_t * compressed, uint64_t * uncompressed, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = externalOf(table);
+        const auto & f = listedFile(*listing, file);
+        auto resolved = resolvedFor(ext, *listing, f);
+        *compressed = 0;
+        *uncompressed = 0;
+        std::set<String> paths;
+        for (const auto & name : columnNames(columns))
+            if (name != ROWID)
+                paths.insert(resolved->names[ext.columnIndex(name)]);
+        for (const auto & row_group : resolved->footer->parquet->row_groups)
+            for (const auto & chunk : row_group.columns)
+            {
+                const auto & path = chunk.meta_data.path_in_schema;
+                if (path.empty() || !paths.contains(path.front()))
+                    continue;
+                *compressed += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_compressed_size, 0));
+                *uncompressed += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_uncompressed_size, 0));
+            }
+    });
+}
+
+extern "C" int chte_external_stats(chte_table * table, chte_external_listing * listing, size_t file, const char * column,
+                                   chte_column_stats * stats, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = externalOf(table);
+        const auto & f = listedFile(*listing, file);
+        parquetStats(*table, ext, f, *resolvedFor(ext, *listing, f), column ? column : "", stats);
+    });
+}
+
+extern "C" int chte_external_read_begin(chte_table * table, chte_external_listing * listing, size_t file, chte_filter * filter,
+                                        const char * columns, const chte_mark_range * ranges, size_t nranges,
+                                        chte_reader ** reader, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        externalOf(table);
+        const auto & f = listedFile(*listing, file);
+        std::optional<std::vector<size_t>> units;
+        if (nranges > 0)
+        {
+            size_t count = f.resolved->footer->unit_rows.size();
+            units.emplace();
+            for (size_t i = 0; i < nranges; ++i)
+            {
+                if (ranges[i].begin >= ranges[i].end || ranges[i].end > count || (i > 0 && ranges[i].begin < ranges[i - 1].end))
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_read_begin: units [{}, {}) are not a range of {} in order",
+                                    ranges[i].begin, ranges[i].end, f.path);
+                for (size_t u = ranges[i].begin; u < ranges[i].end; ++u)
+                    units->push_back(u);
+            }
+        }
+        *reader = openExternalReader(*table, *listing, file, filter, columnNames(columns), std::move(units), nullptr).release();
+    });
+}
+
+extern "C" int chte_external_read_rows(chte_table * table, chte_external_listing * listing, size_t file, const char * columns,
+                                       const uint64_t * offsets, size_t n, chte_reader ** reader, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        externalOf(table);
+        const auto & f = listedFile(*listing, file);
+        auto wanted = std::make_shared<PaddedPODArray<UInt64>>();
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (offsets[i] >= f.resolved->footer->rows || (i > 0 && offsets[i] <= offsets[i - 1]))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_read_rows: row {} is not one of {} in order", offsets[i], f.path);
+            wanted->push_back(offsets[i]);
+        }
+        *reader = openExternalReader(*table, *listing, file, nullptr, columnNames(columns), std::nullopt, std::move(wanted)).release();
+    });
+}
+
+namespace
+{
+
+/// The output formats the writer may name, registered as it first needs them
+void registerOutputFormats()
+{
+    static bool done = false;
+    if (done)
+        return;
+    registerOutputFormatParquet(FormatFactory::instance());
+    done = true;
+}
+
+}
+
+extern "C" int chte_file_write_begin(const char * format, const char * path, const chte_file_column * columns, size_t ncolumns,
+                                     const char * settings, chte_file_writer ** writer, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & e = engine();
+        if (!format || !path || *path != '/')
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_file_write_begin: a format and an absolute path are required");
+        String name = format;
+        if (name != "Parquet")
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "files of format {} are not written", name);
+        registerOutputFormats();
+        auto w = std::make_unique<chte_file_writer>();
+        w->path = path;
+        w->temp_path = fmt::format("{}.tmp{}", path, getpid());
+        w->context = Context::createCopy(e.global);
+        applySettings(w->context, settings);
+        applySingleThreadedSettings(w->context);
+        auto format_settings = getFormatSettings(w->context);
+        forceFormatSettings(format_settings);
+        for (size_t i = 0; i < ncolumns; ++i)
+        {
+            const auto & c = columns[i];
+            if (!c.name || !c.type || !c.source)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_file_write_begin: column {} has no name, type or source", i);
+            auto type = DataTypeFactory::instance().get(c.type);
+            w->types.push_back(type);
+            w->sources.push_back(makeNullable(DataTypeFactory::instance().get(c.source)));
+            w->converts.push_back(c.convert);
+            w->header.insert({type->createColumn(), type, c.name});
+        }
+        w->out = std::make_unique<WriteBufferFromFile>(w->temp_path);
+        w->format = FormatFactory::instance().getOutputFormat(name, *w->out, w->header, w->context, format_settings);
+        *writer = w.release();
+    });
+}
+
+extern "C" int chte_file_write_batch(chte_file_writer * writer, uint32_t nrows, const chte_vector * columns, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (writer->finished)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_file_write_batch: the file is finished");
+        ColumnsWithTypeAndName out;
+        for (size_t c = 0; c < writer->types.size(); ++c)
+        {
+            auto source = writer->sources[c]->createColumn();
+            appendVector(*source, nrows, columns[c]);
+            ColumnWithTypeAndName value{std::move(source), writer->sources[c], ""};
+            if (writer->converts[c] == CHTE_CONVERT_DATE)
+            {
+                auto days = castColumn(value, makeNullable(std::make_shared<DataTypeInt32>()));
+                auto mutable_days = IColumn::mutate(std::move(days));
+                for (auto & v : assert_cast<ColumnInt32 &>(assert_cast<ColumnNullable &>(*mutable_days).getNestedColumn()).getData())
+                    v += PG_EPOCH_DAYS;
+                value = {std::move(mutable_days), makeNullable(std::make_shared<DataTypeDate32>()), ""};
+            }
+            else if (writer->converts[c] == CHTE_CONVERT_TIMESTAMP)
+            {
+                auto micros = castColumn(value, makeNullable(std::make_shared<DataTypeInt64>()));
+                const auto & nullable = assert_cast<const ColumnNullable &>(*micros);
+                auto timestamps = ColumnDecimal<DateTime64>::create(0, 6);
+                for (auto v : assert_cast<const ColumnInt64 &>(nullable.getNestedColumn()).getData())
+                    timestamps->insertValue(DateTime64(v + PG_EPOCH_MICROSECONDS));
+                value = {ColumnNullable::create(std::move(timestamps), nullable.getNullMapColumnPtr()),
+                         makeNullable(std::make_shared<DataTypeDateTime64>(6, "UTC")), ""};
+            }
+            out.push_back({castColumn(value, writer->types[c]), writer->types[c], writer->header.getByPosition(c).name});
+        }
+        writer->format->write(Block(std::move(out)));
+    });
+}
+
+extern "C" int chte_file_write_finish(chte_file_writer * writer, uint64_t * bytes, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (writer->finished)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_file_write_finish: the file is finished");
+        writer->format->finalize();
+        writer->out->finalize();
+        writer->out->sync();
+        writer->format.reset();
+        writer->out.reset();
+        fs::rename(writer->temp_path, writer->path);
+        writer->finished = true;
+        *bytes = fs::file_size(writer->path);
+    });
+}
+
+extern "C" void chte_file_write_close(chte_file_writer * writer)
+{
+    if (!writer)
+        return;
+    try
+    {
+        if (writer->format)
+            writer->format->cancel();
+    }
+    catch (...)
+    {
+    }
+    try
+    {
+        writer->format.reset();
+        if (writer->out)
+        {
+            writer->out->cancel();
+            writer->out.reset();
+        }
+        if (!writer->finished)
+        {
+            std::error_code ec;
+            fs::remove(writer->temp_path, ec);
+        }
+    }
+    catch (...)
+    {
+    }
+    delete writer;
+}

@@ -580,6 +580,8 @@ std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData:
 
 bool chte_reader::pull(Block & block)
 {
+    if (next_block)
+        return next_block(block);
     for (;;)
     {
         if (executor && executor->pull(block))

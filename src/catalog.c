@@ -235,7 +235,7 @@ parts_visible(const ChStorageId *id, Snapshot snapshot, bool keep_toasted)
 	{
 		Datum		values[Natts_parts];
 		bool		nulls[Natts_parts];
-		ChPart	   *p = palloc(sizeof(ChPart));
+		ChPart	   *p = palloc0(sizeof(ChPart));
 
 		heap_deform_tuple(tuple, RelationGetDescr(catalog), values, nulls);
 		p->xmin = HeapTupleHeaderGetXmin(tuple->t_data);

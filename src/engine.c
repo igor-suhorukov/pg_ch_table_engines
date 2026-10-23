@@ -65,6 +65,14 @@ static char mapped_path[MAXPGPATH];
 #define CH_QUERY_WAS_CANCELLED			394
 #define CH_INVALID_SETTING_VALUE		471
 #define CH_DATA_TYPE_CANNOT_BE_USED_IN_KEY 549
+#define CH_THERE_IS_NO_COLUMN			8
+#define CH_CANNOT_OPEN_FILE				76
+#define CH_FILE_DOESNT_EXIST			107
+#define CH_CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN 349
+#define CH_CANNOT_STAT					400
+#define CH_CANNOT_FSTAT					531
+#define CH_UNICODE_ERROR				760
+#define CH_FILE_CHANGED_DURING_READ		1015
 
 /*
  * Polled by ClickHouse's code between blocks.  Only the interrupts that end a
@@ -282,6 +290,28 @@ ch_engine(void)
 	*(void **) &engine.summary_column_bytes = dlsym(handle, "chte_summary_column_bytes");
 	*(void **) &engine.summary_stats = dlsym(handle, "chte_summary_stats");
 	*(void **) &engine.filter_summary_select = dlsym(handle, "chte_filter_summary_select");
+
+	/*
+	 * CH7's, optional: a library built before them lacks them, and the
+	 * external access methods refuse their tables (external.c)
+	 */
+	*(void **) &engine.external_open = dlsym(handle, "chte_external_open");
+	*(void **) &engine.external_schema = dlsym(handle, "chte_external_schema");
+	*(void **) &engine.external_list = dlsym(handle, "chte_external_list");
+	*(void **) &engine.external_listing_bytes = dlsym(handle, "chte_external_listing_bytes");
+	*(void **) &engine.external_listing_load = dlsym(handle, "chte_external_listing_load");
+	*(void **) &engine.external_listing_free = dlsym(handle, "chte_external_listing_free");
+	*(void **) &engine.external_files = dlsym(handle, "chte_external_files");
+	*(void **) &engine.external_file_info = dlsym(handle, "chte_external_file_info");
+	*(void **) &engine.external_select = dlsym(handle, "chte_external_select");
+	*(void **) &engine.external_column_bytes = dlsym(handle, "chte_external_column_bytes");
+	*(void **) &engine.external_stats = dlsym(handle, "chte_external_stats");
+	*(void **) &engine.external_read_begin = dlsym(handle, "chte_external_read_begin");
+	*(void **) &engine.external_read_rows = dlsym(handle, "chte_external_read_rows");
+	*(void **) &engine.file_write_begin = dlsym(handle, "chte_file_write_begin");
+	*(void **) &engine.file_write_batch = dlsym(handle, "chte_file_write_batch");
+	*(void **) &engine.file_write_finish = dlsym(handle, "chte_file_write_finish");
+	*(void **) &engine.file_write_close = dlsym(handle, "chte_file_write_close");
 	if (engine.write_part_summary == NULL || engine.summary_column_bytes == NULL ||
 		engine.summary_stats == NULL || engine.filter_summary_select == NULL)
 	{
@@ -368,15 +398,35 @@ ch_engine_raise(const chte_error *err, const char *what)
 		case CH_CANNOT_PARSE_TEXT:
 			sqlstate = ERRCODE_SYNTAX_ERROR;
 			break;
+		case CH_TYPE_MISMATCH:
+			sqlstate = ERRCODE_DATATYPE_MISMATCH;
+			break;
 		case CH_NO_SUCH_COLUMN_IN_TABLE:
 		case CH_UNKNOWN_IDENTIFIER:
+		case CH_THERE_IS_NO_COLUMN:
 			sqlstate = ERRCODE_UNDEFINED_COLUMN;
+			break;
+		case CH_FILE_DOESNT_EXIST:
+			sqlstate = ERRCODE_UNDEFINED_FILE;
+			break;
+		case CH_CANNOT_OPEN_FILE:
+		case CH_CANNOT_STAT:
+		case CH_CANNOT_FSTAT:
+			sqlstate = ERRCODE_IO_ERROR;
+			break;
+		case CH_FILE_CHANGED_DURING_READ:
+			sqlstate = ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE;
+			break;
+		case CH_CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN:
+			sqlstate = ERRCODE_NOT_NULL_VIOLATION;
+			break;
+		case CH_UNICODE_ERROR:
+			sqlstate = ERRCODE_CHARACTER_NOT_IN_REPERTOIRE;
 			break;
 		case CH_BAD_ARGUMENTS:
 		case CH_ILLEGAL_TYPE_OF_ARGUMENT:
 		case CH_ILLEGAL_COLUMN:
 		case CH_UNKNOWN_TYPE:
-		case CH_TYPE_MISMATCH:
 		case CH_UNKNOWN_STORAGE:
 		case CH_INCORRECT_QUERY:
 		case CH_UNKNOWN_SETTING:
@@ -437,6 +487,14 @@ scan_release(Datum res)
 	ch_scan_forget(DatumGetPointer(res));
 }
 
+/* a file the tests' writer did not finish: removed */
+static void
+file_writer_release(Datum res)
+{
+	if (loaded)
+		engine.file_write_close((chte_file_writer *) DatumGetPointer(res));
+}
+
 static const ResourceOwnerDesc handle_descs[] = {
 	[CH_HANDLE_READER] = {
 		.name = "ch_table_engines reader",
@@ -467,6 +525,12 @@ static const ResourceOwnerDesc handle_descs[] = {
 		.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
 		.release_priority = RELEASE_PRIO_FIRST,
 		.ReleaseResource = scan_release,
+	},
+	[CH_HANDLE_FILE_WRITER] = {
+		.name = "ch_table_engines file writer",
+		.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+		.release_priority = RELEASE_PRIO_FIRST,
+		.ReleaseResource = file_writer_release,
 	},
 };
 

@@ -102,6 +102,51 @@ registering only the functions the filters use (`ch.engine_functions`), the
 others at the first write, merge or rewrite, or a table whose definition
 names them.  `ch.engine_info()` counts a process's threads and functions.
 
+## Tables of files
+
+`parquet` reads Parquet files PostgreSQL does not own, through ClickHouse's
+own Parquet reader, and never writes them:
+
+```sql
+CREATE TABLE trips (id bigint NOT NULL, fare numeric(10, 2), pickup timestamptz, zone text)
+    USING parquet WITH (location = '/data/trips/*.parquet');
+SELECT ch.external_columns('parquet', '/data/trips/2026-01.parquet');  -- a column list to start from
+```
+
+`location` is an absolute path -- a file, a glob (`*`, `?`, `{a,b}`,
+`{1..9}`, `**`) or a directory, whose files and subdirectories' files are read
+but those named `_...` or `.…` -- set only by a role with the privileges of
+`pg_read_server_files`, and changed at any time by `ALTER TABLE ... SET
+(location = ...)`; `settings` takes ClickHouse's settings of the format.  The
+table's columns are the user's: each one a column of the files of the same
+name -- regardless of case where one alone matches -- of a type that takes
+its values exactly: `bool`, the integers (a narrower file integer widened),
+`real`, `double precision`, `numeric(p, s)`, `date`, `timestamp`,
+`timestamptz`, `text`, `varchar`, `json`, `bytea`, `uuid`.  Every file is
+checked as each statement lists them, and at CREATE and ALTER TABLE; a column
+NOT NULL refuses a NULL as it is read, and a text column a value that is not
+UTF-8.  A statement reads the files as they are listed for it, a parallel
+scan's workers the leader's listing; the rows are not under PostgreSQL's MVCC.
+
+ChScan and vexec's source read them as they read the engines' tables: the
+row groups whose statistics rule a filter out are not read (`EXPLAIN
+ANALYZE` counts them), nor the pages their page index rules out, and vexec's
+aggregates of a whole file come from its statistics.  A row's TID is its
+file's first row's id and its place there.  INSERT, UPDATE, DELETE, row locks,
+indexes and TABLESAMPLE are refused, and so are partitions of these tables.
+
+pg_dump leaves their rows out: `COPY t TO ...`, the table form, returns none,
+saying so, and `COPY (SELECT * FROM t) TO ...` reads them; a restored table
+reads its location again.  `pg_dump --inserts` holds the rows, and its restore
+fails at the refused insert.  TRUNCATE leaves the files as they are.
+`ch.external_files(rel)` lists the files a statement reads, and
+`ch.write_file(format, path, query, columns, settings)` writes a query's rows
+to a file by ClickHouse's own writer, as the tests make theirs (a role with
+`pg_write_server_files`'s privileges).
+
+The engine library is built with ClickHouse's Parquet and Arrow IPC formats,
+Avro and their libraries (`engine/submodules.txt`).
+
 ## On the Cloudberry port
 
 The same library runs on [the port of Apache Cloudberry to PostgreSQL

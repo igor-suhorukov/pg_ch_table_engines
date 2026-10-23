@@ -221,6 +221,7 @@ flush(ChBuffer *b)
 
 			CH_CALL("writing a part", eng->write_part(writer, i, &info, CH_ERR));
 			tmp_dir = psprintf("tmp_insert_%s", info.name);
+			memset(&part, 0, sizeof(part));
 			part.name = info.name;
 			part.rows = info.rows;
 			part.bytes = info.bytes_on_disk;

@@ -1,6 +1,10 @@
 # The submodules of ClickHouse v26.8.8.8-lts the engine library needs (ch_table_engines.md §2.2):
 # what dbms, the functions and the aggregate functions link unconditionally, the C++ runtime
-# (llvm-project), sysroot (checked at configure) and libfiu.
+# (llvm-project), sysroot (checked at configure) and libfiu; and CH7's (§2.17): Parquet's and
+# Arrow IPC's -- _arrow and _parquet, with the libraries they link: OpenSSL, which Parquet's
+# encryption takes, crc32c, which snappy brings, and libhdfs3's header, which Arrow's HDFS client
+# includes (it loads libhdfs at run time; libhdfs3 itself is not built) -- and Avro, Iceberg's
+# manifests' format.
 # Start minimal; add a line when configure or link names a missing ch_contrib:: target.
 contrib/sysroot
 contrib/llvm-project
@@ -30,3 +34,15 @@ contrib/clickstack
 contrib/wyhash
 contrib/morton-nd
 contrib/libfiu
+contrib/arrow
+contrib/thrift
+contrib/xsimd
+contrib/snappy
+contrib/crc32c
+contrib/brotli
+contrib/bzip2
+contrib/rapidjson
+contrib/flatbuffers
+contrib/libhdfs3
+contrib/openssl
+contrib/avro

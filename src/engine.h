@@ -79,6 +79,31 @@ typedef struct ChEngine
 	int			(*summary_stats) (chte_table *, const char *, const void *, size_t, const char *,
 								  chte_column_stats *, int *, chte_error *);
 	int			(*filter_summary_select) (chte_filter *, const char *, const void *, size_t, int *, chte_error *);
+	/* optional (CH7): external tables, and the tests' writer of their files */
+	int			(*external_open) (const chte_external_def *, chte_table **, chte_error *);
+	int			(*external_schema) (chte_table *, const chte_external_field **, size_t *, chte_error *);
+	int			(*external_list) (chte_table *, chte_external_listing **, chte_error *);
+	int			(*external_listing_bytes) (chte_external_listing *, const void **, size_t *, chte_error *);
+	int			(*external_listing_load) (chte_table *, const void *, size_t, chte_external_listing **,
+										  chte_error *);
+	void		(*external_listing_free) (chte_external_listing *);
+	size_t		(*external_files) (chte_external_listing *);
+	int			(*external_file_info) (chte_external_listing *, size_t, chte_external_file *, chte_error *);
+	int			(*external_select) (chte_table *, chte_external_listing *, size_t, chte_filter *, uint32_t,
+									uint32_t, chte_mark_range *, size_t, size_t *, uint64_t *, chte_error *);
+	int			(*external_column_bytes) (chte_table *, chte_external_listing *, size_t, const char *, uint64_t *,
+										  uint64_t *, chte_error *);
+	int			(*external_stats) (chte_table *, chte_external_listing *, size_t, const char *, chte_column_stats *,
+								   chte_error *);
+	int			(*external_read_begin) (chte_table *, chte_external_listing *, size_t, chte_filter *, const char *,
+										const chte_mark_range *, size_t, chte_reader **, chte_error *);
+	int			(*external_read_rows) (chte_table *, chte_external_listing *, size_t, const char *, const uint64_t *,
+									   size_t, chte_reader **, chte_error *);
+	int			(*file_write_begin) (const char *, const char *, const chte_file_column *, size_t, const char *,
+									 chte_file_writer **, chte_error *);
+	int			(*file_write_batch) (chte_file_writer *, uint32_t, const chte_vector *, chte_error *);
+	int			(*file_write_finish) (chte_file_writer *, uint64_t *, chte_error *);
+	void		(*file_write_close) (chte_file_writer *);
 } ChEngine;
 
 /* GUCs */
@@ -109,7 +134,8 @@ typedef enum ChHandleKind
 	CH_HANDLE_WRITER,
 	CH_HANDLE_FILTER,
 	CH_HANDLE_BATCH,
-	CH_HANDLE_SCAN				/* a running scan's place among them (scan.c) */
+	CH_HANDLE_SCAN,				/* a running scan's place among them (scan.c) */
+	CH_HANDLE_FILE_WRITER		/* a file the tests' writer has not finished (external.c) */
 } ChHandleKind;
 extern ResourceOwner ch_handle_reserve(void);
 extern void ch_handle_opened(ResourceOwner owner, ChHandleKind kind, void *ptr);

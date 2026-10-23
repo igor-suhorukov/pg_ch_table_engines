@@ -285,7 +285,7 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 	int			n = 0;
 	uint32		flags = spec->size >= offsetof(VexecSourceSpec, flags) + sizeof(spec->flags) ? spec->flags : 0;
 
-	if (!ch_is_engine_rel(rel, NULL))
+	if (!ch_is_scan_rel(rel))
 		elog(ERROR, "the batch source of the ClickHouse engines was given a scan of \"%s\"",
 			 RelationGetRelationName(rel));
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "ch batch source", ALLOCSET_DEFAULT_SIZES);
@@ -1373,22 +1373,29 @@ sink_end(void *state)
 
 /* ---- registration ---- */
 
-static VexecSourceRoutine sources[CH_ENGINE_COUNT];
+static VexecSourceRoutine sources[CH_ENGINE_COUNT + CH_EXTERNAL_COUNT];
 static VexecSinkRoutine sinks[CH_ENGINE_COUNT];
 
+/*
+ * The engines' sources and sinks, and the external access methods' sources
+ * (§2.17), whose tables' scans are scan.c's too; nothing writes those
+ */
 void
 ch_vexec_register(void)
 {
-	for (int k = 0; k < CH_ENGINE_COUNT; k++)
+	for (int k = 0; k < CH_ENGINE_COUNT + CH_EXTERNAL_COUNT; k++)
 	{
 		VexecSourceRoutine *r = &sources[k];
-		VexecSinkRoutine *s = &sinks[k];
+		VexecSinkRoutine *s;
+		bool		external = k >= CH_ENGINE_COUNT;
 
 		memset(r, 0, sizeof(VexecSourceRoutine));
 		r->size = sizeof(VexecSourceRoutine);
 		r->minor = VEXEC_SOURCE_MINOR;
-		r->am = ch_am_routine((ChEngineKind) k);
-		r->name = ch_engine_name((ChEngineKind) k);
+		r->am = external ? ch_external_routine((ChExternalKind) (k - CH_ENGINE_COUNT)) :
+			ch_am_routine((ChEngineKind) k);
+		r->name = external ? ch_external_name((ChExternalKind) (k - CH_ENGINE_COUNT)) :
+			ch_engine_name((ChEngineKind) k);
 		r->supports = src_supports;
 		r->begin = src_begin;
 		r->next = src_next;
@@ -1406,7 +1413,10 @@ ch_vexec_register(void)
 		r->next_rest = src_next_rest;
 		r->set_join_keys = src_set_join_keys;
 		vexec_register_source(r);
+		if (external)
+			continue;
 
+		s = &sinks[k];
 		memset(s, 0, sizeof(VexecSinkRoutine));
 		s->size = sizeof(VexecSinkRoutine);
 		s->minor = VEXEC_SINK_MINOR;

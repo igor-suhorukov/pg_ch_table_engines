@@ -46,18 +46,6 @@ namespace DB::ErrorCodes
 
 using namespace chte;
 
-struct chte_filter
-{
-    chte_table * table = nullptr;
-    ActionsDAG dag;
-    const ActionsDAG::Node * predicate = nullptr;
-    std::optional<KeyCondition> key_condition;
-    /// the filter over the columns it names that have statistics, in this order
-    NamesAndTypesList stats_columns;
-    std::optional<KeyCondition> stats_condition;
-    /// each part's granules the filter keeps, worked out once
-    std::map<String, MarkRanges> selected;
-};
 
 namespace
 {
@@ -85,8 +73,9 @@ const char * functionName(int op)
 class FilterBuilder
 {
 public:
-    FilterBuilder(chte_filter & filter_, const chte_filter_node * nodes_, size_t nnodes_)
-        : filter(filter_), nodes(nodes_), nnodes(nnodes_), context(filter_.table->context)
+    FilterBuilder(ActionsDAG & dag_, const chte_filter_node * nodes_, size_t nnodes_, ContextPtr context_,
+                  const FilterColumns & columns_)
+        : dag(dag_), nodes(nodes_), nnodes(nnodes_), context(std::move(context_)), columns(columns_)
     {
     }
 
@@ -106,7 +95,6 @@ private:
         if (depth > 256)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "a filter's tree is too deep");
         const chte_filter_node & node = nodes[next++];
-        auto & dag = filter.dag;
 
         switch (node.op)
         {
@@ -163,32 +151,54 @@ private:
         auto it = inputs.find(name);
         if (it != inputs.end())
             return *it->second;
-        const auto & columns = filter.table->metadata->getColumns();
-        if (!columns.hasPhysical(name))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "a filter names {}, which is not a column", name);
-        const auto & node = filter.dag.addInput(name, columns.getPhysical(name).type);
+        auto column = columns.input(name);
+        const auto & node = dag.addInput(column.name, column.type);
         inputs.emplace(name, &node);
         return node;
     }
 
-    /// value i of a leaf, a constant of its column's type without Nullable and LowCardinality
+    /// value i of a leaf, a constant of its input's type without Nullable and LowCardinality
     const ActionsDAG::Node & constant(const chte_filter_node & node, uint32_t i)
     {
-        const auto & columns = filter.table->metadata->getColumns();
-        DataTypePtr type = removeLowCardinalityAndNullable(columns.getPhysical(node.column).type);
-        auto column = type->createColumn();
-        appendValue(*column, node.values, i);
-        auto value = ColumnConst::create(std::move(column), 1);
-        return filter.dag.addColumn(std::move(value), type, fmt::format("__chte_value_{}", nconstants++));
+        auto value = columns.constant(node.column, node.values, i);
+        return dag.addColumn(ColumnConst::create(std::move(value.column), 1), value.type,
+                             fmt::format("__chte_value_{}", nconstants++));
     }
 
-    chte_filter & filter;
+    ActionsDAG & dag;
     const chte_filter_node * nodes;
     size_t nnodes;
     ContextPtr context;
+    const FilterColumns & columns;
     size_t next = 0;
     size_t nconstants = 0;
     std::map<String, const ActionsDAG::Node *> inputs;
+};
+
+/// An engine's table's columns, by their names and types in its metadata
+class TableColumns final : public FilterColumns
+{
+public:
+    explicit TableColumns(const chte_table & table_) : table(table_) { }
+
+    NameAndTypePair input(const String & name) const override
+    {
+        const auto & columns = table.metadata->getColumns();
+        if (!columns.hasPhysical(name))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "a filter names {}, which is not a column", name);
+        return columns.getPhysical(name);
+    }
+
+    ColumnWithTypeAndName constant(const String & name, const chte_vector & values, uint32_t i) const override
+    {
+        DataTypePtr type = removeLowCardinalityAndNullable(table.metadata->getColumns().getPhysical(name).type);
+        auto column = type->createColumn();
+        appendValue(*column, values, i);
+        return {std::move(column), type, ""};
+    }
+
+private:
+    const chte_table & table;
 };
 
 /// The boxes of a column's rows in a part, by its statistics: its values, its NULLs.
@@ -344,6 +354,12 @@ enum : UInt8
 namespace chte
 {
 
+const ActionsDAG::Node & buildFilter(ActionsDAG & dag, const chte_filter_node * nodes, size_t nnodes, ContextPtr context,
+                                     const FilterColumns & columns)
+{
+    return FilterBuilder(dag, nodes, nnodes, std::move(context), columns).build();
+}
+
 String summarizePart(const IMergeTreeDataPart & part)
 {
     Names names = part.getColumns().getNames();
@@ -468,7 +484,14 @@ extern "C" int chte_filter_create(chte_table * table, const chte_filter_node * n
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "a filter needs a node");
         auto f = std::make_unique<chte_filter>();
         f->table = table;
-        f->predicate = &FilterBuilder(*f, nodes, nnodes).build();
+        if (table->external)
+        {
+            /// an external table's: each file's DAG is built over its names and types, as it is read (external.cpp)
+            keepExternalFilter(*f, nodes, nnodes);
+            *filter = f.release();
+            return;
+        }
+        f->predicate = &FilterBuilder(f->dag, nodes, nnodes, table->context, TableColumns(*table)).build();
         f->dag.getOutputs() = {f->predicate};
         auto context = table->context;
         if (table->metadata->hasPrimaryKey())

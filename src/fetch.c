@@ -615,6 +615,13 @@ ch_fetch_price(Relation rel, int ncols)
 {
 	ChOptions	opts;
 
+	/*
+	 * an external table's row is read from its file's page of each column: a
+	 * Parquet page, a record batch -- some 128K values, as their writers make
+	 * them (§2.17), where a granule is index_granularity's
+	 */
+	if (ch_is_external_rel(rel, NULL))
+		return ch_fetch_cost + 131072.0 * ncols * ch_fetch_value_cost;
 	ch_relation_options(rel, &opts);
 	return ch_fetch_cost + (double) opts.index_granularity * ncols * ch_fetch_value_cost;
 }

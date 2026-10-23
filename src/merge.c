@@ -188,6 +188,7 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 		CH_CALL("merging parts", eng->merge(t->handle, names, ninputs, version, &writer, CH_ERR));
 		ch_handle_opened(owner, CH_HANDLE_WRITER, writer);
 		CH_CALL("merging parts", eng->write_part(writer, 0, &info, CH_ERR));
+		memset(&next, 0, sizeof(next));
 		next.name = pstrdup(info.name);
 		next.rows = (int64) info.rows;
 		next.bytes = (int64) info.bytes_on_disk;

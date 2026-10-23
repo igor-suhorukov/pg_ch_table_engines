@@ -796,7 +796,8 @@ part_stats(ChTable *t, const ChPart *part, AttrNumber attnum, chte_column_stats 
 	{
 		if (t->options.storage == CH_STORAGE_PAGES)
 			ch_pages_attach(t, part);
-		CH_CALL("reading a part's statistics", eng->part_stats(t->handle, part->name, name, st, CH_ERR));
+		/* a part's, or an external table's file's (§2.17) */
+		ch_unit_stats(t, part, name, st);
 	}
 	return st->has_stats && st->has_null_count;
 }

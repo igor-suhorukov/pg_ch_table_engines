@@ -95,6 +95,9 @@ typedef struct ChParallelScan
 {
 	ParallelTableScanDescData base;
 	pg_atomic_uint32 next_unit;
+	/* an external table's (§2.17): the leader's listing of its files, which every participant reads */
+	uint32		listing_size;
+	char		listing[FLEXIBLE_ARRAY_MEMBER];
 } ChParallelScan;
 
 typedef struct ChScanDescData
@@ -180,6 +183,7 @@ typedef struct ChScanDescData
 	MemoryContext scan_cxt;		/* the scan's: where scan_begin ran */
 	ChTable    *private_table;	/* where the slots' descriptor is not the relation's */
 	ChTable    *pinned;			/* the cached table, pinned while the scan runs */
+	ChListing  *listing;		/* an external table's files, pinned while the scan runs (§2.17) */
 } ChScanDescData;
 
 typedef ChScanDescData *ChScanDesc;
@@ -464,7 +468,8 @@ summary_rules_out(ChScanDesc scan)
 	bytea	   *summary = NULL;
 	int			verdict;
 
-	if (scan->filter == NULL || !ch_enable_summary_pruning || eng->filter_summary_select == NULL)
+	if (scan->filter == NULL || !ch_enable_summary_pruning || eng->filter_summary_select == NULL ||
+		scan->part->listing != NULL)
 		return false;
 	if (ch_enable_part_summaries)
 		summary = ch_part_summary(scan->part);
@@ -478,8 +483,6 @@ summary_rules_out(ChScanDesc scan)
 static void
 select_unit(ChScanDesc scan)
 {
-	const ChEngine *eng = ch_engine();
-
 	if (scan->selected)
 		return;
 	if (scan->filter == NULL && scan->unit_whole)
@@ -509,9 +512,8 @@ select_unit(ChScanDesc scan)
 	{
 		size_t		n;
 
-		CH_CALL("analyzing a part",
-				eng->part_select(scan->table->handle, scan->part->name, scan->filter, scan->unit_begin,
-								 scan->unit_end, scan->ranges, scan->ranges_cap, &n, &scan->unit_rows, CH_ERR));
+		(void) ch_unit_select(scan->table, scan->part, scan->filter, scan->unit_begin, scan->unit_end,
+							  scan->ranges, scan->ranges_cap, &n, &scan->unit_rows);
 		if (n <= scan->ranges_cap)
 		{
 			scan->nranges = n;
@@ -541,10 +543,7 @@ select_unit(ChScanDesc scan)
 		size_t		n;
 		uint64		rows;
 
-		CH_CALL("analyzing a part",
-				eng->part_select(scan->table->handle, scan->part->name, scan->filter, 0, 0,
-								 NULL, 0, &n, &rows, CH_ERR));
-		if (n == 0)
+		if (!ch_unit_select(scan->table, scan->part, scan->filter, 0, 0, NULL, 0, &n, &rows))
 			scan->counts.parts_pruned++;
 	}
 	scan->selected = true;
@@ -592,7 +591,13 @@ begin_reader(ChScanDesc scan)
 	if (scan->table->options.storage == CH_STORAGE_PAGES)
 		ch_pages_attach(scan->table, scan->part);
 	scan->reader_owner = ch_handle_reserve();
-	if (scan->nsteps > 0)
+	if (scan->part->listing)
+		/* an external table's file, its units; the filter the reader's own pruning's too */
+		CH_CALL("reading a file",
+				eng->external_read_begin(scan->table->handle, scan->part->listing->handle, (size_t) scan->part->file,
+										 scan->filter, columns, scan->nranges > 0 ? scan->ranges : NULL,
+										 scan->nranges, &scan->reader, CH_ERR));
+	else if (scan->nsteps > 0)
 	{
 		/* VC2: each column's step, the row id the reader adds in the first */
 		uint8	   *steps = palloc0(scan->ncols + 1);
@@ -624,6 +629,13 @@ begin_reader(ChScanDesc scan)
 	}
 }
 
+/* What a scan's reader reads, for its errors: a part, or an external table's file (§2.17) */
+static const char *
+reading(ChScanDesc scan)
+{
+	return scan->part && scan->part->listing ? "reading a file" : "reading a part";
+}
+
 /* Column c of the reader's current batch: its vector, or its dictionary where kept */
 static void
 read_column(ChScanDesc scan, int c)
@@ -632,11 +644,11 @@ read_column(ChScanDesc scan, int c)
 
 	if (c < scan->ncols && scan->keep_dict && scan->keep_dict[c])
 	{
-		CH_CALL("reading a part", eng->read_dictionary(scan->reader, c, &scan->dicts[c], CH_ERR));
+		CH_CALL(reading(scan), eng->read_dictionary(scan->reader, c, &scan->dicts[c], CH_ERR));
 		if (scan->dicts[c].encoded)
 			return;
 	}
-	CH_CALL("reading a part", eng->read_vector(scan->reader, c, &scan->vectors[c], CH_ERR));
+	CH_CALL(reading(scan), eng->read_vector(scan->reader, c, &scan->vectors[c], CH_ERR));
 }
 
 /* The next batch, from this unit or the next; false at the end */
@@ -651,7 +663,7 @@ next_batch(ChScanDesc scan)
 		{
 			uint32		n;
 
-			CH_CALL("reading a part", eng->read_next(scan->reader, &n, CH_ERR));
+			CH_CALL(reading(scan), eng->read_next(scan->reader, &n, CH_ERR));
 			if (n > 0)
 			{
 				int			nvec = scan->rowid_col == scan->ncols ? scan->ncols + 1 : scan->ncols;
@@ -906,23 +918,45 @@ ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	scan->base.rs_flags = flags;
 	scan->base.rs_parallel = pscan;
 
-	/* rows this backend has buffered that the snapshot sees become a part first */
-	if (pscan == NULL || !IsParallelWorker())
-		ch_buffer_flush_for_scan(rel, snapshot);
-
-	scan->table = t = ch_table(rel);
-	ch_table_pin(t);
-	scan->pinned = t;
-	scan->parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &scan->nonvacuumable));
-	setup_units(scan);
-	scan->counts.parts = scan->nparts;
-	load_deletions(scan, snapshot);
-	/* SERIALIZABLE: the relation's predicate lock, and the writers of parts and deletions it cannot see */
-	if (snapshot && IsMVCCSnapshot(snapshot) && CheckForSerializableConflictOutNeeded(rel, snapshot))
+	if (ch_is_external_rel(rel, NULL))
 	{
-		PredicateLockRelation(rel, snapshot);
-		ch_parts_conflict_out(rel, &t->storage, snapshot);
-		ch_tombstones_conflict_out(rel, &t->storage, snapshot);
+		/*
+		 * An external table's files (§2.17): the statement's listing, or a
+		 * parallel scan's leader's, which every participant reads; no row
+		 * of them is PostgreSQL's to delete, and SSI has none to track
+		 */
+		ChParallelScan *ps = (ChParallelScan *) pscan;
+
+		scan->table = t = ch_table(rel);
+		ch_table_pin(t);
+		scan->pinned = t;
+		scan->listing = ps ? ch_external_listing_load(t, ps->listing, ps->listing_size) :
+			ch_external_listing(rel, t);
+		ch_listing_pin(scan->listing);
+		scan->parts = scan->listing->parts;
+		setup_units(scan);
+		scan->counts.parts = scan->nparts;
+	}
+	else
+	{
+		/* rows this backend has buffered that the snapshot sees become a part first */
+		if (pscan == NULL || !IsParallelWorker())
+			ch_buffer_flush_for_scan(rel, snapshot);
+
+		scan->table = t = ch_table(rel);
+		ch_table_pin(t);
+		scan->pinned = t;
+		scan->parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &scan->nonvacuumable));
+		setup_units(scan);
+		scan->counts.parts = scan->nparts;
+		load_deletions(scan, snapshot);
+		/* SERIALIZABLE: the relation's predicate lock, and the writers of parts and deletions it cannot see */
+		if (snapshot && IsMVCCSnapshot(snapshot) && CheckForSerializableConflictOutNeeded(rel, snapshot))
+		{
+			PredicateLockRelation(rel, snapshot);
+			ch_parts_conflict_out(rel, &t->storage, snapshot);
+			ch_tombstones_conflict_out(rel, &t->storage, snapshot);
+		}
 	}
 	scan->batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "ch scan batch", ALLOCSET_DEFAULT_SIZES);
 	setup_all_columns(scan);
@@ -960,6 +994,8 @@ ch_scan_end(TableScanDesc sscan)
 	}
 	if (scan->private_table)
 		ch_table_private_close(scan->private_table);
+	if (scan->listing)
+		ch_listing_unpin(scan->listing);
 	if (scan->pinned)
 		ch_table_unpin(scan->pinned);
 	MemoryContextDelete(scan->batch_cxt);
@@ -1029,21 +1065,62 @@ ch_scan_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot
 	return true;
 }
 
+/* An external table's listing for the running statement, as bytes for a parallel scan's descriptor */
+static void
+listing_bytes(Relation rel, const void **bytes, size_t *size)
+{
+	ChTable    *t = ch_table(rel);
+
+	ch_table_pin(t);
+	PG_TRY();
+	{
+		ChListing  *l = ch_external_listing(rel, t);
+
+		CH_CALL("listing a table's files", ch_engine()->external_listing_bytes(l->handle, bytes, size, CH_ERR));
+	}
+	PG_FINALLY();
+	{
+		ch_table_unpin(t);
+	}
+	PG_END_TRY();
+}
+
+/* A parallel scan's descriptor: an external table's with its listing (§2.17) */
+static Size
+parallel_size(Relation rel, const void **bytes, size_t *size)
+{
+	*bytes = NULL;
+	*size = 0;
+	if (!ch_is_external_rel(rel, NULL))
+		return MAXALIGN(sizeof(ChParallelScan));
+	listing_bytes(rel, bytes, size);
+	return MAXALIGN(add_size(offsetof(ChParallelScan, listing), *size));
+}
+
 Size
 ch_parallelscan_estimate(Relation rel)
 {
-	return sizeof(ChParallelScan);
+	const void *bytes;
+	size_t		size;
+
+	return parallel_size(rel, &bytes, &size);
 }
 
 Size
 ch_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 {
 	ChParallelScan *ps = (ChParallelScan *) pscan;
+	const void *bytes;
+	size_t		size;
+	Size		total = parallel_size(rel, &bytes, &size);
 
 	ps->base.phs_locator = rel->rd_locator;
 	ps->base.phs_syncscan = false;
 	pg_atomic_init_u32(&ps->next_unit, 0);
-	return sizeof(ChParallelScan);
+	ps->listing_size = (uint32) size;
+	if (size > 0)
+		memcpy(ps->listing, bytes, size);
+	return total;
 }
 
 void
@@ -1189,7 +1266,7 @@ ch_scan_set_steps(TableScanDesc sscan, const int *step_of, int nsteps)
 	int			i = 0;
 
 	Assert(scan->part == NULL);
-	if (ch_engine()->read_begin_steps == NULL || nsteps < 2 || scan->all_columns)
+	if (ch_engine()->read_begin_steps == NULL || nsteps < 2 || scan->all_columns || scan->listing != NULL)
 		return false;
 	old = MemoryContextSwitchTo(scan->scan_cxt);
 	scan->col_step = palloc0(Max(scan->ncols, 1));
@@ -1511,8 +1588,13 @@ read_rows_at(Relation rel, ChTable *t, ChPart *part, const uint64 *offsets, int 
 	scan.part = part;
 	scan.rowid_col = scan.asked_rowid;
 	owner = ch_handle_reserve();
-	CH_CALL("reading rows by their TIDs",
-			eng->read_rows(t->handle, part->name, scan.columns, offsets, n, &scan.reader, CH_ERR));
+	if (part->listing)
+		CH_CALL("reading rows by their TIDs",
+				eng->external_read_rows(t->handle, part->listing->handle, (size_t) part->file, scan.columns, offsets,
+										n, &scan.reader, CH_ERR));
+	else
+		CH_CALL("reading rows by their TIDs",
+				eng->read_rows(t->handle, part->name, scan.columns, offsets, n, &scan.reader, CH_ERR));
 	ch_handle_opened(owner, CH_HANDLE_READER, scan.reader);
 	scan.reader_owner = owner;
 	for (int c = 0; c < scan.ncols; c++)
@@ -1686,18 +1768,23 @@ fetch_uncached(Relation rel, ItemPointer tid, uint64 rowid, Snapshot snapshot, T
 	ch_table_pin(t);
 	PG_TRY();
 	{
-		if (row_survives(t, rowid, snapshot))
+		if (t->external || row_survives(t, rowid, snapshot))
 		{
-			parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
+			/* an external table's: the statement's files, a row's id its file's first and its place there */
+			parts = t->external ? ch_external_listing(rel, t)->parts :
+				ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
 			foreach(lc, parts)
 			{
 				ChPart	   *p = lfirst(lc);
 				HeapTuple	row;
 				uint64		id;
+				uint64		offset = rowid - (uint64) p->min_rowid;
 
 				if ((int64) rowid < p->min_rowid || (int64) rowid > p->max_rowid)
 					continue;
-				if (read_rows_by_id(rel, t, p, &rowid, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1)
+				if (p->listing ?
+					read_rows_at(rel, t, p, &offset, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1 :
+					read_rows_by_id(rel, t, p, &rowid, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1)
 				{
 					if (cols->whole)
 						remember_fetch(rel, rowid, slot->tts_tupleDescriptor, row);
@@ -1744,10 +1831,13 @@ ch_fetch_row_columns(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTabl
 
 	if (!tid_rowid(tid, &rowid))
 		return false;
-	if (snapshot && IsMVCCSnapshot(snapshot))
-		PredicateLockRelation(rel, snapshot);
-	if (ch_buffer_fetch(rel, rowid, snapshot, slot))
-		return true;
+	if (!ch_is_external_rel(rel, NULL))
+	{
+		if (snapshot && IsMVCCSnapshot(snapshot))
+			PredicateLockRelation(rel, snapshot);
+		if (ch_buffer_fetch(rel, rowid, snapshot, slot))
+			return true;
+	}
 	t = ch_table(rel);
 	fetch_cols(t, n, attnums, CurrentMemoryContext, &cols);
 	found = fetch_uncached(rel, tid, rowid, snapshot, slot, &cols);
@@ -1762,7 +1852,12 @@ ch_fetch_row_columns(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTabl
 bool
 ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
 {
-	ChFetchCache *cache = ch_fetch_cache_for(rel, slot);
+	ChFetchCache *cache;
+
+	/* an external table's row: its file's, read again, every column (a TID scan's) */
+	if (ch_is_external_rel(rel, NULL))
+		return ch_fetch_row_columns(rel, tid, snapshot, slot, -1, NULL);
+	cache = ch_fetch_cache_for(rel, slot);
 
 	if (cache != NULL)
 		return ch_fetch_row_cached(rel, tid, snapshot, slot, cache);
@@ -2350,6 +2445,22 @@ ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted)
 	SnapshotData nonvacuumable;
 	int			ndead = 0;
 
+	if (t->external)
+	{
+		/* the statement's files, none of whose rows is deleted (§2.17) */
+		ch_table_pin(t);
+		PG_TRY();
+		{
+			*units = list_length(ch_external_listing(rel, t)->parts);
+		}
+		PG_FINALLY();
+		{
+			ch_table_unpin(t);
+		}
+		PG_END_TRY();
+		*deleted = false;
+		return;
+	}
 	ch_table_pin(t);
 	*units = list_length(ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable)));
 	*deleted = true;
@@ -2383,7 +2494,8 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		*raw = 0;
 	/* pinned from the start: the catalog's read may accept an invalidation of the table */
 	ch_table_pin(t);
-	parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
+	parts = t->external ? ch_external_listing(rel, t)->parts :
+		ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
 	if (parts == NIL)
 	{
 		ch_table_unpin(t);
@@ -2417,11 +2529,11 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		int			verdict = CHTE_SELECT_RANGES;
 		int			found = 0;
 
-		if (ch_enable_part_summaries && eng->summary_column_bytes != NULL)
+		if (ch_enable_part_summaries && eng->summary_column_bytes != NULL && p->listing == NULL)
 			summary = ch_part_summary(p);
 		if (filter)
 		{
-			if (ch_enable_summary_pruning && eng->filter_summary_select != NULL)
+			if (ch_enable_summary_pruning && eng->filter_summary_select != NULL && p->listing == NULL)
 				CH_CALL("analyzing a part",
 						eng->filter_summary_select(filter, p->name, summary ? VARDATA_ANY(summary) : NULL,
 												   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
@@ -2433,8 +2545,7 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 
 				if (t->options.storage == CH_STORAGE_PAGES)
 					ch_pages_attach(t, p);
-				CH_CALL("analyzing a part",
-						eng->part_select(t->handle, p->name, filter, 0, 0, NULL, 0, &nranges, &kept, CH_ERR));
+				(void) ch_unit_select(t, p, filter, 0, 0, NULL, 0, &nranges, &kept);
 			}
 		}
 		*rows += kept;
@@ -2451,8 +2562,7 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 			{
 				if (t->options.storage == CH_STORAGE_PAGES)
 					ch_pages_attach(t, p);
-				CH_CALL("sizing a part's columns",
-						eng->part_column_bytes(t->handle, p->name, names.data, &compressed, &uncompressed, CH_ERR));
+				ch_unit_column_bytes(t, p, names.data, &compressed, &uncompressed);
 			}
 			*bytes += (double) compressed * kept / p->rows;
 			if (raw)

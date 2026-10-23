@@ -490,6 +490,153 @@ CHTE_API void		chte_pages_detach(chte_table *table, const char *part_name);
 /* Removes a part's directory (after PostgreSQL no longer needs it). */
 CHTE_API int			chte_drop_part(chte_table *table, const char *part_name, chte_error *error);
 
+/*
+ * External tables (ch_table_engines.md §2.17, CH7): files PostgreSQL does not own, read by
+ * ClickHouse's own readers -- Parquet's v3 reader, its Arrow IPC reader -- and never written.  A
+ * table is its format, its location and its columns: each the caller's name for a column of
+ * the files, the ClickHouse type the caller takes its values as (§2.5's, without Nullable), and
+ * how they are converted to it as they are read, a filter's constants converted back.  Which
+ * files a statement reads is a listing, made as it begins and kept by the caller: its files
+ * numbered from 0, each file's units -- Parquet's row groups, Arrow's record batches -- from 0,
+ * as a part's marks are, and its rows' ids the rows of the files before it and the row's place
+ * in its file.  An external table is a chte_table: chte_filter_create takes it, and
+ * chte_table_close closes it.  The calls are optional: a library built before them lacks them.
+ */
+#define CHTE_EXTERNAL_PARQUET	0
+#define CHTE_EXTERNAL_ARROW		1
+#define CHTE_EXTERNAL_ICEBERG	2
+
+/* How a column's values are converted from the files' */
+#define CHTE_CONVERT_NONE		0	/* the files' values cast to the type, as ClickHouse casts */
+#define CHTE_CONVERT_DATE		1	/* Date, Date32: days from 2000-01-01, Int32 */
+#define CHTE_CONVERT_TIMESTAMP	2	/* DateTime, DateTime64: microseconds from 2000-01-01, Int64 */
+
+typedef struct chte_external_column
+{
+	const char *name;			/* the caller's, which filters and reads name */
+	const char *file_name;		/* the files': matched exactly, else regardless of case where one
+								 * column alone matches so */
+	const char *type;			/* ClickHouse's type the caller takes it as, without Nullable */
+	int32_t		convert;		/* CHTE_CONVERT_* */
+	int32_t		not_null;		/* a NULL read is an error */
+	int32_t		check_utf8;		/* a string that is not UTF-8, or holds a zero byte, is an error */
+} chte_external_column;
+
+typedef struct chte_external_def
+{
+	int32_t		format;			/* CHTE_EXTERNAL_* */
+	const char *name;			/* for messages */
+	const char *location;		/* an absolute path: a file, a glob or a directory */
+	const char *settings;		/* ClickHouse settings, "name = value, ...", or NULL */
+	const chte_external_column *columns;
+	size_t		ncolumns;
+} chte_external_def;
+
+CHTE_API int			chte_external_open(const chte_external_def *def, chte_table **table, chte_error *error);
+
+/*
+ * The files' columns, as ClickHouse's schema inference reads the first file of a listing made
+ * now: each one's name and type, Nullable(T) where it may hold NULLs; none where no file is
+ * listed.  Valid until the next call on the table.
+ */
+typedef struct chte_external_field
+{
+	const char *name;
+	const char *type;
+} chte_external_field;
+
+CHTE_API int			chte_external_schema(chte_table *table, const chte_external_field **fields, size_t *nfields,
+									 chte_error *error);
+
+/*
+ * A listing: the files the table's location names now, in their paths' order, each one's
+ * footer read -- kept in the process by path, size and modification time -- and its columns
+ * checked against the table's: a column the file lacks, or of a type the caller's cannot take,
+ * fails the listing.  bytes and load hand a listing to a parallel scan's other processes, which
+ * then read the same files; a file found changed as it is read fails the read.
+ */
+typedef struct chte_external_listing chte_external_listing;
+
+typedef struct chte_external_file
+{
+	const char *path;
+	uint64_t	size;
+	int64_t		mtime;			/* nanoseconds since 1970 */
+	uint64_t	rows;
+	uint32_t	units;
+	uint64_t	first_row;		/* its first row's id: the rows of the files before it */
+} chte_external_file;
+
+CHTE_API int			chte_external_list(chte_table *table, chte_external_listing **listing, chte_error *error);
+CHTE_API int			chte_external_listing_bytes(chte_external_listing *listing, const void **bytes, size_t *size,
+											chte_error *error);
+CHTE_API int			chte_external_listing_load(chte_table *table, const void *bytes, size_t size,
+										   chte_external_listing **listing, chte_error *error);
+CHTE_API void		chte_external_listing_free(chte_external_listing *listing);
+CHTE_API size_t		chte_external_files(chte_external_listing *listing);
+CHTE_API int			chte_external_file_info(chte_external_listing *listing, size_t file, chte_external_file *info,
+										chte_error *error);
+
+/*
+ * As chte_part_select, of a listed file's units [begin, end) (end 0: its last): the ranges of
+ * units a filter keeps by the files' statistics, and their rows.
+ */
+CHTE_API int			chte_external_select(chte_table *table, chte_external_listing *listing, size_t file,
+									 chte_filter *filter, uint32_t begin, uint32_t end, chte_mark_range *ranges,
+									 size_t max_ranges, size_t *nranges, uint64_t *rows, chte_error *error);
+
+/* As chte_part_column_bytes, of a listed file */
+CHTE_API int			chte_external_column_bytes(chte_table *table, chte_external_listing *listing, size_t file,
+										   const char *columns, uint64_t *compressed, uint64_t *uncompressed,
+										   chte_error *error);
+
+/*
+ * As chte_part_stats, of a listed file: its column's rows and NULLs where every unit counts
+ * them, and its least and greatest values, converted, where every unit keeps them exactly.
+ */
+CHTE_API int			chte_external_stats(chte_table *table, chte_external_listing *listing, size_t file,
+									const char *column, chte_column_stats *stats, chte_error *error);
+
+/*
+ * As chte_read_begin, of a listed file's units: the table's columns by the caller's names, and
+ * _pg_rowid, each row's id.  A filter, where given, lets the reader pass over what else the
+ * files' indexes rule out -- Parquet's pages by their page index, its row groups by their bloom
+ * filters and dictionaries -- every row of what it reads handed.  And as chte_read_rows, of the
+ * rows at offsets in the file.
+ */
+CHTE_API int			chte_external_read_begin(chte_table *table, chte_external_listing *listing, size_t file,
+										 chte_filter *filter, const char *columns, const chte_mark_range *ranges,
+										 size_t nranges, chte_reader **reader, chte_error *error);
+CHTE_API int			chte_external_read_rows(chte_table *table, chte_external_listing *listing, size_t file,
+										const char *columns, const uint64_t *offsets, size_t n, chte_reader **reader,
+										chte_error *error);
+
+/*
+ * A file written by ClickHouse's own output format -- "Parquet", "Arrow" (Arrow IPC's file
+ * format) -- under its settings, as tests make their files (§2.17): each batch's vectors in
+ * chte_write_batch's layout of the columns' source types -- a date's an Int32 of days from
+ * 2000-01-01 and a timestamp's an Int64 of microseconds, where their convert kinds say so --
+ * cast to the file's types as ClickHouse casts.  The file is written under a temporary name and
+ * renamed to path by finish; close removes what finish did not.
+ */
+typedef struct chte_file_writer chte_file_writer;
+
+typedef struct chte_file_column
+{
+	const char *name;
+	const char *type;			/* the file's, ClickHouse's: Nullable(T) where it may hold NULLs */
+	const char *source;			/* the type of the batches' vectors, without Nullable */
+	int32_t		convert;		/* CHTE_CONVERT_*: a source of days or microseconds */
+} chte_file_column;
+
+CHTE_API int			chte_file_write_begin(const char *format, const char *path, const chte_file_column *columns,
+									  size_t ncolumns, const char *settings, chte_file_writer **writer,
+									  chte_error *error);
+CHTE_API int			chte_file_write_batch(chte_file_writer *writer, uint32_t nrows, const chte_vector *columns,
+									  chte_error *error);
+CHTE_API int			chte_file_write_finish(chte_file_writer *writer, uint64_t *bytes, chte_error *error);
+CHTE_API void		chte_file_write_close(chte_file_writer *writer);
+
 #ifdef __cplusplus
 }
 #endif

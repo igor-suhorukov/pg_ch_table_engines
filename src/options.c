@@ -34,6 +34,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
@@ -48,6 +49,7 @@
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -82,6 +84,8 @@ static const ChOptionName option_names[] = {
 	{"sign", true},
 	{"sum_columns", true},
 	{"low_cardinality", true},
+	/* an external table's (§2.17): where it reads, which changes at any time */
+	{"location", false},
 };
 
 /*
@@ -248,6 +252,11 @@ ch_options_validate(List *defs, ChEngineKind kind)
 			(void) parse_bool_value(name, def_string(def));
 		else if (strcmp(name, "settings") == 0)
 			(void) def_string(def);
+		else if (strcmp(name, "location") == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("option \"location\" does not apply to %s", ch_engine_name(kind)),
+					 errhint("A table that reads files is made with an access method of its format: parquet, arrow or iceberg.")));
 		else
 			elog(ERROR, "unexpected option \"%s\"", name);
 
@@ -260,6 +269,64 @@ ch_options_validate(List *defs, ChEngineKind kind)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("option \"%s\" does not apply to %s", name, ch_engine_name(kind))));
 	}
+}
+
+/*
+ * The options of an external table (§2.17): location -- an absolute path,
+ * set only by a role that may read the server's files, as COPY FROM a file
+ * and file_fdw require -- needed where the table is made; settings,
+ * ClickHouse's for its format.  The engines' others do not apply.
+ */
+void
+ch_external_options_validate(List *defs, ChExternalKind kind, bool creating)
+{
+	ListCell   *lc;
+	bool		has_location = false;
+
+	foreach(lc, defs)
+	{
+		DefElem    *def = lfirst_node(DefElem, lc);
+		const char *name = def->defname;
+
+		if (strcmp(name, "location") == 0)
+		{
+			const char *v;
+
+			if (def->defaction == DEFELEM_DROP)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("option \"location\" of a %s table cannot be reset", ch_external_name(kind)),
+						 errhint("Set another location with ALTER TABLE ... SET (location = '...').")));
+			v = def_string(def);
+			if (v[0] != '/')
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("location \"%s\" is not an absolute path", v)));
+			if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("permission denied to set the location of a %s table", ch_external_name(kind)),
+						 errdetail("Only roles with privileges of the \"%s\" role may read the server's files.",
+								   "pg_read_server_files")));
+			has_location = true;
+		}
+		else if (strcmp(name, "settings") == 0)
+		{
+			if (def->defaction != DEFELEM_DROP)
+				(void) def_string(def);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("option \"%s\" does not apply to a %s table", name, ch_external_name(kind)),
+					 errhint("Its options are \"location\" and \"settings\".")));
+	}
+	if (creating && !has_location)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a %s table needs option \"location\"", ch_external_name(kind)),
+				 errhint("Name its files: CREATE TABLE ... USING %s WITH (location = '/path/to/files').",
+						 ch_external_name(kind))));
 }
 
 static void
@@ -304,6 +371,8 @@ apply_option(ChOptions *opts, const char *name, const char *value)
 		opts->sum_columns = pstrdup(value);
 	else if (strcmp(name, "low_cardinality") == 0)
 		opts->low_cardinality = pstrdup(value);
+	else if (strcmp(name, "location") == 0)
+		opts->location = pstrdup(value);
 }
 
 /* The engines' options in a reloptions array; the others are heap's */
@@ -619,19 +688,44 @@ alter_table_options(Oid relid, AlterTableCmd *cmd)
 	Datum		merged;
 	List	   *heap_only = NIL;
 
+	ChExternalKind ext_kind;
+	bool		external;
+
 	heaps = list_copy(defs);
 	ours = take_engine_options(&heaps);
 	foreach(lc, ours)
 		if (option_is_defining(lfirst_node(DefElem, lc)->defname))
 			defining = true;
 
-	/* as tablecmds.c would take for heap's, and all of it for a defining change */
-	lockmode = defining ? AccessExclusiveLock : Max(AlterTableGetRelOptionsLockLevel(heaps), ShareUpdateExclusiveLock);
-	rel = table_open(relid, lockmode);
-	if (!ch_is_engine_rel(rel, &kind))
-		elog(ERROR, "relation \"%s\" is not of an engine's access method", RelationGetRelationName(rel));
+	/*
+	 * as tablecmds.c would take for heap's, and all of it for a defining
+	 * change -- or for where an external table reads, which a running query
+	 * of it finishes reading first
+	 */
+	{
+		Relation	r = RelationIdGetRelation(relid);
 
-	if (cmd->subtype == AT_SetRelOptions)
+		external = RelationIsValid(r) && ch_is_external_rel(r, &ext_kind);
+		if (RelationIsValid(r))
+			RelationClose(r);
+	}
+	lockmode = defining || (external && ours != NIL) ? AccessExclusiveLock :
+		Max(AlterTableGetRelOptionsLockLevel(heaps), ShareUpdateExclusiveLock);
+	rel = table_open(relid, lockmode);
+	if (external)
+	{
+		/* §2.17: location and settings, location set at any time and never reset */
+		if (!ch_is_external_rel(rel, &ext_kind))
+			elog(ERROR, "relation \"%s\" is not of an external access method", RelationGetRelationName(rel));
+		if (cmd->subtype == AT_ResetRelOptions)
+			foreach(lc, ours)
+				lfirst_node(DefElem, lc)->defaction = DEFELEM_DROP;
+		ch_external_options_validate(ours, ext_kind, false);
+		defining = false;
+	}
+	else if (!ch_is_engine_rel(rel, &kind))
+		elog(ERROR, "relation \"%s\" is not of an engine's access method", RelationGetRelationName(rel));
+	else if (cmd->subtype == AT_SetRelOptions)
 	{
 		ch_options_validate(ours, kind);
 		foreach(lc, ours)
@@ -740,6 +834,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 	List	   *after_alter_strip = NIL;
 	List	   *grow_relids = NIL;	/* VC11: the tables an ALTER may add columns to */
 	List	   *grow_natts = NIL;	/* and their attributes before it */
+	List	   *external_checks = NIL;	/* §2.17: the external tables an ALTER changes */
 
 	/*
 	 * A command that needs a database to itself waits for its other backends
@@ -770,9 +865,28 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 	if (IsA(parsetree, CreateStmt))
 	{
 		CreateStmt *stmt = (CreateStmt *) parsetree;
+		ChExternalKind ext_kind;
 
-		if (stmt->partspec == NULL &&
-			ch_am_name_kind(create_access_method(stmt->accessMethod), &kind))
+		if (ch_external_am_name_kind(create_access_method(stmt->accessMethod), &ext_kind))
+		{
+			CreateStmt *copy;
+			List	   *ours;
+
+			/* §2.17: not a partition in CH7, nor partitioned (§8 item 17) */
+			if (stmt->partspec != NULL || stmt->partbound != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("a %s table cannot be partitioned or a partition", ch_external_name(ext_kind))));
+			copy = copyObject(stmt);
+			ours = take_engine_options(&copy->options);
+			ch_external_options_validate(ours, ext_kind, true);
+			pending_defs = stringify_defs(ours);
+			pending_create = true;
+			pstmt = copy_with_utility(pstmt, (Node *) copy);
+			readOnlyTree = false;
+		}
+		else if (stmt->partspec == NULL &&
+				 ch_am_name_kind(create_access_method(stmt->accessMethod), &kind))
 		{
 			CreateStmt *copy = copyObject(stmt);
 			List	   *ours = take_engine_options(&copy->options);
@@ -787,8 +901,21 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 	else if (IsA(parsetree, CreateTableAsStmt))
 	{
 		CreateTableAsStmt *stmt = (CreateTableAsStmt *) parsetree;
+		ChExternalKind ext_kind;
 
-		if (stmt->into && ch_am_name_kind(create_access_method(stmt->into->accessMethod), &kind))
+		if (stmt->into && ch_external_am_name_kind(create_access_method(stmt->into->accessMethod), &ext_kind))
+		{
+			/* WITH NO DATA makes one; rows the access method refuses */
+			CreateTableAsStmt *copy = copyObject(stmt);
+			List	   *ours = take_engine_options(&copy->into->options);
+
+			ch_external_options_validate(ours, ext_kind, true);
+			pending_defs = stringify_defs(ours);
+			pending_create = true;
+			pstmt = copy_with_utility(pstmt, (Node *) copy);
+			readOnlyTree = false;
+		}
+		else if (stmt->into && ch_am_name_kind(create_access_method(stmt->into->accessMethod), &kind))
 		{
 			CreateTableAsStmt *copy = copyObject(stmt);
 			List	   *ours = take_engine_options(&copy->into->options);
@@ -810,12 +937,16 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 		{
 			Relation	rel = RelationIdGetRelation(relid);
 			bool		ours = RelationIsValid(rel) && ch_is_engine_rel(rel, &kind);
+			bool		external = RelationIsValid(rel) && ch_is_external_rel(rel, NULL);
 			AlterTableStmt *copy = NULL;
 			List	   *rest = NIL;
 			ListCell   *lc;
 
 			if (RelationIsValid(rel))
 				RelationClose(rel);
+			/* its columns or its location changed: checked against its files as the command ends */
+			if (external)
+				external_checks = lappend_oid(external_checks, relid);
 
 			/*
 			 * VC11: the storages' plain columns that lost NOT NULL by an
@@ -832,7 +963,13 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 				if (cmd->subtype == AT_AttachPartition && IsA(cmd->def, PartitionCmd))
 				{
 					Oid			part = RangeVarGetRelid(((PartitionCmd *) cmd->def)->name, NoLock, true);
+					ChExternalKind ext_kind;
 
+					/* §2.17: an external table is no partition in CH7 */
+					if (OidIsValid(part) && ch_is_external_am(get_rel_relam(part), &ext_kind))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("a %s table cannot be a partition", ch_external_name(ext_kind))));
 					if (OidIsValid(part))
 						ch_plain_revoke(part);
 				}
@@ -854,7 +991,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 			{
 				AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
 
-				if (ours && (cmd->subtype == AT_SetRelOptions || cmd->subtype == AT_ResetRelOptions))
+				if ((ours || external) && (cmd->subtype == AT_SetRelOptions || cmd->subtype == AT_ResetRelOptions))
 				{
 					alter_table_options(relid, cmd);
 					continue;
@@ -875,8 +1012,24 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 				if (cmd->subtype == AT_SetAccessMethod)
 				{
 					ChEngineKind newkind;
+					ChExternalKind ext_kind;
 					bool		to_ours = ch_am_name_kind(create_access_method(cmd->name), &newkind);
 
+					/*
+					 * §2.17: a table that reads files is made so; one leaves
+					 * them for another access method, its rows read into it
+					 */
+					if (ch_external_am_name_kind(create_access_method(cmd->name), &ext_kind))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("cannot change the access method of a table to %s", ch_external_name(ext_kind)),
+								 errhint("Make the table with CREATE TABLE ... USING %s WITH (location = '...').",
+										 ch_external_name(ext_kind))));
+					if (external)
+					{
+						after_alter_strip = lappend_oid(after_alter_strip, relid);
+						external_checks = list_delete_oid(external_checks, relid);
+					}
 					if (ours && !to_ours)
 						after_alter_strip = lappend_oid(after_alter_strip, relid);
 					else if (!ours && to_ours)
@@ -910,6 +1063,27 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 
 	else if (IsA(parsetree, CreatedbStmt))
 		check_template((CreatedbStmt *) parsetree);
+	else if (IsA(parsetree, CopyStmt))
+	{
+		CopyStmt   *stmt = (CopyStmt *) parsetree;
+
+		/*
+		 * §2.17, the user's rule: the table form of COPY ... TO of an
+		 * external table runs as its query form under WHERE false, so that
+		 * pg_dump's dump holds no row of it
+		 */
+		if (!stmt->is_from && stmt->relation != NULL && stmt->query == NULL)
+		{
+			Oid			relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+			Node	   *query_form = OidIsValid(relid) ? ch_external_copy_to(stmt, relid) : NULL;
+
+			if (query_form)
+			{
+				pstmt = copy_with_utility(pstmt, query_form);
+				readOnlyTree = false;
+			}
+		}
+	}
 
 	utility_depth++;
 	PG_TRY();
@@ -941,6 +1115,30 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 
 		forboth(lr, grow_relids, ln, grow_natts)
 			ch_plain_grow(lfirst_oid(lr), lfirst_int(ln));
+	}
+	if (external_checks != NIL)
+	{
+		ListCell   *lc;
+
+		/* the columns and location the ALTER left, against the files the location names now */
+		CommandCounterIncrement();
+		foreach(lc, external_checks)
+		{
+			Relation	r = RelationIdGetRelation(lfirst_oid(lc));
+
+			if (!RelationIsValid(r))
+				continue;
+			PG_TRY();
+			{
+				if (ch_is_external_rel(r, NULL))
+					ch_external_check(r);
+			}
+			PG_FINALLY();
+			{
+				RelationClose(r);
+			}
+			PG_END_TRY();
+		}
 	}
 
 	/*
@@ -991,7 +1189,26 @@ ch_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId, 
 		if (RelationIsValid(rel))
 		{
 			if ((rel->rd_rel->relkind == RELKIND_RELATION || rel->rd_rel->relkind == RELKIND_MATVIEW) &&
-				ch_is_engine_rel(rel, &kind))
+				ch_is_external_rel(rel, NULL))
+			{
+				ch_options_bind(objectId, pending_defs);
+				/*
+				 * §2.17: its columns' types the engine library takes, and the
+				 * files its location names now, each one's columns checked
+				 */
+				PG_TRY();
+				{
+					ch_external_check(rel);
+				}
+				PG_CATCH();
+				{
+					RelationClose(rel);
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+			}
+			else if ((rel->rd_rel->relkind == RELKIND_RELATION || rel->rd_rel->relkind == RELKIND_MATVIEW) &&
+					 ch_is_engine_rel(rel, &kind))
 			{
 				ChOptions	opts;
 

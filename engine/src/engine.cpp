@@ -94,6 +94,8 @@ public:
     }
 };
 
+}
+
 /// Settings that keep a query, an insert and a merge on the calling thread.
 void applySingleThreadedSettings(ContextMutablePtr & context)
 {
@@ -120,8 +122,6 @@ void applySettings(ContextMutablePtr & context, const char * settings)
     ASTPtr ast = parseQuery(parser, text, "settings", DBMS_DEFAULT_MAX_QUERY_SIZE, DBMS_DEFAULT_MAX_PARSER_DEPTH,
                             DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
     context->applySettingsChanges(ast->as<ASTSetQuery &>().changes);
-}
-
 }
 
 void registerAllFunctions()
