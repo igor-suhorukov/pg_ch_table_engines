@@ -24,6 +24,7 @@
 #include <Storages/MergeTree/MergeTask.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
 #include <Storages/MergeTree/MergeTreeIOSettings.h>
+#include <Storages/MergeTree/MergeTreeMarksLoader.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 
@@ -619,6 +620,184 @@ extern "C" int chte_read_begin(chte_table * table, const char * part_name, const
         }
 
         *reader = openReader(*table, part, names, std::move(mark_ranges)).release();
+    });
+}
+
+namespace
+{
+
+/// The end of the compressed block at `offset` of a part's file: its checksum's 16 bytes, then its
+/// method's byte and its size with the header's 9 bytes, then the rest of it.
+uint64_t compressedBlockEnd(const IMergeTreeDataPart & part, const String & file, uint64_t offset)
+{
+    auto buf = part.getDataPartStorage().readFile(file, ReadSettings{}, 25);
+    buf->seek(offset, SEEK_SET);
+    char header[25];
+    buf->readStrict(header, sizeof(header));
+    UInt32 compressed;
+    memcpy(&compressed, header + 17, sizeof(compressed));
+    return offset + 16 + compressed;
+}
+
+}
+
+/// W6 (chte_engine.h): a wide part's columns as its files hold them -- each column's streams as
+/// MergeTreeReaderWide::addStreams enumerates them, their marks as it loads them, and their bytes'
+/// ranges over the granules asked for.
+extern "C" int chte_part_streams_of(chte_table * table, const char * part_name, const char * columns,
+                                    uint32_t begin, uint32_t end, chte_part_streams * out, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & storage = *table->storage;
+        MergeTreeData::DataPartPtr part = storage.getPart(part_name);
+        table->part_streams.clear();
+        table->part_types.clear();
+        table->part_refusal.clear();
+        *out = {};
+        auto refuse = [&](const String & why)
+        {
+            table->part_refusal = why;
+            table->part_streams.clear();
+            out->refusal = table->part_refusal.c_str();
+        };
+
+        size_t marks = part->index_granularity->getMarksCountWithoutFinal();
+        if (begin >= end || end > marks)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_part_streams_of: marks [{}, {}) are not a range of part {}'s {}",
+                            begin, end, part_name, marks);
+        if (!isWidePart(part))
+        {
+            refuse("a compact part");
+            return;
+        }
+        uint64_t rows = 0;
+        for (size_t m = begin; m < end; ++m)
+            rows += part->index_granularity->getMarkRows(m);
+
+        auto mutations = storage.getMutationsSnapshot({});
+        auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table->context);
+        auto info = std::make_shared<LoadedMergeTreeDataPartInfoForReader>(part, alter_conversions);
+        auto settings = storage.getSettings();
+        Names names = columnNames(columns);
+        for (size_t c = 0; c < names.size(); ++c)
+        {
+            auto column = part->getColumns().tryGetByName(names[c]);
+            if (!column)
+            {
+                refuse("a column the part lacks, " + names[c]);
+                return;
+            }
+            auto serialization = part->getSerialization(names[c]);
+            auto kinds = serialization->getKindStack();
+            /// the default's, or the sparse one's over it, whose offsets the device parses
+            bool sparse = kinds.size() == 2 && kinds[0] == ISerialization::Kind::DEFAULT &&
+                          kinds[1] == ISerialization::Kind::SPARSE;
+            if (!sparse && (kinds.size() != 1 || kinds[0] != ISerialization::Kind::DEFAULT))
+            {
+                refuse("a column of a serialization the device does not decode, " + names[c]);
+                return;
+            }
+            DataTypePtr nested = removeNullable(column->type);
+            int width = 0;
+            if (!isString(nested))
+            {
+                if (!nested->isValueRepresentedByNumber() || nested->lowCardinality())
+                {
+                    refuse("a column of type " + column->type->getName());
+                    return;
+                }
+                width = static_cast<int>(nested->getSizeOfValueInMemory());
+            }
+            table->part_types += column->type->getName() + ";";
+
+            bool ok = true;
+            serialization->enumerateStreams([&](const ISerialization::SubstreamPath & path)
+            {
+                if (!ok || ISerialization::isEphemeralSubcolumn(path, path.size()))
+                    return;
+                int kind;
+                int stream_width;
+                switch (path.back().type)
+                {
+                    case ISerialization::Substream::SparseOffsets:
+                        /// a Nullable's sparse values are those not NULL, its null map none
+                        kind = column->type->isNullable() ? CHTE_STREAM_SPARSE_NULLS : CHTE_STREAM_SPARSE;
+                        stream_width = 0;
+                        break;
+                    case ISerialization::Substream::Regular:
+                        kind = CHTE_STREAM_VALUES;
+                        stream_width = width;
+                        break;
+                    case ISerialization::Substream::NullMap:
+                        kind = CHTE_STREAM_NULLS;
+                        stream_width = 1;
+                        break;
+                    case ISerialization::Substream::StringSizes:
+                        kind = CHTE_STREAM_SIZES;
+                        stream_width = 8;
+                        break;
+                    default:
+                        ok = false;
+                        refuse("a stream of " + names[c] + " of a kind the device does not decode");
+                        return;
+                }
+                auto stream = IMergeTreeDataPart::getStreamNameForColumn(*column, path, ".bin", part->checksums, settings);
+                if (!stream)
+                {
+                    ok = false;
+                    refuse("a stream of " + names[c] + " the part lacks");
+                    return;
+                }
+                String file = *stream + ".bin";
+                if (file.size() >= sizeof(chte_part_stream::file))
+                {
+                    ok = false;
+                    refuse("a stream's file of a name too long, " + file);
+                    return;
+                }
+                MergeTreeMarksLoader loader(info, nullptr, part->index_granularity_info.getMarksFilePath(*stream),
+                                            part->getMarksCount(), part->index_granularity_info, false, ReadSettings{},
+                                            nullptr, 1, false);
+                auto getter = loader.loadMarks();
+                auto first = getter->getMark(begin, 0);
+                chte_part_stream s{};
+                s.column = static_cast<int32_t>(c);
+                s.kind = kind;
+                s.width = stream_width;
+                memcpy(s.file, file.c_str(), file.size() + 1);
+                s.from = first.offset_in_compressed_file;
+                s.skip = first.offset_in_decompressed_block;
+                if (end < marks)
+                {
+                    auto last = getter->getMark(end, 0);
+                    s.to = last.offset_in_decompressed_block == 0 ? last.offset_in_compressed_file
+                                                                  : compressedBlockEnd(*part, file, last.offset_in_compressed_file);
+                }
+                else
+                    s.to = part->getFileSizeOrZero(file);
+                table->part_streams.push_back(s);
+            });
+            if (!ok)
+                return;
+        }
+        out->rows = rows;
+        out->nstreams = table->part_streams.size();
+        out->streams = table->part_streams.data();
+        out->types = table->part_types.c_str();
+    });
+}
+
+/// W6: bytes of a part's file, through its storage's reader -- the pages store's buffers among them
+extern "C" int chte_part_file_read(chte_table * table, const char * part_name, const char * file, uint64_t offset,
+                                   uint64_t length, void * dest, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        MergeTreeData::DataPartPtr part = table->storage->getPart(part_name);
+        auto buf = part->getDataPartStorage().readFile(file, ReadSettings{}, length);
+        buf->seek(offset, SEEK_SET);
+        buf->readStrict(static_cast<char *>(dest), length);
     });
 }
 

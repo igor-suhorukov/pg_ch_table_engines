@@ -467,7 +467,7 @@ chte_table * openTable(const chte_table_def * def)
                                                  std::move(pages_disk));
     StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
     StorageMetadataPtr snapshot = handle;
-    return new chte_table{storage, snapshot, context, {}, {}, {}};
+    return new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}};
 }
 
 }

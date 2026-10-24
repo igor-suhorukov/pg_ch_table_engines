@@ -353,6 +353,8 @@ extern bytea *ch_pages_store_part(Relation rel, ChTable *t, const char *part_dir
 extern bytea *ch_pages_store_part_files(Relation rel, ChTable *t, const chte_part_file *files, size_t nfiles,
 										ChPart *part, CommandId cid);
 extern void ch_pages_raise_pending(void);
+extern chte_page_file *ch_pages_files(const ChPart *part, size_t *nfiles);
+extern void ch_pages_read_file(ChTable *t, const chte_page_file *file, uint64 offset, uint64 length, char *dest);
 
 /* external.c: external tables (§2.17) */
 typedef struct ChListing

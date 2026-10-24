@@ -353,6 +353,57 @@ CHTE_API int			chte_filter_summary_select(chte_filter *filter, const char *part_
 									   size_t size, int *verdict, chte_error *error);
 
 /*
+ * W6 (pg_vector_executor.md §3.26): a wide part's named columns (comma-separated) as its
+ * files hold them, over granules [begin, end), for a GPU's executor to decompress and
+ * decode itself: each column's type as the part keeps it, and each of its streams -- its
+ * values, fixed-width or a String's bytes; a String's sizes, a UInt64 each (the string
+ * serialization of version 1); a Nullable's null map, a UInt8 each, 1 a NULL; a sparse
+ * serialization's offsets, VarUInts, each the rows of the default before the next value
+ * and a granule's last its rows of the default after them, bit 62 set (SerializationSparse),
+ * its values' streams then those of its other rows alone, the rows of the default its
+ * type's 0 or empty string, a Nullable's NULL -- named by its file in the part, its
+ * compressed blocks [from, to) there, and the bytes of their first block's decompressed
+ * data before the range's first row.  refusal is set where a column is not one the device
+ * reads so -- a compact part, a LowCardinality serialization, a type neither of a fixed
+ * width nor String, strings of the single stream of version 0 -- and the streams then left
+ * out.  Valid until the next call on the table.
+ */
+#define CHTE_STREAM_VALUES	1
+#define CHTE_STREAM_SIZES	2
+#define CHTE_STREAM_NULLS	3
+#define CHTE_STREAM_SPARSE	4		/* a sparse serialization's offsets, its default 0 or '' */
+#define CHTE_STREAM_SPARSE_NULLS 5	/* and a Nullable's, its default NULL */
+
+typedef struct chte_part_stream
+{
+	int32_t		column;			/* the column's place among the names asked for */
+	int32_t		kind;			/* CHTE_STREAM_* */
+	int32_t		width;			/* VALUES: a value's bytes, 0 for a String's */
+	int32_t		pad;
+	char		file[128];		/* its file in the part, "c3.size.bin" */
+	uint64_t	from;
+	uint64_t	to;
+	uint64_t	skip;
+} chte_part_stream;
+
+typedef struct chte_part_streams
+{
+	uint64_t	rows;			/* the granules' */
+	size_t		nstreams;
+	const chte_part_stream *streams;
+	const char *types;			/* each column's type as the part keeps it, ';' after each */
+	const char *refusal;		/* NULL, or why the columns are not read so */
+} chte_part_streams;
+
+CHTE_API int			chte_part_streams_of(chte_table *table, const char *part_name, const char *columns,
+									 uint32_t begin, uint32_t end, chte_part_streams *out,
+									 chte_error *error);
+
+/* W6: bytes [offset, offset + length) of a part's file into dest */
+CHTE_API int			chte_part_file_read(chte_table *table, const char *part_name, const char *file,
+									uint64_t offset, uint64_t length, void *dest, chte_error *error);
+
+/*
  * Reading one part: columns is a comma-separated list of names (virtual columns such as
  * _part_offset allowed); ranges, when nranges is not 0, the granules to read, in order.
  * next returns 0 rows at the end; vectors stay valid until the following next or end,

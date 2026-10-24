@@ -334,6 +334,13 @@ ch_engine(void)
 	 * CH8's, optional: a library built before them lacks them, and the
 	 * external access methods refuse a table without a location (table.c)
 	 */
+	*(void **) &engine.part_streams_of = dlsym(handle, "chte_part_streams_of");
+	*(void **) &engine.part_file_read = dlsym(handle, "chte_part_file_read");
+	if (engine.part_streams_of == NULL || engine.part_file_read == NULL)
+	{
+		engine.part_streams_of = NULL;
+		engine.part_file_read = NULL;
+	}
 	*(void **) &engine.own_open = dlsym(handle, "chte_own_open");
 	*(void **) &engine.own_list = dlsym(handle, "chte_own_list");
 	*(void **) &engine.own_write_begin = dlsym(handle, "chte_own_write_begin");

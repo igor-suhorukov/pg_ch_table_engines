@@ -46,12 +46,13 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		7	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		8	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
 									 * price; 5: columns in steps; 6:
 									 * set_join_keys; 7: next_unit,
-									 * read_unit */
+									 * read_unit; 8: MergeTree's units,
+									 * read_unit_bytes */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -268,8 +269,44 @@ typedef enum VexecUnitFormat
 {
 	VEXEC_UNIT_CPU,				/* not the device's: next() hands its rows */
 	VEXEC_UNIT_PARQUET,
-	VEXEC_UNIT_ARROW			/* Arrow IPC's file format */
+	VEXEC_UNIT_ARROW,			/* Arrow IPC's file format */
+	VEXEC_UNIT_MERGETREE		/* from minor version 8: granules of a part */
 } VexecUnitFormat;
+
+/*
+ * From minor version 8 (pg_vector_executor.md §3.26, W6): a unit of granules
+ * of a MergeTree part, its spec's columns as the part's files hold them:
+ * each column's streams, compressed blocks of ClickHouse's format -- a
+ * 16-byte checksum, a method's byte, the block's and its data's sizes --
+ * of its values, fixed-width little-endian or a String's bytes, of a
+ * String's sizes, a uint64 each, and of a Nullable's null map, a byte each,
+ * 1 a NULL; or, a column of the sparse serialization, of its offsets --
+ * VarUInts, each the rows of its default before the next value, a granule's
+ * last its rows of the default after them with bit 62 set -- its values'
+ * streams then those of its other rows alone, the default the type's 0 or
+ * empty string, or NULL (SPARSE_NULLS).  The device decompresses and decodes
+ * them itself; their bytes,
+ * which the source's storage alone may read -- PostgreSQL's buffers, where
+ * the part's pages are the relation's -- are copied by read_unit_bytes().
+ * path names the unit -- the relation, the part and its granules -- for
+ * as long as the part is, which never changes, as the device's cache keys
+ * it; file_size and file_mtime are 0.
+ */
+#define VEXEC_STREAM_VALUES		1
+#define VEXEC_STREAM_SIZES		2
+#define VEXEC_STREAM_NULLS		3
+#define VEXEC_STREAM_SPARSE		4
+#define VEXEC_STREAM_SPARSE_NULLS	5
+
+typedef struct VexecSourceStream
+{
+	int			column;			/* the spec column it is of */
+	int			kind;			/* VEXEC_STREAM_* */
+	int			width;			/* VALUES: a value's bytes, 0 a String's */
+	uint64		length;			/* its compressed blocks' bytes */
+	uint64		skip;			/* their data's bytes before the unit's
+								 * first row */
+} VexecSourceStream;
 
 /* VexecSourceUnit.column_flags */
 #define VEXEC_UNIT_NOT_NULL		0x01	/* a NULL is an error */
@@ -291,6 +328,10 @@ typedef struct VexecSourceUnit
 	const uint64 *deleted;		/* rows bits, 1 = a row the snapshot does not
 								 * see; NULL: it sees every one */
 	void	   *token;			/* the source's own: what read_unit() names */
+
+	/* from minor version 8, VEXEC_UNIT_MERGETREE's: its columns' streams */
+	int			nstreams;
+	const VexecSourceStream *streams;
 } VexecSourceUnit;
 
 /*
@@ -477,6 +518,15 @@ typedef struct VexecSourceRoutine
 	 * the source's reader raises its error.  Its rows are counted again.
 	 */
 	void		(*read_unit) (void *state, const VexecSourceUnit *unit);
+
+	/*
+	 * Optional, from minor version 8: bytes [offset, offset + length) of
+	 * stream `stream` of a VEXEC_UNIT_MERGETREE unit next_unit() handed, into
+	 * dest -- the device's memory a task shares with it -- before the unit's
+	 * request goes; called between batches, as often as the caller asks.
+	 */
+	void		(*read_unit_bytes) (void *state, const VexecSourceUnit *unit, int stream,
+									uint64 offset, uint64 length, void *dest);
 } VexecSourceRoutine;
 
 /*

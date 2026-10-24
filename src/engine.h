@@ -47,6 +47,11 @@ typedef struct ChEngine
 								chte_mark_range *, size_t, size_t *, uint64_t *, chte_error *);
 	int			(*part_column_bytes) (chte_table *, const char *, const char *, uint64_t *, uint64_t *,
 									  chte_error *);
+	/* W6: a part's columns as its files hold them, and its files' bytes; both, or neither */
+	int			(*part_streams_of) (chte_table *, const char *, const char *, uint32_t, uint32_t,
+									chte_part_streams *, chte_error *);
+	int			(*part_file_read) (chte_table *, const char *, const char *, uint64_t, uint64_t, void *,
+								   chte_error *);
 	int			(*part_stats) (chte_table *, const char *, const char *, chte_column_stats *, chte_error *);
 	chte_batch *(*read_retain) (chte_reader *);
 	void		(*batch_release) (chte_batch *);

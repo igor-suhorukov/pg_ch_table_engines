@@ -191,6 +191,13 @@ typedef struct SrcState
 	/* VEXEC_SRC_STEPS (VC2): the steps, and each column's; 0, every column with next() */
 	int			nsteps;
 	int		   *col_step;
+	/* W6: a claimed MergeTree unit handed in runs of granules, the next run's first */
+	bool		mt_open;
+	ChScanUnit	mt_unit;
+	uint32		mt_next;
+	uint32		mt_end;
+	chte_page_file *mt_files;	/* the pages store's: the claimed part's manifest */
+	size_t		mt_nfiles;
 } SrcState;
 
 static uint64 null_row = 0;		/* a constant's validity: its one value NULL */
@@ -1029,6 +1036,7 @@ src_rescan(void *arg)
 	st->have_batch = false;
 	st->pos = 0;
 	st->nbound_keys = 0;
+	st->mt_open = false;		/* W6: no claimed unit's runs left */
 	ch_scan_set_unit_check(st->scan, st->nspec_keys > 0 ? unit_within_keys : NULL, st);
 	/* and the join's keys (VC3) */
 	ch_scan_set_join_keys(st->scan, 0, NULL);
@@ -1354,6 +1362,180 @@ unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
 	return true;
 }
 
+/*
+ * W6 (pg_vector_executor.md §3.26; minor 8): granules of a MergeTree part
+ * for the GPU's executor to decompress and decode itself -- a wide part's
+ * columns, each stream's compressed blocks named by its file in the part,
+ * whose bytes read_unit_bytes() copies, the pages store's through its
+ * buffers.  A claimed unit goes in runs of at most CH_DEVICE_UNIT_MARKS
+ * granules, from its ranges' first granule to their last: where its scan's
+ * quals pruned some between, the device's filter of the scan's quals (W4)
+ * reads them again and keeps what the quals keep.  The plain engine's
+ * parts of no deletion alone; read_unit() reads a run again on the CPU.
+ */
+#define CH_DEVICE_UNIT_MARKS	256
+
+typedef struct SrcMtUnit
+{
+	SrcUnit		unit;			/* read_unit()'s: the part and the run, first */
+	chte_mark_range range;
+	int			nfiles;
+	char	  (*files)[128];	/* per stream: its file, */
+	uint64	   *from;			/* its first block's offset there, */
+	chte_page_file *pages;		/* and, the pages store's, the file's pages; path NULL: the library's read */
+} SrcMtUnit;
+
+/* The spec's columns as the part names them, "c1, c3" */
+static char *
+mergetree_names(SrcState *st)
+{
+	StringInfoData b;
+
+	initStringInfo(&b);
+	for (int i = 0; i < st->ncols; i++)
+		appendStringInfo(&b, "%sc%d", i > 0 ? ", " : "", st->cols[i].attnum);
+	return b.data;
+}
+
+/* The claimed unit's next run of granules for the device; false, nothing set, where its part's columns are not read so. */
+static bool
+mergetree_unit(SrcState *st, VexecSourceUnit *u)
+{
+	ChTable    *t = ch_scan_table(st->scan);
+	uint32		begin = st->mt_next;
+	uint32		end = Min(begin + CH_DEVICE_UNIT_MARKS, st->mt_end);
+	chte_part_streams ps;
+	MemoryContext old;
+	SrcMtUnit  *keep;
+	VexecSourceStream *streams;
+	const char **names;
+	uint8	   *flags;
+	char	   *list = mergetree_names(st);
+
+	CH_CALL("describing a part's columns for the device",
+			ch_engine()->part_streams_of(t->handle, st->mt_unit.part->name, list, begin, end, &ps, CH_ERR));
+	pfree(list);
+	if (ps.refusal != NULL)
+		return false;
+	old = MemoryContextSwitchTo(st->cxt);
+	keep = palloc0(sizeof(SrcMtUnit));
+	keep->unit.part = st->mt_unit.part;
+	keep->range.begin = begin;
+	keep->range.end = end;
+	keep->unit.ranges = &keep->range;
+	keep->unit.nranges = 1;
+	keep->unit.rows = ps.rows;
+	keep->nfiles = (int) ps.nstreams;
+	keep->files = palloc(sizeof(*keep->files) * Max(ps.nstreams, 1));
+	keep->from = palloc(sizeof(uint64) * Max(ps.nstreams, 1));
+	keep->pages = palloc0(sizeof(chte_page_file) * Max(ps.nstreams, 1));
+	streams = palloc0(sizeof(VexecSourceStream) * Max(ps.nstreams, 1));
+	for (size_t i = 0; i < ps.nstreams; i++)
+	{
+		const chte_part_stream *x = &ps.streams[i];
+
+		memcpy(keep->files[i], x->file, sizeof(keep->files[i]));
+		keep->from[i] = x->from;
+		/* the file's pages, as the part's manifest has them, its name the stream's */
+		for (size_t f = 0; f < st->mt_nfiles; f++)
+			if (strcmp(st->mt_files[f].path, x->file) == 0)
+			{
+				keep->pages[i] = st->mt_files[f];
+				keep->pages[i].path = keep->files[i];
+				break;
+			}
+		streams[i].column = x->column;
+		streams[i].kind = x->kind == CHTE_STREAM_SIZES ? VEXEC_STREAM_SIZES :
+			x->kind == CHTE_STREAM_NULLS ? VEXEC_STREAM_NULLS :
+			x->kind == CHTE_STREAM_SPARSE ? VEXEC_STREAM_SPARSE :
+			x->kind == CHTE_STREAM_SPARSE_NULLS ? VEXEC_STREAM_SPARSE_NULLS : VEXEC_STREAM_VALUES;
+		streams[i].width = x->width;
+		streams[i].length = x->to - x->from;
+		streams[i].skip = x->skip;
+	}
+	names = palloc(sizeof(char *) * st->ncols);
+	flags = palloc0(sizeof(uint8) * st->ncols);
+	for (int i = 0; i < st->ncols; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(st->rel), st->cols[i].attnum - 1);
+
+		names[i] = psprintf("c%d", st->cols[i].attnum);
+		if (att->attnotnull)
+			flags[i] |= VEXEC_UNIT_NOT_NULL;
+		if ((att->atttypid == TEXTOID || att->atttypid == VARCHAROID || att->atttypid == JSONOID) &&
+			GetDatabaseEncoding() == PG_UTF8)
+			flags[i] |= VEXEC_UNIT_CHECK_UTF8;
+	}
+	u->format = VEXEC_UNIT_MERGETREE;
+	/* what names the run as long as its part is: the database, the relation's storage, the part, the run */
+	u->path = psprintf("mergetree/%u/%u/%s/%u-%u", MyDatabaseId, st->rel->rd_locator.relNumber,
+					   st->mt_unit.part->name, begin, end);
+	u->file_size = 0;
+	u->file_mtime = 0;
+	u->nparts = (int) (end - begin);
+	{
+		int32	   *parts = palloc(sizeof(int32) * (end - begin));
+
+		for (uint32 m = begin; m < end; m++)
+			parts[m - begin] = (int32) m;
+		u->parts = parts;
+	}
+	u->rows = ps.rows;
+	u->names = names;
+	u->column_flags = flags;
+	u->deleted = NULL;
+	u->token = keep;
+	u->nstreams = (int) ps.nstreams;
+	u->streams = streams;
+	MemoryContextSwitchTo(old);
+	st->mt_next = end;
+	return true;
+}
+
+/*
+ * W6: whether the claimed unit goes to the device: a part of the plain
+ * engine, of no deletion, read for no TID, its first run's columns ones the
+ * device reads; its runs then from its ranges' first granule to their last.
+ */
+static bool
+mergetree_begin(SrcState *st, const ChScanUnit *unit)
+{
+	ChTable    *t = ch_scan_table(st->scan);
+	int32	   *parts;
+	chte_mark_range *ranges;
+	int			nranges;
+
+	if (t->external || t->kind != CH_ENGINE_MERGETREE || ch_engine()->part_streams_of == NULL ||
+		unit->deletions || st->tids || st->ncols == 0)
+		return false;
+	for (int i = 0; i < st->ncols; i++)
+		if (st->cols[i].col->kind == CH_COL_CSTRING || st->cols[i].col->low_cardinality)
+			return false;
+	(void) ch_scan_unit_parts(st->scan, &parts, &ranges, &nranges);
+	if (nranges == 0)
+		return false;
+	if (t->options.storage == CH_STORAGE_PAGES)
+	{
+		MemoryContext old = MemoryContextSwitchTo(st->cxt);
+
+		ch_pages_attach(t, unit->part);
+		if (st->mt_files != NULL)
+		{
+			for (size_t f = 0; f < st->mt_nfiles; f++)
+				pfree(unconstify(char *, st->mt_files[f].path));
+			pfree(st->mt_files);
+		}
+		st->mt_files = ch_pages_files(unit->part, &st->mt_nfiles);
+		MemoryContextSwitchTo(old);
+	}
+	st->mt_unit = *unit;
+	st->mt_next = ranges[0].begin;
+	st->mt_end = ranges[nranges - 1].end;
+	pfree(parts);
+	pfree(ranges);
+	return true;
+}
+
 static bool
 src_next_unit(void *arg, VexecSourceUnit *u)
 {
@@ -1363,11 +1545,41 @@ src_next_unit(void *arg, VexecSourceUnit *u)
 	if (st->have_batch && st->pos < st->batch.nrows)
 		elog(ERROR, "a unit claimed inside a batch");
 	st->have_batch = false;
+	/* W6: the claimed MergeTree unit's next run, or, where it is refused, the rest on the CPU */
+	if (st->mt_open)
+	{
+		if (st->mt_next < st->mt_end)
+		{
+			if (mergetree_unit(st, u))
+				return true;
+			ch_scan_read_unit(st->scan, st->mt_unit.part,
+							  &(chte_mark_range) {st->mt_next, st->mt_end}, 1, 0);
+			st->mt_open = false;
+			u->format = VEXEC_UNIT_CPU;
+			return true;
+		}
+		st->mt_open = false;
+	}
 	if (!ch_scan_claim_unit(st->scan, &unit))
 		return false;
 	if (unit.rows == 0)
 	{
 		/* none of its granules kept: read as nothing, here */
+		ch_scan_one_unit(st->scan);
+		u->format = VEXEC_UNIT_CPU;
+		return true;
+	}
+	if (mergetree_begin(st, &unit))
+	{
+		if (mergetree_unit(st, u))
+		{
+			st->mt_open = true;
+			ch_scan_pass_unit(st->scan);
+			/* as getnextslot counts each row it returns */
+			if (pgstat_should_count_relation(st->rel))
+				st->rel->pgstat_info->counts.tuples_returned += unit.rows;
+			return true;
+		}
 		ch_scan_one_unit(st->scan);
 		u->format = VEXEC_UNIT_CPU;
 		return true;
@@ -1396,6 +1608,27 @@ src_read_unit(void *arg, const VexecSourceUnit *u)
 		elog(ERROR, "a unit read again inside a batch");
 	st->have_batch = false;
 	ch_scan_read_unit(st->scan, keep->part, keep->ranges, keep->nranges, keep->rows);
+}
+
+/* W6: bytes of a stream of a MergeTree unit next_unit() handed, from its part's file (minor 8) */
+static void
+src_read_unit_bytes(void *arg, const VexecSourceUnit *u, int stream, uint64 offset, uint64 length, void *dest)
+{
+	SrcState   *st = arg;
+	SrcMtUnit  *keep = (SrcMtUnit *) u->token;
+	ChTable    *t = ch_scan_table(st->scan);
+
+	if (u->format != VEXEC_UNIT_MERGETREE || stream < 0 || stream >= keep->nfiles ||
+		offset + length > (uint64) u->streams[stream].length)
+		elog(ERROR, "bytes asked of a unit's stream past it");
+	if (keep->pages[stream].path != NULL)
+	{
+		ch_pages_read_file(t, &keep->pages[stream], keep->from[stream] + offset, length, dest);
+		return;
+	}
+	CH_CALL("reading a part's file for the device",
+			ch_engine()->part_file_read(t->handle, keep->unit.part->name, keep->files[stream],
+										keep->from[stream] + offset, length, dest, CH_ERR));
 }
 
 /* The library's id of the dictionary of a column of the last batch (minor 3) */
@@ -1578,6 +1811,17 @@ ch_vexec_register(void)
 		{
 			r->next_unit = src_next_unit;
 			r->read_unit = src_read_unit;
+		}
+		/*
+		 * W6 (minor 8): the plain engine's parts, their columns' compressed
+		 * streams, which the device decompresses and decodes; a part the
+		 * library cannot describe so, the CPU's (mergetree_begin())
+		 */
+		if (!external && k == CH_ENGINE_MERGETREE)
+		{
+			r->next_unit = src_next_unit;
+			r->read_unit = src_read_unit;
+			r->read_unit_bytes = src_read_unit_bytes;
 		}
 		vexec_register_source(r);
 		if (external)

@@ -527,4 +527,8 @@ struct chte_table
     std::vector<double> last_bytes_per_row;
     /// an external table's (§2.17), its storage and metadata then none
     std::shared_ptr<chte::ExternalTable> external;
+    /// W6: chte_part_streams_of's last answer
+    std::vector<chte_part_stream> part_streams;
+    std::string part_types;
+    std::string part_refusal;
 };

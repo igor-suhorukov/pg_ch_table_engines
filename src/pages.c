@@ -38,6 +38,7 @@
 #include "storage/bufpage.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
+#include "storage/read_stream.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -204,6 +205,64 @@ ch_pages_attach(ChTable *t, const ChPart *part)
 	if (manifest != part->manifest)
 		pfree(manifest);
 	(void) hash_search(t->attached, part->name, HASH_ENTER, NULL);
+}
+
+/* W6: a part's files as its manifest names them, for the GPU's executor's reads of their bytes */
+chte_page_file *
+ch_pages_files(const ChPart *part, size_t *nfiles)
+{
+	bytea	   *manifest;
+	chte_page_file *files;
+
+	if (part->manifest == NULL)
+		elog(ERROR, "part %s of a table of the pages store has no manifest", part->name);
+	manifest = ch_part_manifest(part);
+	files = manifest_files(manifest, nfiles);
+	if (manifest != part->manifest)
+		pfree(manifest);
+	return files;
+}
+
+/*
+ * W6: bytes [offset, offset + length) of a part's file into dest, a stream's
+ * for the GPU's executor: its pages through a read stream, each page's
+ * payload copied once, where the library's reads take a page at a time
+ * through read_page and copy it again out of their buffer.
+ */
+void
+ch_pages_read_file(ChTable *t, const chte_page_file *file, uint64 offset, uint64 length, char *dest)
+{
+	Relation	rel;
+	BlockRangeReadStreamPrivate range;
+	ReadStream *stream;
+	uint64		at = offset;
+	uint64		end = offset + length;
+
+	if (end > file->size || (end + CH_PAGE_PAYLOAD - 1) / CH_PAGE_PAYLOAD > file->nblocks)
+		elog(ERROR, "bytes of file \"%s\" past its " UINT64_FORMAT, file->path, file->size);
+	if (length == 0)
+		return;
+	rel = relation_open(t->relid, NoLock);
+	range.current_blocknum = file->first_block + (BlockNumber) (offset / CH_PAGE_PAYLOAD);
+	range.last_exclusive = file->first_block + (BlockNumber) ((end + CH_PAGE_PAYLOAD - 1) / CH_PAGE_PAYLOAD);
+	stream = read_stream_begin_relation(READ_STREAM_FULL | READ_STREAM_SEQUENTIAL, NULL, rel, MAIN_FORKNUM,
+										block_range_read_stream_cb, &range, 0);
+	while (at < end)
+	{
+		Buffer		buf = read_stream_next_buffer(stream, NULL);
+		uint32		in_page = (uint32) (at % CH_PAGE_PAYLOAD);
+		uint32		take = (uint32) Min((uint64) (CH_PAGE_PAYLOAD - in_page), end - at);
+
+		if (!BufferIsValid(buf))
+			elog(ERROR, "file \"%s\" ended before its pages", file->path);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(dest + (at - offset), (char *) BufferGetPage(buf) + SizeOfPageHeaderData + in_page, take);
+		UnlockReleaseBuffer(buf);
+		at += take;
+		CHECK_FOR_INTERRUPTS();
+	}
+	read_stream_end(stream);
+	relation_close(rel, NoLock);
 }
 
 /* The relation's pages no part row names: runs of them, ascending, and its end */
