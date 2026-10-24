@@ -1323,7 +1323,13 @@ ch_scan_set_steps(TableScanDesc sscan, const int *step_of, int nsteps)
 	int			i = 0;
 
 	Assert(scan->part == NULL);
-	if (ch_engine()->read_begin_steps == NULL || nsteps < 2 || scan->all_columns || scan->listing != NULL)
+	/*
+	 * Steps are a MergeTree part's granules': an external table's files and a
+	 * table of its own files' (§2.18) are read whole by CH7's readers -- the
+	 * latter's listing made as the scan first reads, so not here yet
+	 */
+	if (ch_engine()->read_begin_steps == NULL || nsteps < 2 || scan->all_columns || scan->listing != NULL ||
+		scan->table->own)
 		return false;
 	old = MemoryContextSwitchTo(scan->scan_cxt);
 	scan->col_step = palloc0(Max(scan->ncols, 1));

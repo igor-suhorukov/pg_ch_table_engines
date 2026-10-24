@@ -1566,8 +1566,19 @@ ch_vexec_register(void)
 		r->ordering = src_ordering;
 		r->next_rest = src_next_rest;
 		r->set_join_keys = src_set_join_keys;
-		r->next_unit = src_next_unit;
-		r->read_unit = src_read_unit;
+		/*
+		 * V8e (minor 7, N2): units the GPU's executor reads itself, a Parquet
+		 * file's row groups and an Arrow file's record batches -- the parquet
+		 * and arrow access methods' tables, external and of their own files.
+		 * The engines' parts and Iceberg's data files are always the CPU's:
+		 * their sources offer no next_unit(), so that vexec prices no device
+		 * read of them (pg_accel's plan/agg.c, units_input())
+		 */
+		if (external && (k - CH_ENGINE_COUNT == CH_EXTERNAL_PARQUET || k - CH_ENGINE_COUNT == CH_EXTERNAL_ARROW))
+		{
+			r->next_unit = src_next_unit;
+			r->read_unit = src_read_unit;
+		}
 		vexec_register_source(r);
 		if (external)
 			continue;

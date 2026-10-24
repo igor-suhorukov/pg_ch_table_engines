@@ -195,6 +195,28 @@ SELECT y, z, count(*) FROM aca GROUP BY y, z ORDER BY y, z LIMIT 3;
  2004 | new |     1
 (3 rows)
 
+-- a qual and other columns, which vexec's scan asks in steps (VC2): read in one step, as an external table's,
+-- the steps being a MergeTree part's granules'
+SELECT count(*), sum(x), sum(y), min(z), max(t) FROM ac WHERE id > 500;
+ count |  sum  |  sum  | min | max  
+-------+-------+-------+-----+------
+   510 | 10055 | 41110 | new | t999
+(1 row)
+
+SELECT count(*), sum(x), sum(y), min(z), max(t) FROM aca WHERE id > 500;
+ count |  sum  |  sum  | min | max  
+-------+-------+-------+-----+------
+   510 | 10055 | 41110 | new | t999
+(1 row)
+
+SELECT t, count(*) FROM ac WHERE t LIKE 't100%' GROUP BY t ORDER BY t LIMIT 3;
+   t   | count 
+-------+-------
+ t100  |     1
+ t1000 |     1
+ t1001 |     1
+(3 rows)
+
 SET vexec.mode = off;
 CREATE INDEX ac_id ON ac (id);
 SET enable_seqscan = off;

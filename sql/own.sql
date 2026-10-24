@@ -105,6 +105,11 @@ SELECT * FROM ac WHERE id IN (1, 1001) ORDER BY id;
 SET vexec.mode = force;
 SELECT y, z, count(*) FROM ac GROUP BY y, z ORDER BY y, z LIMIT 3;
 SELECT y, z, count(*) FROM aca GROUP BY y, z ORDER BY y, z LIMIT 3;
+-- a qual and other columns, which vexec's scan asks in steps (VC2): read in one step, as an external table's,
+-- the steps being a MergeTree part's granules'
+SELECT count(*), sum(x), sum(y), min(z), max(t) FROM ac WHERE id > 500;
+SELECT count(*), sum(x), sum(y), min(z), max(t) FROM aca WHERE id > 500;
+SELECT t, count(*) FROM ac WHERE t LIKE 't100%' GROUP BY t ORDER BY t LIMIT 3;
 SET vexec.mode = off;
 CREATE INDEX ac_id ON ac (id);
 SET enable_seqscan = off;
