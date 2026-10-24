@@ -247,7 +247,9 @@ extern "C" int chte_init(const chte_init_options * options, chte_error * error)
         applySingleThreadedSettings(engine->global);
         /// ClickHouse's time zone where a type names none, UTC, whatever the host's TZ or /etc/localtime says:
         /// the shim's timestamps are UTC's, and an Iceberg table's day, month and hour partitions of a
-        /// timestamp without a zone are UTC's too, which the manifests' pruning computes in it (CH7)
+        /// timestamp without a zone are UTC's too, which the manifests' pruning computes in it (CH7).
+        /// Its tables built by chte_preload in the postmaster, where it preloads the library, and found
+        /// here; built here otherwise
         DateLUT::setDefaultTimezone("UTC");
         applySettings(engine->global, options->settings);
 
@@ -323,6 +325,22 @@ extern "C" void chte_shutdown(void)
     {
         tryLogCurrentException("chte_shutdown");
     }
+}
+
+/// In the postmaster as it preloads the library (the extension's ch_engine_map()): ClickHouse's date
+/// tables of the default time zone chte_init sets, UTC.  DateLUT's constructor builds the table of the
+/// zone the host names -- TZ, else /etc/localtime, here Etc/UTC -- and setDefaultTimezone() UTC's under
+/// its own name, each the days of 1900 to 2299, about 4.4 ms (DateLUT.h:43-48, DateLUT.cpp:194-232):
+/// built in every process's chte_init, the backends' before they plan, every parallel worker's before
+/// it reads.  Built here, they are each forked process's, inherited, and chte_init's
+/// setDefaultTimezone("UTC") finds them.  DateLUT starts no thread and keeps only its tables and a
+/// mutex, which no thread holds as the postmaster forks; nothing else of ClickHouse's is made.
+extern "C" int chte_preload(chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        DateLUT::setDefaultTimezone("UTC");
+    });
 }
 
 extern "C" int chte_register_all_functions(chte_error * error)

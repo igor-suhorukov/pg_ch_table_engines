@@ -3,8 +3,8 @@
  * compiled into one shared library (ch_table_engines.md §2.2).
  *
  * The extension dlopen()s the library on first use in a backend, or in the postmaster as
- * it preloads -- mapped there only, its static initializers run, chte_init never called --
- * and talks to it only through these functions: no C++ type, exception or thread crosses
+ * it preloads -- mapped there, its static initializers run, chte_preload called, chte_init
+ * never -- and talks to it only through these functions: no C++ type, exception or thread crosses
  * this boundary.  Every call runs on the calling thread.  A call that fails returns
  * nonzero and fills *error; the caller turns that into ereport(ERROR) after the call has
  * returned, so ClickHouse's stack is always unwound by ClickHouse.
@@ -67,6 +67,14 @@ typedef struct chte_init_options
 
 /* Initializes the process-wide ClickHouse context; later calls are no-ops. */
 CHTE_API int			chte_init(const chte_init_options *options, chte_error *error);
+
+/*
+ * In the postmaster, after its dlopen(): builds what every process's chte_init would build
+ * alike and that starts no thread -- ClickHouse's date tables of its default time zone, UTC
+ * -- so that each process forked after it inherits them.  Optional: a library built before
+ * it builds them in each process's chte_init, which still sets the zone where it was not.
+ */
+CHTE_API int			chte_preload(chte_error *error);
 
 /*
  * Shuts the process's ClickHouse down: its background executors' idle threads end, so

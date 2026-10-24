@@ -94,13 +94,13 @@ column are apart, which vexec groups as they come (`vexec.enable_sorted_agg`),
 and fetch a sort's late columns alone, at their price -- and a batch sink,
 through which vexec's INSERT writes columns into a table.
 
-Loading.  Preloaded, the postmaster maps the engine library and calls
-nothing of it (`ch.engine_preload`), so that every process forked from it --
-each parallel worker of a query among them -- finds it mapped and relocated;
-ClickHouse's engine starts in each process as it first needs a table,
-registering only the functions the filters use (`ch.engine_functions`), the
-others at the first write, merge or rewrite, or a table whose definition
-names them.  `ch.engine_info()` counts a process's threads and functions.
+Loading.  Preloaded, the postmaster maps the engine library and builds only
+ClickHouse's date tables of its time zone, UTC (`ch.engine_preload`), so that
+every process forked from it -- each parallel worker of a query among them --
+finds it mapped and relocated and those tables built; ClickHouse's engine
+starts in each process as it first needs a table, registering only the
+functions the filters use (`ch.engine_functions`), the others at the first
+write, merge or rewrite, or a table whose definition names them.  `ch.engine_info()` counts a process's threads and functions.
 
 ## Tables of files
 

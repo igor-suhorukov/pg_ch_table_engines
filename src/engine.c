@@ -157,15 +157,20 @@ engine_path(char *path)
  * and relocated once, its static initializers run -- which start no thread
  * and leave nothing a child could not inherit (§2.2) -- so that every
  * process forked from it finds it so, where each mapped it again before, 4
- * to 11 ms a parallel worker.  Nothing of it is called: ClickHouse's context,
- * executors and their threads are each process's own, made as it first needs
- * them (ch_engine()).  A library that cannot be loaded here is left to the
- * processes, which raise their error as they first need it.
+ * to 11 ms a parallel worker.  Of it only chte_preload() is called, which
+ * builds ClickHouse's date tables of the default time zone, UTC, and starts
+ * no thread: each process's chte_init built two, 8.8 ms of its engine's 9.9
+ * since CH7 set the zone.  ClickHouse's context, executors and their threads
+ * are each process's own, made as it first needs them (ch_engine()).  A
+ * library that cannot be loaded here is left to the processes, which raise
+ * their error as they first need it; one without chte_preload(), or whose
+ * call fails, has each process build its tables.
  */
 void
 ch_engine_map(void)
 {
 	char		path[MAXPGPATH];
+	int			(*preload) (chte_error *error);
 
 	Assert(!IsUnderPostmaster);
 	engine_path(path);
@@ -179,6 +184,17 @@ ch_engine_map(void)
 		return;
 	}
 	strlcpy(mapped_path, path, sizeof(mapped_path));
+
+	*(void **) &preload = dlsym(mapped_handle, "chte_preload");
+	if (preload != NULL)
+	{
+		chte_error	err;
+
+		if (preload(&err) != 0)
+			ereport(WARNING,
+					(errmsg("the engine library could not build its date tables in the postmaster: %s", err.message),
+					 errdetail("ClickHouse error code %d.  Each process builds them as it starts the engine.", err.code)));
+	}
 }
 
 const ChEngine *
