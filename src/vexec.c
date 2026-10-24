@@ -87,6 +87,7 @@
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/datum.h"
@@ -1244,6 +1245,126 @@ src_aggregate(void *arg, int nreqs, const VexecSourceAgg *reqs, VexecSourceAggAn
 	return true;
 }
 
+/*
+ * V8e (pg_vector_executor.md §3.25, N2): the scan's next unit for the GPU's
+ * executor to read itself, between batches (minor 7).  A unit of an
+ * external Parquet or Arrow table's file, of no deletion, whose columns
+ * the executor finds by their names there -- a column's file name is its
+ * attribute's, matched exactly by libcudf, and a name of a nested column's
+ * form, with a dot, is not -- is handed so, and passed over; any other is
+ * the CPU's, read by the next batches alone.  The token keeps what
+ * read_unit() reads again: the file's part and the granules' ranges.
+ */
+typedef struct SrcUnit
+{
+	const ChPart *part;
+	chte_mark_range *ranges;
+	int			nranges;
+	uint64		rows;
+} SrcUnit;
+
+static bool
+unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
+{
+	ChExternalKind kind;
+	chte_external_file info;
+	SrcUnit    *keep;
+	int32	   *parts;
+	int			nparts;
+	const char **names;
+	uint8	   *flags;
+	MemoryContext old;
+
+	if (unit->part->listing == NULL || unit->deletions || unit->part->deletes ||
+		!ch_is_external_rel(st->rel, &kind) || (kind != CH_EXTERNAL_PARQUET && kind != CH_EXTERNAL_ARROW) ||
+		st->tids || st->ncols == 0)
+		return false;
+	old = MemoryContextSwitchTo(st->cxt);
+	names = palloc(sizeof(char *) * st->ncols);
+	flags = palloc0(sizeof(uint8) * st->ncols);
+	for (int i = 0; i < st->ncols; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(st->rel), st->cols[i].attnum - 1);
+		const char *name = NameStr(att->attname);
+
+		if (strchr(name, '.') != NULL)
+		{
+			MemoryContextSwitchTo(old);
+			return false;
+		}
+		names[i] = name;
+		if (att->attnotnull)
+			flags[i] |= VEXEC_UNIT_NOT_NULL;
+		if ((att->atttypid == TEXTOID || att->atttypid == VARCHAROID || att->atttypid == JSONOID) &&
+			GetDatabaseEncoding() == PG_UTF8)
+			flags[i] |= VEXEC_UNIT_CHECK_UTF8;
+	}
+	CH_CALL("listing a table's files",
+			ch_engine()->external_file_info(unit->part->listing->handle, (size_t) unit->part->file, &info, CH_ERR));
+	keep = palloc0(sizeof(SrcUnit));
+	nparts = ch_scan_unit_parts(st->scan, &parts, &keep->ranges, &keep->nranges);
+	keep->part = unit->part;
+	keep->rows = unit->rows;
+	MemoryContextSwitchTo(old);
+
+	u->format = kind == CH_EXTERNAL_PARQUET ? VEXEC_UNIT_PARQUET : VEXEC_UNIT_ARROW;
+	u->path = MemoryContextStrdup(st->cxt, info.path);
+	u->file_size = info.size;
+	u->file_mtime = info.mtime;
+	u->nparts = nparts;
+	u->parts = parts;
+	u->rows = unit->rows;
+	u->names = names;
+	u->column_flags = flags;
+	u->deleted = NULL;
+	u->token = keep;
+	return true;
+}
+
+static bool
+src_next_unit(void *arg, VexecSourceUnit *u)
+{
+	SrcState   *st = arg;
+	ChScanUnit	unit;
+
+	if (st->have_batch && st->pos < st->batch.nrows)
+		elog(ERROR, "a unit claimed inside a batch");
+	st->have_batch = false;
+	if (!ch_scan_claim_unit(st->scan, &unit))
+		return false;
+	if (unit.rows == 0)
+	{
+		/* none of its granules kept: read as nothing, here */
+		ch_scan_one_unit(st->scan);
+		u->format = VEXEC_UNIT_CPU;
+		return true;
+	}
+	if (!unit_for_device(st, &unit, u))
+	{
+		ch_scan_one_unit(st->scan);
+		u->format = VEXEC_UNIT_CPU;
+		return true;
+	}
+	ch_scan_pass_unit(st->scan);
+	/* as getnextslot counts each row it returns */
+	if (pgstat_should_count_relation(st->rel))
+		st->rel->pgstat_info->counts.tuples_returned += unit.rows;
+	return true;
+}
+
+/* V8e: a unit next_unit() handed for the device, read by the next batches alone (minor 7) */
+static void
+src_read_unit(void *arg, const VexecSourceUnit *u)
+{
+	SrcState   *st = arg;
+	SrcUnit    *keep = (SrcUnit *) u->token;
+
+	if (st->have_batch && st->pos < st->batch.nrows)
+		elog(ERROR, "a unit read again inside a batch");
+	st->have_batch = false;
+	ch_scan_read_unit(st->scan, keep->part, keep->ranges, keep->nranges, keep->rows);
+}
+
 /* The library's id of the dictionary of a column of the last batch (minor 3) */
 static uint64
 src_dictionary_id(void *arg, int column)
@@ -1412,6 +1533,8 @@ ch_vexec_register(void)
 		r->ordering = src_ordering;
 		r->next_rest = src_next_rest;
 		r->set_join_keys = src_set_join_keys;
+		r->next_unit = src_next_unit;
+		r->read_unit = src_read_unit;
 		vexec_register_source(r);
 		if (external)
 			continue;

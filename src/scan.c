@@ -146,6 +146,7 @@ typedef struct ChScanDescData
 	size_t		ranges_cap;
 	uint64		unit_rows;		/* rows of the granules kept */
 	uint64		count_left;		/* a scan of no column: rows of the unit not yet handed */
+	bool		one_unit;		/* V8e: the claimed unit's batches alone, then an end */
 	chte_reader *reader;
 	ResourceOwner reader_owner;
 	uint32		nrows;			/* of the batch */
@@ -706,6 +707,12 @@ next_batch(ChScanDesc scan)
 		}
 		if (scan->part == NULL)
 		{
+			/* V8e: the one unit asked for is read: an end, once */
+			if (scan->one_unit)
+			{
+				scan->one_unit = false;
+				return false;
+			}
 			refresh_filter(scan);
 			if (!claim_unit(scan))
 				return false;
@@ -1030,6 +1037,7 @@ ch_scan_rescan(TableScanDesc sscan, ScanKeyData *key, bool set_params,
 
 	release_unit(scan);
 	scan->next_unit = 0;
+	scan->one_unit = false;
 	scan->position = 0;
 	scan->block_end = 0;
 	scan->bm_nrows = scan->bm_pos = 0;
@@ -1376,6 +1384,94 @@ ch_scan_pass_unit(TableScanDesc sscan)
 	Assert(scan->part != NULL && scan->reader == NULL);
 	scan->counts.units_passed++;
 	release_unit(scan);
+}
+
+/*
+ * V8e (pg_vector_executor.md §3.25, N2): the claimed unit read by the next
+ * batches alone, which then end -- ch_scan_next_batch() returns false once,
+ * at the unit's end -- the scan going on at the next call.
+ */
+void
+ch_scan_one_unit(TableScanDesc sscan)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	Assert(scan->part != NULL && scan->reader == NULL);
+	scan->one_unit = true;
+}
+
+/*
+ * V8e: the claimed unit's units of its part -- an external table's file's
+ * row groups or record batches -- that the filter keeps, ascending, into
+ * *parts (palloc'd); and its granules' ranges, which ch_scan_read_unit()
+ * takes back.
+ */
+int
+ch_scan_unit_parts(TableScanDesc sscan, int32 **parts, chte_mark_range **ranges, int *nranges)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	int			n = 0;
+
+	Assert(scan->part != NULL && scan->selected);
+	if (scan->nranges == 0)
+	{
+		uint32		end = scan->unit_end ? scan->unit_end : (uint32) scan->part->marks;
+
+		*parts = palloc(sizeof(int32) * Max(end - scan->unit_begin, 1));
+		for (uint32 u = scan->unit_begin; u < end; u++)
+			(*parts)[n++] = (int32) u;
+		*ranges = palloc(sizeof(chte_mark_range));
+		(*ranges)[0].begin = scan->unit_begin;
+		(*ranges)[0].end = end;
+		*nranges = 1;
+		return n;
+	}
+	{
+		int			total = 0;
+
+		for (size_t i = 0; i < scan->nranges; i++)
+			total += scan->ranges[i].end - scan->ranges[i].begin;
+		*parts = palloc(sizeof(int32) * Max(total, 1));
+		for (size_t i = 0; i < scan->nranges; i++)
+			for (uint32 u = scan->ranges[i].begin; u < scan->ranges[i].end; u++)
+				(*parts)[n++] = (int32) u;
+	}
+	*ranges = palloc(sizeof(chte_mark_range) * scan->nranges);
+	memcpy(*ranges, scan->ranges, sizeof(chte_mark_range) * scan->nranges);
+	*nranges = (int) scan->nranges;
+	return n;
+}
+
+/*
+ * V8e: a unit the scan claimed and passed over, read by the next batches
+ * alone: its part's granules' ranges and their rows, as
+ * ch_scan_unit_parts() gave them.  For a device that lost them, or refused
+ * them, so that the reader raises what it raises.
+ */
+void
+ch_scan_read_unit(TableScanDesc sscan, const ChPart *part, const chte_mark_range *ranges, int nranges, uint64 rows)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	if (scan->reader != NULL || scan->part != NULL || scan->count_left > 0)
+		elog(ERROR, "a unit read again while another is being read");
+	/* one of the scan's own parts, which ch_scan_claim_unit() handed out */
+	scan->part = unconstify(ChPart *, part);
+	scan->unit_whole = false;
+	scan->unit_begin = 0;
+	scan->unit_end = 0;
+	if (scan->ranges_cap < (size_t) nranges)
+	{
+		scan->ranges = scan->ranges ? repalloc(scan->ranges, sizeof(chte_mark_range) * nranges) :
+			MemoryContextAlloc(scan->scan_cxt, sizeof(chte_mark_range) * Max(nranges, 1));
+		scan->ranges_cap = nranges;
+	}
+	memcpy(scan->ranges, ranges, sizeof(chte_mark_range) * nranges);
+	scan->nranges = nranges;
+	scan->unit_rows = rows;
+	scan->selected = true;
+	unit_deletions(scan);
+	scan->one_unit = true;
 }
 
 ChTable *

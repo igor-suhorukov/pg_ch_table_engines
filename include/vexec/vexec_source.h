@@ -46,11 +46,12 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		6	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		7	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
 									 * price; 5: columns in steps; 6:
-									 * set_join_keys */
+									 * set_join_keys; 7: next_unit,
+									 * read_unit */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -251,6 +252,48 @@ typedef struct VexecSourceEstimate
 #define VEXEC_EST_AGG_EXACT		0x0001
 
 /*
+ * A unit a source hands for the GPU's executor to read itself, from its file
+ * (from minor version 7, next_unit(); pg_vector_executor.md §3.25, N2):
+ * some row groups of a Parquet file, some record batches of an Arrow IPC
+ * file.  The file is named by its path and pinned by the identity the
+ * source's listing gave it, which the executor checks before it reads; the
+ * spec's columns by their names in the file, each with what the source's
+ * own reader checks of its values as it reads them, which the executor
+ * checks too -- a unit that fails a check is read again on the CPU, whose
+ * reader raises the error.  A date is read as days, a timestamp as its
+ * file's unit, both from 1970-01-01, a decimal at its file's scale; the
+ * executor moves them to PostgreSQL's.
+ */
+typedef enum VexecUnitFormat
+{
+	VEXEC_UNIT_CPU,				/* not the device's: next() hands its rows */
+	VEXEC_UNIT_PARQUET,
+	VEXEC_UNIT_ARROW			/* Arrow IPC's file format */
+} VexecUnitFormat;
+
+/* VexecSourceUnit.column_flags */
+#define VEXEC_UNIT_NOT_NULL		0x01	/* a NULL is an error */
+#define VEXEC_UNIT_CHECK_UTF8	0x02	/* a string that is not UTF-8, or holds a
+										 * zero byte, is an error */
+
+typedef struct VexecSourceUnit
+{
+	Size		size;			/* sizeof as the caller was built */
+	uint8		format;			/* VexecUnitFormat */
+	const char *path;			/* the file, an absolute path */
+	uint64		file_size;		/* its identity, as the source listed it */
+	int64		file_mtime;		/* nanoseconds since 1970 */
+	int			nparts;			/* its row groups or record batches: */
+	const int32 *parts;			/* their indexes in the file, ascending */
+	uint64		rows;			/* their rows, deleted ones among them */
+	const char *const *names;	/* per spec column: the file's name of it */
+	const uint8 *column_flags;	/* per spec column: VEXEC_UNIT_* */
+	const uint64 *deleted;		/* rows bits, 1 = a row the snapshot does not
+								 * see; NULL: it sees every one */
+	void	   *token;			/* the source's own: what read_unit() names */
+} VexecSourceUnit;
+
+/*
  * A source.  vexec begins the scan itself through the generic wrappers
  * (table_beginscan, table_beginscan_parallel), so the access method keeps
  * the snapshot's registration, predicate locks, parallel units, rescan and
@@ -408,6 +451,32 @@ typedef struct VexecSourceRoutine
 	 * keeps.
 	 */
 	void		(*set_join_keys) (void *state, int nkeys, const ScanKeyData *keys);
+
+	/*
+	 * Optional, from minor version 7: the scan's next unit, claimed as next()
+	 * claims its units -- a parallel scan's among its participants, the
+	 * spec's quals pruning as they prune -- between batches, for the GPU's
+	 * executor to read itself (pg_vector_executor.md §3.25, N2): true with
+	 * *unit filled, false at the scan's end.  A unit of a device's format the
+	 * scan passes over, its rows counted in the statistics as handed; the
+	 * executor reads them from the file.  A unit the source cannot hand so --
+	 * a file of another kind, a column the executor's reader may not decode
+	 * as the source's does -- comes as VEXEC_UNIT_CPU: next() then hands its
+	 * rows, and returns false at its end, and the scan goes on at the next
+	 * call of next_unit().  Called only for a scan begun with no keys, its
+	 * columns in one step, without TIDs.  The unit's pointers are the
+	 * source's until the next call of next_unit() or read_unit(), or the
+	 * scan's end.
+	 */
+	bool		(*next_unit) (void *state, VexecSourceUnit *unit);
+
+	/*
+	 * Optional, from minor version 7: a unit next_unit() handed for the
+	 * device, read again by next() -- its rows, then false -- for an executor
+	 * that lost them, or a unit whose values failed a check there, so that
+	 * the source's reader raises its error.  Its rows are counted again.
+	 */
+	void		(*read_unit) (void *state, const VexecSourceUnit *unit);
 } VexecSourceRoutine;
 
 /*

@@ -160,10 +160,13 @@ ChScan and vexec's source read them as they read the engines' tables: the
 row groups whose statistics rule a filter out are not read (`EXPLAIN
 ANALYZE` counts them), nor the pages their page index rules out, and vexec's
 aggregates of a whole file come from its statistics; an Arrow file's record
-batches, which carry no statistics, are all read.  A row's TID is its file's
-first row's id and its place there -- an Iceberg data file's deleted rows
-counted.  INSERT, UPDATE, DELETE, row locks, indexes and TABLESAMPLE are
-refused, and so are partitions of these tables.
+batches, which carry no statistics, are all read.  With pg_accel's
+`vexec_gpu`, vexec's groupings over Parquet and Arrow files may have the GPU
+read and decode their row groups and record batches itself; an Iceberg
+table's data files, and any unit the GPU refuses, are read here.  A row's
+TID is its file's first row's id and its place there -- an Iceberg data
+file's deleted rows counted.  INSERT, UPDATE, DELETE, row locks, indexes
+and TABLESAMPLE are refused, and so are partitions of these tables.
 
 pg_dump leaves their rows out: `COPY t TO ...`, the table form, returns none,
 saying so, and `COPY (SELECT * FROM t) TO ...` reads them; a restored table

@@ -84,6 +84,15 @@ extern void ch_scan_set_unit_check(TableScanDesc scan, ChUnitCheck check, void *
 extern bool ch_scan_claim_unit(TableScanDesc scan, ChScanUnit *unit);
 extern void ch_scan_pass_unit(TableScanDesc scan);
 
+/*
+ * V8e: the claimed unit's batches alone, then an end; its units of its part,
+ * the filter's; and a unit passed over read again by the next batches alone
+ */
+extern void ch_scan_one_unit(TableScanDesc scan);
+extern int	ch_scan_unit_parts(TableScanDesc scan, int32 **parts, chte_mark_range **ranges, int *nranges);
+extern void ch_scan_read_unit(TableScanDesc scan, const ChPart *part, const chte_mark_range *ranges, int nranges,
+							  uint64 rows);
+
 extern ChTable *ch_scan_table(TableScanDesc scan);
 extern const ChScanCounts *ch_scan_counts(TableScanDesc scan);
 
