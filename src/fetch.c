@@ -434,7 +434,7 @@ scan_columns(PlanState *ps, const Need *need, WalkState *ws)
 	int			n = 0;
 	int			x = -1;
 
-	if (rel == NULL || !ch_is_engine_rel(rel, NULL))
+	if (rel == NULL || !ch_is_mvcc_rel(rel))
 		return;
 	if (IsA(ps, IndexOnlyScanState))
 	{
@@ -577,7 +577,7 @@ has_fetching_scan(PlanState *ps, void *arg)
 		case T_BitmapHeapScanState:
 		case T_TidScanState:
 			if (((ScanState *) ps)->ss_currentRelation != NULL &&
-				ch_is_engine_rel(((ScanState *) ps)->ss_currentRelation, NULL))
+				ch_is_mvcc_rel(((ScanState *) ps)->ss_currentRelation))
 				return true;
 			break;
 		default:
@@ -731,7 +731,7 @@ ch_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	if (rte->rtekind != RTE_RELATION || rel->indexlist == NIL)
 		return;
 	relation = table_open(rte->relid, NoLock);
-	if (ch_is_engine_rel(relation, NULL))
+	if (ch_is_mvcc_rel(relation))
 	{
 		RelPrice   *rp = palloc0(sizeof(RelPrice));
 		TupleDesc	desc = RelationGetDescr(relation);
@@ -739,7 +739,8 @@ ch_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		ListCell   *lc;
 
 		ch_relation_options(relation, &opts);
-		rp->granularity = opts.index_granularity;
+		/* a table of its own files' row is read from its part's page of each column (§2.18) */
+		rp->granularity = ch_is_own_rel(relation) ? 131072 : opts.index_granularity;
 		if (opts.order_by != NULL)
 		{
 			char	   *copy = pstrdup(opts.order_by);

@@ -22,6 +22,7 @@
  */
 #include "external.h"
 
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnDecimal.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
@@ -129,6 +130,10 @@ struct chte_file_writer
     /// an Iceberg table's writer (iceberg.cpp), which the rows go to in place of a file
     std::shared_ptr<chte::IcebergWriter> iceberg;
     bool finished = false;
+    /// chte_own_write_begin's (§2.18): the rows written in slices of exactly these rows, but the last, 0 as they
+    /// come; the rows of a slice not yet whole
+    size_t slice_rows = 0;
+    DB::MutableColumns pending;
 };
 
 using namespace chte;
@@ -262,6 +267,9 @@ bool takes(const ExternalColumn & column, const DataTypePtr & file_type)
         default:
             break;
     }
+    /// a table of its own files' one-byte column, "char" and its kin (§2.18)
+    if (caller.isInt8())
+        return file.isInt8();
     if (caller.isInt16())
         return file.isInt8() || file.isUInt8() || file.isInt16();
     if (caller.isInt32())
@@ -271,6 +279,9 @@ bool takes(const ExternalColumn & column, const DataTypePtr & file_type)
             || file.isInt64();
     if (caller.isUInt32())
         return file.isUInt8() || file.isUInt16() || file.isUInt32();
+    /// a table of its own files' _pg_rowid (§2.18)
+    if (caller.isUInt64())
+        return file.isUInt64();
     if (caller.isFloat32())
         return file.isFloat32();
     if (caller.isFloat64())
@@ -329,6 +340,15 @@ void resolveColumns(const ExternalTable & table, ResolvedFile & file, const Stri
     {
         bool ambiguous;
         const auto * in_file = findColumn(file.schema, column.file_name, ambiguous);
+        if (!in_file && !ambiguous && table.own && column.name != ROWID)
+        {
+            /// a table of its own files' column added after the file was written (§2.18)
+            file.names.emplace_back();
+            file.file_types.push_back(nullptr);
+            file.nullable.push_back(1);
+            file.absent.push_back(1);
+            continue;
+        }
         if (!in_file && ambiguous)
             throw Exception(ErrorCodes::THERE_IS_NO_COLUMN,
                             "column \"{}\" of \"{}\" names more than one column of {} regardless of case, and none exactly",
@@ -344,6 +364,7 @@ void resolveColumns(const ExternalTable & table, ResolvedFile & file, const Stri
         file.names.push_back(in_file->name);
         file.file_types.push_back(in_file->type);
         file.nullable.push_back(isNullableOrLowCardinalityNullable(in_file->type) ? 1 : 0);
+        file.absent.push_back(0);
     }
 }
 
@@ -569,6 +590,8 @@ Block fileHeader(const ExternalTable & table, const ResolvedFile & file, const N
     for (const auto & name : names)
     {
         size_t i = table.columnIndex(name);
+        if (file.isAbsent(i))
+            continue;
         DataTypePtr type = fileReadType(table, file, i);
         header.insert({type->createColumn(), type, file.names[i]});
     }
@@ -729,6 +752,13 @@ struct PipelineRead
                     continue;
                 }
                 const auto & column = table->columns[columns[c]];
+                if (positions[c] == ABSENT)
+                {
+                    /// not in the file: defaults, which the caller passes over (chte_read_present)
+                    out.emplace_back(column.type->createColumnConstWithDefaultValue(rows)->convertToFullColumnIfConst(),
+                                     column.type, column.name);
+                    continue;
+                }
                 ColumnPtr col = in.at(positions[c]);
                 if (casts[c])
                 {
@@ -766,9 +796,11 @@ std::unique_ptr<chte_reader> openExternalReader(chte_table & table, const chte_e
         return openIcebergReader(table, listing, listed, filter, names, std::move(rows_to_read));
     auto resolved = resolvedFor(ext, listing, listed);
 
+    /// the row id a row's place, but a table of its own files' (§2.18), a column of the file
     Names read;
     for (const auto & name : names)
-        if (name != ROWID && std::find(read.begin(), read.end(), name) == read.end())
+        if ((name != ROWID || ext.own) && std::find(read.begin(), read.end(), name) == read.end() &&
+            !(name != ROWID && resolved->isAbsent(ext.columnIndex(name))))
             read.push_back(name);
     auto header = std::make_shared<const Block>(fileHeader(ext, *resolved, read));
 
@@ -814,7 +846,7 @@ std::unique_ptr<chte_reader> pipelineReader(chte_table & table, std::shared_ptr<
     const auto & header = state->pipeline.getHeader();
     for (const auto & name : names)
     {
-        if (name == ROWID)
+        if (name == ROWID && !ext.own)
         {
             state->columns.push_back(SIZE_MAX);
             state->positions.push_back(SIZE_MAX);
@@ -823,6 +855,14 @@ std::unique_ptr<chte_reader> pipelineReader(chte_table & table, std::shared_ptr<
             continue;
         }
         size_t i = ext.columnIndex(name);
+        if (state->resolved->isAbsent(i))
+        {
+            state->columns.push_back(i);
+            state->positions.push_back(ABSENT);
+            state->types.push_back(nullptr);
+            state->casts.push_back(nullptr);
+            continue;
+        }
         size_t position = header.getPositionByName(state->resolved->names[i]);
         state->columns.push_back(i);
         state->positions.push_back(position);
@@ -834,6 +874,9 @@ std::unique_ptr<chte_reader> pipelineReader(chte_table & table, std::shared_ptr<
     auto r = std::make_unique<chte_reader>();
     r->table = &table;
     r->present.assign(names.size(), 1);
+    for (size_t c = 0; c < names.size(); ++c)
+        if (state->positions[c] == ABSENT)
+            r->present[c] = 0;
     r->next_block = [raw = state.get()](Block & block) { return raw->next(block); };
     r->external_state = std::move(state);
     return r;
@@ -974,56 +1017,88 @@ void keepExternalFilter(chte_filter & filter, const chte_filter_node * nodes, si
 
 }
 
-extern "C" int chte_external_open(const chte_external_def * def, chte_table ** table, chte_error * error)
+namespace
 {
-    return guarded(error, [&]
+
+/// An external table, or one of its own files (§2.18): its location not read, its _pg_rowid a column of the files
+void openExternal(const chte_external_def * def, bool own, chte_table ** table)
+{
+    auto & e = engine();
+    if (!def || (!def->location && !own))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: location is required");
+    if (own ? def->format != CHTE_EXTERNAL_PARQUET && def->format != CHTE_EXTERNAL_ARROW
+            : def->format != CHTE_EXTERNAL_PARQUET && def->format != CHTE_EXTERNAL_ARROW && def->format != CHTE_EXTERNAL_ICEBERG)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} tables of format {} are not supported", own ? "own files'" : "external",
+                        def->format);
+    auto ext = std::make_shared<ExternalTable>();
+    ext->format = def->format;
+    ext->name = def->name && *def->name ? def->name : "table";
+    ext->own = own;
+    if (!own)
     {
-        auto & e = engine();
-        if (!def || !def->location)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: location is required");
-        if (def->format != CHTE_EXTERNAL_PARQUET && def->format != CHTE_EXTERNAL_ARROW && def->format != CHTE_EXTERNAL_ICEBERG)
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "external tables of format {} are not supported", def->format);
-        auto ext = std::make_shared<ExternalTable>();
-        ext->format = def->format;
-        ext->name = def->name && *def->name ? def->name : "table";
         ext->location = def->location;
         if (ext->location.empty() || ext->location.front() != '/')
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "location {} is not an absolute path", ext->location);
-        ext->context = Context::createCopy(e.global);
-        applySettings(ext->context, def->settings);
-        /// whatever the caller's settings say, nothing starts a thread; and an Iceberg table's metadata is read
-        /// again for each statement, which ClickHouse's cache of it would not (its latest version kept a while)
-        applySingleThreadedSettings(ext->context);
-        ext->context->setSetting("use_iceberg_metadata_files_cache", Field(false));
-        ext->format_settings = getFormatSettings(ext->context);
-        forceFormatSettings(ext->format_settings);
-        ext->read_options = readOptions(ext->format_settings);
-        for (size_t i = 0; i < def->ncolumns; ++i)
-        {
-            const auto & c = def->columns[i];
-            if (!c.name || !c.type)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: column {} has no name or type", i);
-            ExternalColumn column;
-            column.name = c.name;
-            column.file_name = c.file_name && *c.file_name ? c.file_name : c.name;
-            column.type = DataTypeFactory::instance().get(c.type);
-            column.convert = c.convert;
-            column.not_null = c.not_null != 0;
-            column.check_utf8 = c.check_utf8 != 0;
-            column.read_type = readType(column);
-            if ((column.convert == CHTE_CONVERT_DATE && !WhichDataType(column.type).isInt32())
-                || (column.convert == CHTE_CONVERT_TIMESTAMP && !WhichDataType(column.type).isInt64())
-                || (column.check_utf8 && !WhichDataType(column.type).isString()))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: column {} of type {} cannot be converted so",
-                                column.name, column.type->getName());
-            ext->by_name.emplace(column.name, ext->columns.size());
-            ext->columns.push_back(std::move(column));
-        }
-        auto t = std::make_unique<chte_table>();
-        t->context = ext->context;
-        t->external = std::move(ext);
-        *table = t.release();
-    });
+    }
+    ext->context = Context::createCopy(e.global);
+    applySettings(ext->context, def->settings);
+    /// whatever the caller's settings say, nothing starts a thread; and an Iceberg table's metadata is read
+    /// again for each statement, which ClickHouse's cache of it would not (its latest version kept a while)
+    applySingleThreadedSettings(ext->context);
+    ext->context->setSetting("use_iceberg_metadata_files_cache", Field(false));
+    ext->format_settings = getFormatSettings(ext->context);
+    forceFormatSettings(ext->format_settings);
+    ext->read_options = readOptions(ext->format_settings);
+    for (size_t i = 0; i < def->ncolumns; ++i)
+    {
+        const auto & c = def->columns[i];
+        if (!c.name || !c.type)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: column {} has no name or type", i);
+        ExternalColumn column;
+        column.name = c.name;
+        column.file_name = c.file_name && *c.file_name ? c.file_name : c.name;
+        column.type = DataTypeFactory::instance().get(c.type);
+        column.convert = c.convert;
+        column.not_null = c.not_null != 0;
+        column.check_utf8 = c.check_utf8 != 0;
+        column.read_type = readType(column);
+        if ((column.convert == CHTE_CONVERT_DATE && !WhichDataType(column.type).isInt32())
+            || (column.convert == CHTE_CONVERT_TIMESTAMP && !WhichDataType(column.type).isInt64())
+            || (column.check_utf8 && !WhichDataType(column.type).isString()))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_external_open: column {} of type {} cannot be converted so",
+                            column.name, column.type->getName());
+        ext->by_name.emplace(column.name, ext->columns.size());
+        ext->columns.push_back(std::move(column));
+    }
+    if (own)
+    {
+        /// each row's id, which every file of the table holds, never NULL
+        if (ext->by_name.contains(ROWID))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_own_open: a column of the caller's is named {}", ROWID);
+        ExternalColumn column;
+        column.name = column.file_name = ROWID;
+        column.type = std::make_shared<DataTypeUInt64>();
+        column.not_null = true;
+        column.read_type = readType(column);
+        ext->by_name.emplace(column.name, ext->columns.size());
+        ext->columns.push_back(std::move(column));
+    }
+    auto t = std::make_unique<chte_table>();
+    t->context = ext->context;
+    t->external = std::move(ext);
+    *table = t.release();
+}
+
+}
+
+extern "C" int chte_external_open(const chte_external_def * def, chte_table ** table, chte_error * error)
+{
+    return guarded(error, [&] { openExternal(def, /* own= */ false, table); });
+}
+
+extern "C" int chte_own_open(const chte_external_def * def, chte_table ** table, chte_error * error)
+{
+    return guarded(error, [&] { openExternal(def, /* own= */ true, table); });
 }
 
 extern "C" int chte_external_list(chte_table * table, chte_external_listing ** listing, chte_error * error)
@@ -1031,6 +1106,8 @@ extern "C" int chte_external_list(chte_table * table, chte_external_listing ** l
     return guarded(error, [&]
     {
         auto & ext = externalOf(table);
+        if (ext.own)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "a table of its own files has no location to list");
         if (ext.format == CHTE_EXTERNAL_ICEBERG)
         {
             auto l = std::make_unique<chte_external_listing>();
@@ -1152,6 +1229,8 @@ extern "C" int chte_external_schema(chte_table * table, const chte_external_fiel
     return guarded(error, [&]
     {
         auto & ext = externalOf(table);
+        if (ext.own)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "a table of its own files has no location to infer its columns from");
         ext.schema.clear();
         ext.schema_types.clear();
         ext.fields.clear();
@@ -1341,44 +1420,148 @@ void registerOutputFormats()
 
 }
 
+namespace
+{
+
+/// A writer of a file, its blocks written in slices of slice_rows (0: whole)
+std::unique_ptr<chte_file_writer> fileWriteBegin(const char * format, const char * path, const chte_file_column * columns,
+                                                 size_t ncolumns, const char * settings, size_t slice_rows)
+{
+    auto & e = engine();
+    if (!format || !path || *path != '/')
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_file_write_begin: a format and an absolute path are required");
+    String name = format;
+    if (name == "Parquet")
+        registerOutputFormats();
+    else if (name == "Arrow")
+        registerArrowOutput();
+    else
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "files of format {} are not written", name);
+    auto w = std::make_unique<chte_file_writer>();
+    w->path = path;
+    w->temp_path = fmt::format("{}.tmp{}", path, getpid());
+    w->slice_rows = slice_rows;
+    w->context = Context::createCopy(e.global);
+    applySettings(w->context, settings);
+    applySingleThreadedSettings(w->context);
+    auto format_settings = getFormatSettings(w->context);
+    forceFormatSettings(format_settings);
+    for (size_t i = 0; i < ncolumns; ++i)
+    {
+        const auto & c = columns[i];
+        if (!c.name || !c.type || !c.source)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_file_write_begin: column {} has no name, type or source", i);
+        auto type = DataTypeFactory::instance().get(c.type);
+        w->types.push_back(type);
+        w->sources.push_back(makeNullable(DataTypeFactory::instance().get(c.source)));
+        w->converts.push_back(c.convert);
+        w->header.insert({type->createColumn(), type, c.name});
+    }
+    w->out = std::make_unique<WriteBufferFromFile>(w->temp_path);
+    w->format = FormatFactory::instance().getOutputFormat(name, *w->out, w->header, w->context, format_settings);
+    return w;
+}
+
+/// A column of the caller's values -- a batch's vector of its source type, or a reader's of a table's type -- as
+/// the file's column c holds them: days and microseconds moved to 1970's epoch, cast to the file's type
+ColumnWithTypeAndName fileColumn(const chte_file_writer & writer, size_t c, ColumnWithTypeAndName value)
+{
+    if (writer.converts[c] == CHTE_CONVERT_DATE)
+    {
+        auto days = castColumn(value, makeNullable(std::make_shared<DataTypeInt32>()));
+        auto mutable_days = IColumn::mutate(std::move(days));
+        for (auto & v : assert_cast<ColumnInt32 &>(assert_cast<ColumnNullable &>(*mutable_days).getNestedColumn()).getData())
+            v += PG_EPOCH_DAYS;
+        value = {std::move(mutable_days), makeNullable(std::make_shared<DataTypeDate32>()), ""};
+    }
+    else if (writer.converts[c] == CHTE_CONVERT_TIMESTAMP)
+    {
+        auto micros = castColumn(value, makeNullable(std::make_shared<DataTypeInt64>()));
+        const auto & nullable = assert_cast<const ColumnNullable &>(*micros);
+        auto timestamps = ColumnDecimal<DateTime64>::create(0, 6);
+        for (auto v : assert_cast<const ColumnInt64 &>(nullable.getNestedColumn()).getData())
+            timestamps->insertValue(DateTime64(v + PG_EPOCH_MICROSECONDS));
+        value = {ColumnNullable::create(std::move(timestamps), nullable.getNullMapColumnPtr()),
+                 makeNullable(std::make_shared<DataTypeDateTime64>(6, "UTC")), ""};
+    }
+    return {castColumn(value, writer.types[c]), writer.types[c], writer.header.getByPosition(c).name};
+}
+
+/// The rows of a slice gathered so far written, a block of the file's columns
+void writePending(chte_file_writer & writer)
+{
+    if (writer.pending.empty() || writer.pending[0]->empty())
+        return;
+    ColumnsWithTypeAndName piece;
+    for (size_t c = 0; c < writer.pending.size(); ++c)
+    {
+        const auto & column = writer.header.getByPosition(c);
+        piece.emplace_back(std::move(writer.pending[c]), column.type, column.name);
+        writer.pending[c] = column.type->createColumn();
+    }
+    writer.format->write(Block(std::move(piece)));
+}
+
+/// A block of the file's columns written: to an Iceberg table's writer, or the file's format -- where the writer has
+/// slices, gathered into slices of exactly slice_rows, so that a format that gathers its rows to a target of a
+/// multiple of them cuts its units at that target, whatever blocks come
+void writeFileBlock(chte_file_writer & writer, Block block)
+{
+    if (writer.iceberg)
+    {
+        icebergWrite(*writer.iceberg, std::move(block));
+        return;
+    }
+    if (writer.slice_rows == 0)
+    {
+        writer.format->write(block);
+        return;
+    }
+    if (writer.pending.empty())
+        for (const auto & column : writer.header)
+            writer.pending.push_back(column.type->createColumn());
+    size_t rows = block.rows();
+    for (size_t at = 0; at < rows;)
+    {
+        size_t n = std::min(writer.slice_rows - writer.pending[0]->size(), rows - at);
+        for (size_t c = 0; c < writer.pending.size(); ++c)
+            writer.pending[c]->insertRangeFrom(*block.getByPosition(c).column, at, n);
+        at += n;
+        if (writer.pending[0]->size() == writer.slice_rows)
+            writePending(writer);
+    }
+}
+
+/// The file finished, synced and renamed to its path: its bytes
+UInt64 fileWriteFinish(chte_file_writer & writer)
+{
+    writePending(writer);
+    writer.format->finalize();
+    writer.out->finalize();
+    writer.out->sync();
+    writer.format.reset();
+    writer.out.reset();
+    fs::rename(writer.temp_path, writer.path);
+    writer.finished = true;
+    return fs::file_size(writer.path);
+}
+
+}
+
 extern "C" int chte_file_write_begin(const char * format, const char * path, const chte_file_column * columns, size_t ncolumns,
                                      const char * settings, chte_file_writer ** writer, chte_error * error)
 {
-    return guarded(error, [&]
-    {
-        auto & e = engine();
-        if (!format || !path || *path != '/')
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_file_write_begin: a format and an absolute path are required");
-        String name = format;
-        if (name == "Parquet")
-            registerOutputFormats();
-        else if (name == "Arrow")
-            registerArrowOutput();
-        else
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "files of format {} are not written", name);
-        auto w = std::make_unique<chte_file_writer>();
-        w->path = path;
-        w->temp_path = fmt::format("{}.tmp{}", path, getpid());
-        w->context = Context::createCopy(e.global);
-        applySettings(w->context, settings);
-        applySingleThreadedSettings(w->context);
-        auto format_settings = getFormatSettings(w->context);
-        forceFormatSettings(format_settings);
-        for (size_t i = 0; i < ncolumns; ++i)
-        {
-            const auto & c = columns[i];
-            if (!c.name || !c.type || !c.source)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_file_write_begin: column {} has no name, type or source", i);
-            auto type = DataTypeFactory::instance().get(c.type);
-            w->types.push_back(type);
-            w->sources.push_back(makeNullable(DataTypeFactory::instance().get(c.source)));
-            w->converts.push_back(c.convert);
-            w->header.insert({type->createColumn(), type, c.name});
-        }
-        w->out = std::make_unique<WriteBufferFromFile>(w->temp_path);
-        w->format = FormatFactory::instance().getOutputFormat(name, *w->out, w->header, w->context, format_settings);
-        *writer = w.release();
-    });
+    return guarded(error, [&] { *writer = fileWriteBegin(format, path, columns, ncolumns, settings, 0).release(); });
+}
+
+/// A part's file of a table of its own files (§2.18): its blocks sliced, so that the format's writer gathers its rows
+/// to its targets -- Parquet's row groups, Arrow's record batches -- and cuts them there
+constexpr size_t OWN_SLICE_ROWS = 65536;
+
+extern "C" int chte_own_write_begin(const char * format, const char * path, const chte_file_column * columns, size_t ncolumns,
+                                    const char * settings, chte_file_writer ** writer, chte_error * error)
+{
+    return guarded(error, [&] { *writer = fileWriteBegin(format, path, columns, ncolumns, settings, OWN_SLICE_ROWS).release(); });
 }
 
 extern "C" int chte_iceberg_write_begin(const char * location, int action, const char * spec, const chte_file_column * columns,
@@ -1432,31 +1615,9 @@ extern "C" int chte_file_write_batch(chte_file_writer * writer, uint32_t nrows, 
         {
             auto source = writer->sources[c]->createColumn();
             appendVector(*source, nrows, columns[writer->vectors.empty() ? c : writer->vectors[c]]);
-            ColumnWithTypeAndName value{std::move(source), writer->sources[c], ""};
-            if (writer->converts[c] == CHTE_CONVERT_DATE)
-            {
-                auto days = castColumn(value, makeNullable(std::make_shared<DataTypeInt32>()));
-                auto mutable_days = IColumn::mutate(std::move(days));
-                for (auto & v : assert_cast<ColumnInt32 &>(assert_cast<ColumnNullable &>(*mutable_days).getNestedColumn()).getData())
-                    v += PG_EPOCH_DAYS;
-                value = {std::move(mutable_days), makeNullable(std::make_shared<DataTypeDate32>()), ""};
-            }
-            else if (writer->converts[c] == CHTE_CONVERT_TIMESTAMP)
-            {
-                auto micros = castColumn(value, makeNullable(std::make_shared<DataTypeInt64>()));
-                const auto & nullable = assert_cast<const ColumnNullable &>(*micros);
-                auto timestamps = ColumnDecimal<DateTime64>::create(0, 6);
-                for (auto v : assert_cast<const ColumnInt64 &>(nullable.getNestedColumn()).getData())
-                    timestamps->insertValue(DateTime64(v + PG_EPOCH_MICROSECONDS));
-                value = {ColumnNullable::create(std::move(timestamps), nullable.getNullMapColumnPtr()),
-                         makeNullable(std::make_shared<DataTypeDateTime64>(6, "UTC")), ""};
-            }
-            out.push_back({castColumn(value, writer->types[c]), writer->types[c], writer->header.getByPosition(c).name});
+            out.push_back(fileColumn(*writer, c, {std::move(source), writer->sources[c], ""}));
         }
-        if (writer->iceberg)
-            icebergWrite(*writer->iceberg, Block(std::move(out)));
-        else
-            writer->format->write(Block(std::move(out)));
+        writeFileBlock(*writer, Block(std::move(out)));
     });
 }
 
@@ -1472,14 +1633,7 @@ extern "C" int chte_file_write_finish(chte_file_writer * writer, uint64_t * byte
             writer->finished = true;
             return;
         }
-        writer->format->finalize();
-        writer->out->finalize();
-        writer->out->sync();
-        writer->format.reset();
-        writer->out.reset();
-        fs::rename(writer->temp_path, writer->path);
-        writer->finished = true;
-        *bytes = fs::file_size(writer->path);
+        *bytes = fileWriteFinish(*writer);
     });
 }
 
@@ -1516,4 +1670,357 @@ extern "C" void chte_file_write_close(chte_file_writer * writer)
     {
     }
     delete writer;
+}
+
+/*
+ * Tables of their own files (ch_table_engines.md §2.18, CH8): a part's one file, its rows in their ids' order, each
+ * id in its _pg_rowid.  The external readers read them (ExternalTable::own); a row is found by its id in the file's
+ * ids, read once for its identity; a merge reads its parts' files through the same readers and writes one.
+ */
+
+namespace chte
+{
+
+namespace
+{
+
+/// The files' row ids a table keeps, beyond which it forgets them all
+constexpr size_t MAX_ROW_ID_FILES = 256;
+
+ExternalTable & ownOf(chte_table * table)
+{
+    auto & ext = externalOf(table);
+    if (!ext.own)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "not a table of its own files");
+    return ext;
+}
+
+/// A listed file's row ids, as its _pg_rowid holds them, checked ascending
+std::shared_ptr<const OwnRowIds> ownRowIds(chte_table & table, const chte_external_listing & listing, size_t file)
+{
+    auto & ext = *table.external;
+    const auto & listed = listedFile(listing, file);
+    auto it = ext.row_ids.find(listed.path);
+    if (it != ext.row_ids.end() && it->second->size == listed.size && it->second->mtime == listed.mtime)
+        return it->second;
+
+    auto ids = std::make_shared<OwnRowIds>();
+    ids->size = listed.size;
+    ids->mtime = listed.mtime;
+    UInt64 first = 0;
+    for (UInt64 rows : listed.resolved->footer->unit_rows)
+    {
+        ids->unit_first.push_back(first);
+        first += rows;
+    }
+    ids->ids.reserve(first);
+    auto reader = openExternalReader(table, listing, file, nullptr, {ROWID}, std::nullopt, nullptr);
+    Block block;
+    while (reader->next_block(block))
+    {
+        const auto & data = assert_cast<const ColumnUInt64 &>(*block.getByPosition(0).column).getData();
+        ids->ids.insert(data.begin(), data.end());
+    }
+    if (ids->ids.size() != first)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "file {}: {} row ids read of {} rows", listed.path, ids->ids.size(), first);
+    for (size_t i = 1; i < ids->ids.size(); ++i)
+        if (ids->ids[i] <= ids->ids[i - 1])
+            throw Exception(ErrorCodes::INCORRECT_DATA, "file {}: row id {} after {}, not ascending", listed.path, ids->ids[i],
+                            ids->ids[i - 1]);
+    if (ext.row_ids.size() >= MAX_ROW_ID_FILES)
+        ext.row_ids.clear();
+    ext.row_ids[listed.path] = ids;
+    return ids;
+}
+
+/// A Parquet column chunk's codec, by its number in parquet::format::CompressionCodec
+const char * parquetCodecName(int codec)
+{
+    static const char * const names[] = {"NONE", "SNAPPY", "GZIP", "LZO", "BROTLI", "LZ4", "ZSTD", "LZ4_RAW"};
+    return codec >= 0 && codec < static_cast<int>(std::size(names)) ? names[codec] : "UNKNOWN";
+}
+
+/// A column as a merge holds it: Nullable where the table's column may hold NULLs
+DataTypePtr mergeType(const ExternalColumn & column)
+{
+    return column.not_null ? column.type : makeNullable(column.type);
+}
+
+ColumnPtr asMergeColumn(const ExternalColumn & column, ColumnPtr col)
+{
+    if (column.not_null || col->isNullable())
+        return col;
+    return makeNullable(col);
+}
+
+}
+
+}
+
+extern "C" int chte_own_list(chte_table * table, const char * const * paths, size_t npaths, chte_external_listing ** listing,
+                             chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        ownOf(table);
+        std::vector<std::tuple<String, UInt64, Int64>> files;
+        for (size_t i = 0; i < npaths; ++i)
+        {
+            struct stat st;
+            if (stat(paths[i], &st) != 0)
+                throw ErrnoException(ErrorCodes::CANNOT_STAT, "Cannot stat {}", paths[i]);
+            auto [size, mtime] = statIdentity(st);
+            files.emplace_back(paths[i], size, mtime);
+        }
+        auto l = std::make_unique<chte_external_listing>();
+        l->table = table->external;
+        listFiles(*l, files);
+        *listing = l.release();
+    });
+}
+
+extern "C" int chte_own_locate(chte_table * table, chte_external_listing * listing, size_t file, const uint64_t * ids, size_t n,
+                               uint64_t * offsets, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        ownOf(table);
+        auto row_ids = ownRowIds(*table, *listing, file);
+        const auto & data = row_ids->ids;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const auto * at = std::lower_bound(data.begin(), data.end(), ids[i]);
+            offsets[i] = at != data.end() && *at == ids[i] ? static_cast<uint64_t>(at - data.begin()) : UINT64_MAX;
+        }
+    });
+}
+
+extern "C" int chte_own_unit_ids(chte_table * table, chte_external_listing * listing, size_t file, const int32_t * units,
+                                 size_t nunits, const uint64_t ** ids, size_t * n, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        ownOf(table);
+        auto row_ids = ownRowIds(*table, *listing, file);
+        const auto & unit_rows = listedFile(*listing, file).resolved->footer->unit_rows;
+        auto out = ColumnUInt64::create();
+        auto & data = out->getData();
+        for (size_t i = 0; i < nunits; ++i)
+        {
+            if (units[i] < 0 || static_cast<size_t>(units[i]) >= unit_rows.size())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_own_unit_ids: a file of {} units has no unit {}", unit_rows.size(),
+                                units[i]);
+            const auto * begin = row_ids->ids.begin() + row_ids->unit_first[units[i]];
+            data.insert(begin, begin + unit_rows[units[i]]);
+        }
+        *ids = data.data();
+        *n = data.size();
+        table->scratch.clear();
+        table->scratch.push_back(std::move(out));
+    });
+}
+
+extern "C" int chte_own_merge(chte_table * table, chte_external_listing * listing, const size_t * files, size_t nfiles,
+                              const uint64_t * dead, size_t ndead, uint8_t * dropped, const char * format, const char * path,
+                              const chte_file_column * columns, size_t ncolumns, const chte_vector * missing,
+                              const char * settings, uint64_t * rows, uint64_t * bytes, chte_error * error)
+{
+    std::unique_ptr<chte_file_writer> writer;
+    int rc = guarded(error, [&]
+    {
+        auto & ext = ownOf(table);
+        writer = fileWriteBegin(format, path, columns, ncolumns, settings, OWN_SLICE_ROWS);
+        Names names;
+        std::vector<const ExternalColumn *> table_columns;
+        size_t rowid_at = SIZE_MAX;
+        for (size_t c = 0; c < ncolumns; ++c)
+        {
+            names.push_back(columns[c].name);
+            table_columns.push_back(&ext.column(columns[c].name));
+            if (names.back() == ROWID)
+                rowid_at = c;
+        }
+        if (rowid_at == SIZE_MAX)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_own_merge: no column {} among the columns", ROWID);
+        if (dropped && ndead > 0)
+            memset(dropped, 0, ndead);
+
+        /// each input's block, its rows but the dead ones, and the place of its next row
+        struct Input
+        {
+            std::unique_ptr<chte_reader> reader;
+            Columns block;
+            const PaddedPODArray<UInt64> * ids = nullptr;
+            size_t pos = 0;
+            bool done = false;
+        };
+        std::vector<Input> inputs(nfiles);
+        auto pull = [&](Input & in)
+        {
+            in.pos = 0;
+            in.ids = nullptr;
+            Block block;
+            while (in.reader->next_block(block))
+            {
+                size_t n = block.rows();
+                if (n == 0)
+                    continue;
+                Columns cols;
+                for (size_t c = 0; c < ncolumns; ++c)
+                {
+                    if (!in.reader->present[c])
+                    {
+                        /// a column the file lacks: its missing value, every row
+                        if (!missing)
+                            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_own_merge: a file lacks column {}, and no missing value is given",
+                                            names[c]);
+                        auto one = makeNullable(table_columns[c]->type)->createColumn();
+                        appendVector(*one, 1, missing[c]);
+                        ColumnPtr value = std::move(one);
+                        if (table_columns[c]->not_null)
+                            value = assert_cast<const ColumnNullable &>(*value).getNestedColumnPtr();
+                        cols.push_back(ColumnConst::create(value, n)->convertToFullColumnIfConst());
+                        continue;
+                    }
+                    cols.push_back(asMergeColumn(*table_columns[c], block.getByPosition(c).column));
+                }
+                if (ndead > 0)
+                {
+                    const auto & ids = assert_cast<const ColumnUInt64 &>(*cols[rowid_at]).getData();
+                    IColumn::Filter keep(n, 1);
+                    size_t kept = n;
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        const auto * d = std::lower_bound(dead, dead + ndead, ids[i]);
+                        if (d != dead + ndead && *d == ids[i])
+                        {
+                            keep[i] = 0;
+                            --kept;
+                            if (dropped)
+                                dropped[d - dead] = 1;
+                        }
+                    }
+                    if (kept == 0)
+                        continue;
+                    if (kept != n)
+                        for (auto & col : cols)
+                            col = col->filter(keep, static_cast<ssize_t>(kept));
+                }
+                in.block = std::move(cols);
+                in.ids = &assert_cast<const ColumnUInt64 &>(*in.block[rowid_at]).getData();
+                return;
+            }
+            in.done = true;
+        };
+        for (size_t i = 0; i < nfiles; ++i)
+        {
+            inputs[i].reader = openExternalReader(*table, *listing, files[i], nullptr, names, std::nullopt, nullptr);
+            pull(inputs[i]);
+        }
+
+        MutableColumns out;
+        for (size_t c = 0; c < ncolumns; ++c)
+            out.push_back(mergeType(*table_columns[c])->createColumn());
+        UInt64 written = 0;
+        auto flush = [&]
+        {
+            if (out[0]->empty())
+                return;
+            ColumnsWithTypeAndName block;
+            for (size_t c = 0; c < ncolumns; ++c)
+            {
+                ColumnPtr col = std::move(out[c]);
+                block.push_back(fileColumn(*writer, c, {col, mergeType(*table_columns[c]), names[c]}));
+                out[c] = mergeType(*table_columns[c])->createColumn();
+            }
+            written += block.front().column->size();
+            writeFileBlock(*writer, Block(std::move(block)));
+        };
+
+        /// the inputs' runs in their ids' order: the input of the least next id, its rows below every other's next
+        for (;;)
+        {
+            checkInterrupted();
+            size_t best = SIZE_MAX;
+            UInt64 best_id = 0;
+            UInt64 next_other = UINT64_MAX;
+            for (size_t i = 0; i < nfiles; ++i)
+            {
+                if (inputs[i].done)
+                    continue;
+                UInt64 id = (*inputs[i].ids)[inputs[i].pos];
+                if (best == SIZE_MAX || id < best_id)
+                {
+                    if (best != SIZE_MAX)
+                        next_other = std::min(next_other, best_id);
+                    best = i;
+                    best_id = id;
+                }
+                else
+                    next_other = std::min(next_other, id);
+            }
+            if (best == SIZE_MAX)
+                break;
+            auto & in = inputs[best];
+            const auto & ids = *in.ids;
+            size_t end = next_other == UINT64_MAX ? ids.size()
+                                                  : static_cast<size_t>(std::lower_bound(ids.begin() + in.pos, ids.end(), next_other) - ids.begin());
+            if (end == in.pos)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "row id {} is in two of the merged files", best_id);
+            for (size_t c = 0; c < ncolumns; ++c)
+                out[c]->insertRangeFrom(*in.block[c], in.pos, end - in.pos);
+            in.pos = end;
+            if (in.pos == ids.size())
+                pull(in);
+            if (out[0]->size() >= OWN_SLICE_ROWS)
+                flush();
+        }
+        flush();
+        *rows = written;
+        *bytes = fileWriteFinish(*writer);
+    });
+    if (writer)
+        chte_file_write_close(writer.release());
+    return rc;
+}
+
+extern "C" int chte_own_file_layout(chte_table * table, chte_external_listing * listing, size_t file, chte_file_layout * layout,
+                                    chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = ownOf(table);
+        const auto & listed = listedFile(*listing, file);
+        const auto & footer = *listed.resolved->footer;
+        *layout = {};
+        layout->units = static_cast<uint32_t>(footer.unit_rows.size());
+        layout->rows = footer.rows;
+        for (size_t u = 0; u < footer.unit_rows.size(); ++u)
+        {
+            layout->min_unit_rows = u == 0 ? footer.unit_rows[u] : std::min(layout->min_unit_rows, footer.unit_rows[u]);
+            layout->max_unit_rows = std::max(layout->max_unit_rows, footer.unit_rows[u]);
+        }
+        ext.layout_codec = "NONE";
+        if (ext.format == CHTE_EXTERNAL_ARROW)
+            ext.layout_codec = arrowCodec(listed.path, footer);
+        else
+        {
+            bool page_index = !footer.parquet->row_groups.empty();
+            bool first = true;
+            for (const auto & row_group : footer.parquet->row_groups)
+                for (const auto & chunk : row_group.columns)
+                {
+                    if (first)
+                        ext.layout_codec = parquetCodecName(static_cast<int>(chunk.meta_data.codec));
+                    first = false;
+                    page_index = page_index && chunk.__isset.column_index_offset && chunk.__isset.offset_index_offset;
+                    if (chunk.meta_data.__isset.bloom_filter_offset)
+                        layout->bloom_filters = 1;
+                    if (chunk.meta_data.__isset.dictionary_page_offset)
+                        layout->dictionaries = 1;
+                }
+            layout->page_index = page_index ? 1 : 0;
+        }
+        layout->codec = ext.layout_codec.c_str();
+    });
 }

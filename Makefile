@@ -19,6 +19,7 @@ OBJS = \
 	src/merge.o \
 	src/module.o \
 	src/options.o \
+	src/own.o \
 	src/pages.o \
 	src/scan.o \
 	src/store.o \

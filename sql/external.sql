@@ -170,7 +170,8 @@ CREATE TABLE bad (n numeric) USING parquet WITH (location = '/tmp/chte_external/
 CREATE TABLE bad (j jsonb) USING parquet WITH (location = '/tmp/chte_external/all.parquet');
 CREATE TABLE bad (id bigint) USING parquet WITH (location = '/tmp/chte_external/missing.parquet');
 CREATE TABLE bad (id bigint) USING parquet WITH (location = 'all.parquet');
-CREATE TABLE bad (id bigint) USING parquet;
+-- without a location, parquet and arrow make a table of their own files (§2.18, CH8): iceberg needs one
+CREATE TABLE bad (id bigint) USING iceberg;
 CREATE TABLE bad (id bigint) USING parquet WITH (location = '/tmp/chte_external/all.parquet', storage = 'files');
 CREATE TABLE bad (id bigint) USING mergetree WITH (location = '/tmp/chte_external/all.parquet');
 -- a NOT NULL column refuses a NULL as it is read; a scan of no column reads none

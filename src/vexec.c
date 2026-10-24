@@ -102,6 +102,7 @@
 
 #include "chte.h"
 #include "scan.h"
+#include "tombstones.h"
 
 /* A view of Arrow's binary view layout, 16 bytes */
 typedef union ChView
@@ -1252,8 +1253,11 @@ src_aggregate(void *arg, int nreqs, const VexecSourceAgg *reqs, VexecSourceAggAn
  * the executor finds by their names there -- a column's file name is its
  * attribute's, matched exactly by libcudf, and a name of a nested column's
  * form, with a dot, is not -- is handed so, and passed over; any other is
- * the CPU's, read by the next batches alone.  The token keeps what
- * read_unit() reads again: the file's part and the granules' ranges.
+ * the CPU's, read by the next batches alone.  A part of a table of its own
+ * files (§2.18, CH8) is handed so too, its columns c<attnum> there, its
+ * rows the snapshot sees deleted as the unit's deleted bits, from its
+ * rows' ids in the file.  The token keeps what read_unit() reads again:
+ * the file's part and the granules' ranges.
  */
 typedef struct SrcUnit
 {
@@ -1274,8 +1278,9 @@ unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
 	const char **names;
 	uint8	   *flags;
 	MemoryContext old;
+	ChTable    *t = ch_scan_table(st->scan);
 
-	if (unit->part->listing == NULL || unit->deletions || unit->part->deletes ||
+	if (unit->part->listing == NULL || (unit->deletions && !t->own) || unit->part->deletes ||
 		!ch_is_external_rel(st->rel, &kind) || (kind != CH_EXTERNAL_PARQUET && kind != CH_EXTERNAL_ARROW) ||
 		st->tids || st->ncols == 0)
 		return false;
@@ -1287,7 +1292,10 @@ unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
 		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(st->rel), st->cols[i].attnum - 1);
 		const char *name = NameStr(att->attname);
 
-		if (strchr(name, '.') != NULL)
+		/* a table of its own files' column is c<attnum> in its files (§2.18) */
+		if (t->own)
+			name = psprintf("c%d", att->attnum);
+		else if (strchr(name, '.') != NULL)
 		{
 			MemoryContextSwitchTo(old);
 			return false;
@@ -1318,6 +1326,31 @@ unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
 	u->column_flags = flags;
 	u->deleted = NULL;
 	u->token = keep;
+	if (unit->deletions)
+	{
+		/* CH8: the unit's rows the snapshot sees deleted, by their ids in the part's file */
+		const uint64 *dead;
+		int			ndead = ch_scan_unit_dead(st->scan, &dead);
+		const uint64 *ids;
+		size_t		nids;
+		uint64	   *bits;
+
+		CH_CALL("reading a part's row ids",
+				ch_engine()->own_unit_ids(t->handle, unit->part->listing->handle, (size_t) unit->part->file, parts,
+										  (size_t) nparts, &ids, &nids, CH_ERR));
+		if (nids != unit->rows)
+			elog(ERROR, "a unit of %zu row ids where its part's units have " UINT64_FORMAT " rows", nids, unit->rows);
+		bits = MemoryContextAllocZero(st->cxt, sizeof(uint64) * Max((nids + 63) / 64, 1));
+		/* the unit's ids ascend as its file's do, the dead ones too: one walk over both */
+		for (size_t r = 0, d = 0; r < nids && d < (size_t) ndead; r++)
+		{
+			while (d < (size_t) ndead && dead[d] < ids[r])
+				d++;
+			if (d < (size_t) ndead && dead[d] == ids[r])
+				bits[r / 64] |= UINT64CONST(1) << (r % 64);
+		}
+		u->deleted = bits;
+	}
 	return true;
 }
 

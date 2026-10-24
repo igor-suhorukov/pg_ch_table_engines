@@ -306,10 +306,12 @@ merge_once(Oid relid)
 
 			if (rel)
 			{
-				if (ch_is_engine_rel(rel, NULL) && rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
+				if (ch_is_mvcc_rel(rel) && rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
 				{
 					pgstat_report_activity(STATE_RUNNING, RelationGetRelationName(rel));
-					merged = ch_merge_parts(rel, CH_MERGE_BACKGROUND) > 0;
+					/* a table of its own files' parts are no MergeTree parts (§2.18) */
+					merged = (ch_is_own_rel(rel) ? ch_own_merge_parts(rel, CH_MERGE_BACKGROUND) :
+							  ch_merge_parts(rel, CH_MERGE_BACKGROUND)) > 0;
 				}
 				relation_close(rel, NoLock);
 			}
@@ -356,7 +358,7 @@ sweep_once(Oid relid)
 				ChOptions	opts;
 
 				ch_relation_options(rel, &opts);
-				if (ch_is_engine_rel(rel, NULL) && opts.storage == CH_STORAGE_FILES &&
+				if (ch_is_mvcc_rel(rel) && opts.storage == CH_STORAGE_FILES &&
 					rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
 				{
 					ChStorageId id;

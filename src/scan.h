@@ -83,6 +83,8 @@ extern void ch_scan_set_unit_check(TableScanDesc scan, ChUnitCheck check, void *
 /* Between batches: the next unit, claimed, which the next batch reads unless passed */
 extern bool ch_scan_claim_unit(TableScanDesc scan, ChScanUnit *unit);
 extern void ch_scan_pass_unit(TableScanDesc scan);
+/* CH8: the claimed unit's part's deletions, ascending */
+extern int	ch_scan_unit_dead(TableScanDesc scan, const uint64 **dead);
 
 /*
  * V8e: the claimed unit's batches alone, then an end; its units of its part,

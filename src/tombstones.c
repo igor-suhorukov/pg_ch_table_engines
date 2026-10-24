@@ -379,6 +379,37 @@ ch_tombstones_visible(const ChStorageId *id, Snapshot snapshot, uint64 lo, uint6
 	return ids;
 }
 
+/* Whether the snapshot sees any deletion or update of the storage's rows: the first one found ends the scan */
+bool
+ch_tombstones_visible_any(const ChStorageId *id, Snapshot snapshot)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+	int			nkeys;
+	bool		found = false;
+
+	catalog = ch_catalog_open("tombstones", id, AccessShareLock);
+	nkeys = ch_catalog_storage_keys(id, keys);
+	scan = systable_beginscan(catalog, ch_catalog_index(catalog), true, snapshot, nkeys, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		uint64		rowid;
+		char		kind;
+		uint64		successor;
+
+		deform(catalog, tuple, &rowid, &kind, &successor);
+		if (kind == CH_TOMB_LOCKED)
+			continue;
+		found = true;
+		break;
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return found;
+}
+
 /* Whether the snapshot sees a deletion or update of the row: an update's new row id into *successor */
 bool
 ch_tombstone_visible(const ChStorageId *id, Snapshot snapshot, uint64 rowid, uint64 *successor)

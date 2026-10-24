@@ -195,8 +195,17 @@ ch_dead_rows_of_part(ChTable *t, const ChPart *p, const ChDeadRows *dead, uint64
 	/* the part's own rows among them: its row ids may span others' (a merge's) */
 	offsets = palloc(sizeof(uint64) * (last - first));
 	*mine = palloc(sizeof(uint64) * (last - first));
-	CH_CALL("finding a part's deleted rows",
-			eng->part_locate(t->handle, p->name, dead->ids + first, last - first, offsets, CH_ERR));
+	if (t->own)
+	{
+		/* a table of its own files' part (§2.18): its rows' ids, its file's, through its listing */
+		Assert(p->listing != NULL);
+		CH_CALL("finding a part's deleted rows",
+				eng->own_locate(t->handle, p->listing->handle, (size_t) p->file, dead->ids + first, last - first,
+								offsets, CH_ERR));
+	}
+	else
+		CH_CALL("finding a part's deleted rows",
+				eng->part_locate(t->handle, p->name, dead->ids + first, last - first, offsets, CH_ERR));
 	for (int i = 0; i < last - first; i++)
 		if (offsets[i] != PG_UINT64_MAX)
 		{

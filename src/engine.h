@@ -107,6 +107,19 @@ typedef struct ChEngine
 	int			(*file_write_batch) (chte_file_writer *, uint32_t, const chte_vector *, chte_error *);
 	int			(*file_write_finish) (chte_file_writer *, uint64_t *, chte_error *);
 	void		(*file_write_close) (chte_file_writer *);
+	/* CH8's (§2.18), optional: tables of their own files */
+	int			(*own_open) (const chte_external_def *, chte_table **, chte_error *);
+	int			(*own_list) (chte_table *, const char *const *, size_t, chte_external_listing **, chte_error *);
+	int			(*own_write_begin) (const char *, const char *, const chte_file_column *, size_t, const char *,
+									chte_file_writer **, chte_error *);
+	int			(*own_locate) (chte_table *, chte_external_listing *, size_t, const uint64_t *, size_t, uint64_t *,
+							   chte_error *);
+	int			(*own_unit_ids) (chte_table *, chte_external_listing *, size_t, const int32_t *, size_t,
+								 const uint64_t **, size_t *, chte_error *);
+	int			(*own_merge) (chte_table *, chte_external_listing *, const size_t *, size_t, const uint64_t *, size_t,
+							  uint8_t *, const char *, const char *, const chte_file_column *, size_t,
+							  const chte_vector *, const char *, uint64_t *, uint64_t *, chte_error *);
+	int			(*own_file_layout) (chte_table *, chte_external_listing *, size_t, chte_file_layout *, chte_error *);
 } ChEngine;
 
 /* GUCs */

@@ -649,6 +649,13 @@ open_external(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext
 	appendStringInfoString(&cols, CH_ROWID_COLUMN);
 	t->all_columns = cols.data;
 	ch_external_columns_for(rel, desc, cxt, &columns, &ncolumns);
+	t->own = ch_is_own_rel(rel);
+	if (t->own)
+	{
+		/* a table of its own files (§2.18): its parts' columns c<attnum>, which a renamed column keeps */
+		t->relative_path = ch_storage_path(id, true);
+		ch_own_table_setup(rel, desc, t);
+	}
 	MemoryContextSwitchTo(old);
 
 	if (eng->external_open == NULL)
@@ -656,7 +663,13 @@ open_external(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("the engine library reads no external files"),
 				 errdetail("It was built before CH7 (ch_table_engines.md §2.17).")));
-	if (t->options.location == NULL)
+	if (t->own && eng->own_open == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the engine library keeps no table of its own files"),
+				 errdetail("It was built before CH8 (ch_table_engines.md §2.18)."),
+				 errhint("Give the table a location, or install an engine library built with CH8.")));
+	if (t->options.location == NULL && !t->own)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("table \"%s\" has no location", RelationGetRelationName(rel))));
@@ -667,7 +680,10 @@ open_external(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext
 	def.settings = t->options.settings;
 	def.columns = columns;
 	def.ncolumns = ncolumns;
-	CH_CALL("opening the table in the engine library", eng->external_open(&def, &t->handle, CH_ERR));
+	if (t->own)
+		CH_CALL("opening the table in the engine library", eng->own_open(&def, &t->handle, CH_ERR));
+	else
+		CH_CALL("opening the table in the engine library", eng->external_open(&def, &t->handle, CH_ERR));
 	return t;
 }
 

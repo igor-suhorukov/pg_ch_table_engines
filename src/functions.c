@@ -29,7 +29,10 @@ open_engine_relation(Oid relid, ChEngineKind *kind)
 {
 	Relation	rel = relation_open(relid, AccessShareLock);
 
-	if (!ch_is_engine_rel(rel, kind))
+	/* a table of its own files (§2.18) is MergeTree's as its parts and tombstones go */
+	if (kind)
+		*kind = CH_ENGINE_MERGETREE;
+	if (!ch_is_engine_rel(rel, kind) && !ch_is_own_rel(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table of the ClickHouse engines", RelationGetRelationName(rel))));
@@ -136,13 +139,13 @@ ch_fold(PG_FUNCTION_ARGS)
 	Relation	rel = relation_open(PG_GETARG_OID(0), ShareUpdateExclusiveLock);
 	int64		folded;
 
-	if (!ch_is_engine_rel(rel, NULL))
+	if (!ch_is_mvcc_rel(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table of the ClickHouse engines", RelationGetRelationName(rel))));
 	if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, RelationGetRelationName(rel));
-	folded = ch_fold_deletions(rel);
+	folded = ch_is_own_rel(rel) ? ch_own_fold(rel) : ch_fold_deletions(rel);
 	relation_close(rel, NoLock);
 	PG_RETURN_INT64(folded);
 }
@@ -155,7 +158,7 @@ ch_remove_orphans(PG_FUNCTION_ARGS)
 	ChStorageId id;
 	int			removed;
 
-	if (!ch_is_engine_rel(rel, NULL))
+	if (!ch_is_mvcc_rel(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table of the ClickHouse engines", RelationGetRelationName(rel))));

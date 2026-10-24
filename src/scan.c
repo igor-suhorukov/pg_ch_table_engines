@@ -158,6 +158,7 @@ typedef struct ChScanDescData
 	int			ndead;
 	int			dead_lo;		/* the claimed unit's part's: dead[dead_lo, dead_hi) */
 	int			dead_hi;
+	int			dead_at;		/* row_dead()'s place among them, the last row's */
 	int			rowid_col;		/* the reader's row id column, or -1 */
 	uint64		*visible;		/* ch_scan_next_batch(): the batch's live rows as bits, or NULL */
 
@@ -311,18 +312,45 @@ unit_deletions(ChScanDesc scan)
 	}
 	scan->dead_lo = lower_bound(scan->dead, scan->ndead, (uint64) scan->part->min_rowid);
 	scan->dead_hi = lower_bound(scan->dead, scan->ndead, (uint64) scan->part->max_rowid + 1);
+	scan->dead_at = scan->dead_lo;
 }
 
-/* Whether row r of the batch is deleted for the scan's snapshot */
+/*
+ * Whether row r of the batch is deleted for the scan's snapshot: the dead
+ * ids searched from the last row's place, galloping forward where the rows
+ * ascend -- a table of its own files' part's always (§2.18), a MergeTree
+ * part's runs of a key -- and from the range's start where they do not
+ */
 static inline bool
 row_dead(ChScanDesc scan, uint32 r)
 {
+	const uint64 *dead = scan->dead;
 	uint64		rowid;
+	int			d;
 
 	if (scan->dead_lo == scan->dead_hi)
 		return false;
 	rowid = ((const uint64 *) scan->vectors[scan->rowid_col].values)[r];
-	return ch_rowid_in(scan->dead + scan->dead_lo, scan->dead_hi - scan->dead_lo, rowid);
+	d = scan->dead_at;
+	if (d < scan->dead_lo || d > scan->dead_hi || (d > scan->dead_lo && dead[d - 1] >= rowid))
+		d = scan->dead_lo + lower_bound(dead + scan->dead_lo, scan->dead_hi - scan->dead_lo, rowid);
+	else
+	{
+		int			hi = d;
+		int			step = 1;
+
+		/* every one before d is below rowid: the first at or above it, between d and the gallop's last probe */
+		while (hi < scan->dead_hi && dead[hi] < rowid)
+		{
+			d = hi + 1;
+			hi += step;
+			step *= 2;
+		}
+		hi = Min(hi, scan->dead_hi);
+		d += lower_bound(dead + d, hi - d, rowid);
+	}
+	scan->dead_at = d;
+	return d < scan->dead_hi && dead[d] == rowid;
 }
 
 /*
@@ -400,6 +428,22 @@ claim_unit(ChScanDesc scan)
 	return false;
 }
 
+/*
+ * A table of its own files (§2.18): its parts' files listed, each part read
+ * through its file as an external table's is -- every participant of a
+ * parallel scan lists the same parts' files.  As the scan first reads, by
+ * its table then: a rewrite's scan reads by the old descriptor (fit_slot()),
+ * whose files hold the types the new one may not take.
+ */
+static void
+own_listing(ChScanDesc scan)
+{
+	if (scan->listing != NULL || !scan->table->own || scan->parts == NIL)
+		return;
+	scan->listing = ch_own_listing(scan->table, scan->parts);
+	ch_listing_pin(scan->listing);
+}
+
 static bool
 claim_one_unit(ChScanDesc scan)
 {
@@ -407,6 +451,7 @@ claim_one_unit(ChScanDesc scan)
 	int			p;
 
 	Assert(scan->part == NULL);
+	own_listing(scan);
 	if (scan->base.rs_parallel)
 	{
 		ChParallelScan *ps = (ChParallelScan *) scan->base.rs_parallel;
@@ -928,7 +973,7 @@ ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	scan->base.rs_flags = flags;
 	scan->base.rs_parallel = pscan;
 
-	if (ch_is_external_rel(rel, NULL))
+	if (ch_is_external_rel(rel, NULL) && !ch_is_own_rel(rel))
 	{
 		/*
 		 * An external table's files (§2.17): the statement's listing, or a
@@ -957,6 +1002,7 @@ ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 		ch_table_pin(t);
 		scan->pinned = t;
 		scan->parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &scan->nonvacuumable));
+		/* a table of its own files' parts' files are listed as the scan first reads (own_listing()) */
 		setup_units(scan);
 		scan->counts.parts = scan->nparts;
 		load_deletions(scan, snapshot);
@@ -1102,7 +1148,7 @@ parallel_size(Relation rel, const void **bytes, size_t *size)
 {
 	*bytes = NULL;
 	*size = 0;
-	if (!ch_is_external_rel(rel, NULL))
+	if (!ch_is_external_rel(rel, NULL) || ch_is_own_rel(rel))
 		return MAXALIGN(sizeof(ChParallelScan));
 	listing_bytes(rel, bytes, size);
 	return MAXALIGN(add_size(offsetof(ChParallelScan, listing), *size));
@@ -1374,6 +1420,17 @@ ch_scan_claim_unit(TableScanDesc sscan, ChScanUnit *unit)
 	unit->rows = scan->unit_rows;
 	unit->deletions = scan->dead_lo < scan->dead_hi || scan->part->deletes;
 	return true;
+}
+
+/* CH8 (§2.18): the deletions within the claimed unit's part's row ids, ascending: how many, *dead the first */
+int
+ch_scan_unit_dead(TableScanDesc sscan, const uint64 **dead)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	Assert(scan->part != NULL);
+	*dead = scan->dead ? scan->dead + scan->dead_lo : NULL;
+	return scan->dead_hi - scan->dead_lo;
 }
 
 void
@@ -1747,7 +1804,12 @@ read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, in
 
 	if (t->options.storage == CH_STORAGE_PAGES)
 		ch_pages_attach(t, part);
-	CH_CALL("finding rows by their TIDs", eng->part_locate(t->handle, part->name, rowids, n, offsets, CH_ERR));
+	if (t->own)
+		/* a table of its own files' part (§2.18): its rows' ids, its file's */
+		CH_CALL("finding rows by their TIDs",
+				eng->own_locate(t->handle, part->listing->handle, (size_t) part->file, rowids, n, offsets, CH_ERR));
+	else
+		CH_CALL("finding rows by their TIDs", eng->part_locate(t->handle, part->name, rowids, n, offsets, CH_ERR));
 	for (int i = 0; i < n; i++)
 		if (offsets[i] != PG_UINT64_MAX)
 			found[nfound++] = offsets[i];
@@ -1849,6 +1911,7 @@ fetch_uncached(Relation rel, ItemPointer tid, uint64 rowid, Snapshot snapshot, T
 	List	   *parts;
 	ListCell   *lc;
 	bool		found = false;
+	ChListing  *volatile own_listing = NULL;
 
 	/* SnapshotAny: the row whatever its deletions, which a running scan or the last fetch may have at hand */
 	if (snapshot && snapshot->snapshot_type == SNAPSHOT_ANY)
@@ -1867,11 +1930,32 @@ fetch_uncached(Relation rel, ItemPointer tid, uint64 rowid, Snapshot snapshot, T
 	ch_table_pin(t);
 	PG_TRY();
 	{
-		if (t->external || row_survives(t, rowid, snapshot))
+		bool		external = t->external && !t->own;
+
+		if (external || row_survives(t, rowid, snapshot))
 		{
 			/* an external table's: the statement's files, a row's id its file's first and its place there */
-			parts = t->external ? ch_external_listing(rel, t)->parts :
+			parts = external ? ch_external_listing(rel, t)->parts :
 				ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
+			if (t->own)
+			{
+				List	   *holding = NIL;
+
+				/* a table of its own files' parts whose row ids span the row's, their files listed (§2.18) */
+				foreach(lc, parts)
+				{
+					ChPart	   *p = lfirst(lc);
+
+					if ((int64) rowid >= p->min_rowid && (int64) rowid <= p->max_rowid)
+						holding = lappend(holding, p);
+				}
+				parts = holding;
+				if (parts != NIL)
+				{
+					own_listing = ch_own_listing(t, parts);
+					ch_listing_pin(own_listing);
+				}
+			}
 			foreach(lc, parts)
 			{
 				ChPart	   *p = lfirst(lc);
@@ -1881,7 +1965,7 @@ fetch_uncached(Relation rel, ItemPointer tid, uint64 rowid, Snapshot snapshot, T
 
 				if ((int64) rowid < p->min_rowid || (int64) rowid > p->max_rowid)
 					continue;
-				if (p->listing ?
+				if (external ?
 					read_rows_at(rel, t, p, &offset, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1 :
 					read_rows_by_id(rel, t, p, &rowid, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1)
 				{
@@ -1898,6 +1982,8 @@ fetch_uncached(Relation rel, ItemPointer tid, uint64 rowid, Snapshot snapshot, T
 	}
 	PG_FINALLY();
 	{
+		if (own_listing)
+			ch_listing_unpin(own_listing);
 		ch_table_unpin(t);
 	}
 	PG_END_TRY();
@@ -1930,7 +2016,7 @@ ch_fetch_row_columns(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTabl
 
 	if (!tid_rowid(tid, &rowid))
 		return false;
-	if (!ch_is_external_rel(rel, NULL))
+	if (ch_is_mvcc_rel(rel))
 	{
 		if (snapshot && IsMVCCSnapshot(snapshot))
 			PredicateLockRelation(rel, snapshot);
@@ -1954,8 +2040,18 @@ ch_fetch_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *s
 	ChFetchCache *cache;
 
 	/* an external table's row: its file's, read again, every column (a TID scan's) */
-	if (ch_is_external_rel(rel, NULL))
+	if (ch_is_external_rel(rel, NULL) && !ch_is_own_rel(rel))
 		return ch_fetch_row_columns(rel, tid, snapshot, slot, -1, NULL);
+	/* a table of its own files' (§2.18): the columns fetch.c knows the slot to need, uncached */
+	if (ch_is_own_rel(rel))
+	{
+		int			n;
+		const AttrNumber *attnums;
+
+		if (!ch_fetch_slot_columns(rel, slot, &n, &attnums))
+			n = -1;
+		return ch_fetch_row_columns(rel, tid, snapshot, slot, n, n < 0 ? NULL : attnums);
+	}
 	cache = ch_fetch_cache_for(rel, slot);
 
 	if (cache != NULL)
@@ -2485,6 +2581,7 @@ ch_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot, bool *reche
 				ncols = -1;
 			fetch_cols(scan->table, ncols, attnums, scan->scan_cxt, scan->bm_cols);
 		}
+		own_listing(scan);
 		MemoryContextReset(scan->bm_cxt);
 		old = MemoryContextSwitchTo(scan->bm_cxt);
 		scan->bm_rows = palloc(sizeof(HeapTuple) * TBM_MAX_TUPLES_PER_PAGE);
@@ -2542,9 +2639,8 @@ ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted)
 {
 	ChTable    *t = ch_table(rel);
 	SnapshotData nonvacuumable;
-	int			ndead = 0;
 
-	if (t->external)
+	if (t->external && !t->own)
 	{
 		/* the statement's files, none of whose rows is deleted (§2.17) */
 		ch_table_pin(t);
@@ -2563,14 +2659,9 @@ ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted)
 	ch_table_pin(t);
 	*units = list_length(ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable)));
 	*deleted = true;
+	/* whether any row is deleted, not which: the first deletion found tells */
 	if (snapshot != NULL)
-	{
-		uint64	   *dead = ch_tombstones_visible(&t->storage, snapshot, 0, PG_INT64_MAX, &ndead);
-
-		*deleted = ndead > 0;
-		if (dead)
-			pfree(dead);
-	}
+		*deleted = ch_tombstones_visible_any(&t->storage, snapshot);
 	ch_table_unpin(t);
 }
 
@@ -2586,6 +2677,7 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 	StringInfoData names;
 	chte_filter *filter = NULL;
 	ResourceOwner owner = NULL;
+	ChListing  *own_listing = NULL;
 
 	*rows = 0;
 	*bytes = 0;
@@ -2593,12 +2685,18 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		*raw = 0;
 	/* pinned from the start: the catalog's read may accept an invalidation of the table */
 	ch_table_pin(t);
-	parts = t->external ? ch_external_listing(rel, t)->parts :
+	parts = t->external && !t->own ? ch_external_listing(rel, t)->parts :
 		ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
 	if (parts == NIL)
 	{
 		ch_table_unpin(t);
 		return;
+	}
+	/* a table of its own files' parts, each read through its file (§2.18) */
+	if (t->own)
+	{
+		own_listing = ch_own_listing(t, parts);
+		ch_listing_pin(own_listing);
 	}
 	eng = ch_engine();
 	initStringInfo(&names);
@@ -2673,6 +2771,8 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		ch_handle_closing(owner, CH_HANDLE_FILTER, filter);
 		eng->filter_free(filter);
 	}
+	if (own_listing)
+		ch_listing_unpin(own_listing);
 	ch_table_unpin(t);
 	pfree(names.data);
 }

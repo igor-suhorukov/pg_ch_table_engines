@@ -1,0 +1,571 @@
+-- Tables of their own files (ch_table_engines.md §2.18, CH8): the access methods parquet and arrow made
+-- without a location keep their rows in files of their own, a part's one file, written by ClickHouse's own
+-- writers at §2.18's layout -- read back from the files (ch.own_files()) -- and answer as heap holding the
+-- same rows does: their types, DELETE and UPDATE as tombstones, savepoints, indexes, TIDs, merges folding
+-- their dead rows out, ch.fold(), TRUNCATE, rewrites and COPY.
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+CREATE TABLE src (id int8 NOT NULL, i2 int2, i4 int4, f4 float4, f8 float8, n numeric(18, 4), b bool, d date,
+				  ts timestamp, tz timestamptz, t text, vc varchar, j json, by bytea, u uuid);
+INSERT INTO src
+SELECT g, (g % 200 - 100)::int2, CASE WHEN g % 9 = 0 THEN NULL ELSE g * 7 END, g / 4.0, g / 3.0,
+	   round(g / 7.0, 4), g % 2 = 0, DATE '1998-03-01' + g % 2000,
+	   TIMESTAMP '1960-01-01 00:00:00' + g * INTERVAL '17 minutes 0.25 seconds',
+	   TIMESTAMPTZ '2010-06-07 08:09:10+02' + g * INTERVAL '3 hours',
+	   CASE WHEN g % 13 = 0 THEN NULL ELSE 'own ' || g || repeat('ü', g % 4) END, 'v' || g % 100,
+	   json_build_object('g', g), decode(lpad(to_hex(g * 31), 10, '0'), 'hex'),
+	   ('11111111-2222-4333-8444-' || lpad(to_hex(g), 12, '0'))::uuid
+FROM generate_series(1, 300000) g;
+-- a table of its own files, of each format, made of the same rows
+CREATE TABLE p (LIKE src) USING parquet;
+CREATE TABLE a (LIKE src) USING arrow;
+SELECT relname, engine, storage FROM ch.tables JOIN pg_class c ON c.oid = relid WHERE relname IN ('p', 'a') ORDER BY 1;
+ relname | engine  | storage 
+---------+---------+---------
+ a       | arrow   | files
+ p       | parquet | files
+(2 rows)
+
+INSERT INTO p SELECT * FROM src;
+INSERT INTO a SELECT * FROM src;
+-- every row as heap's, every column of every type
+CREATE FUNCTION rows_digest(rel regclass) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+	EXECUTE format('SELECT md5(string_agg(x::text, '','' ORDER BY x.id)) FROM %s x', rel) INTO r;
+	RETURN r;
+END $$;
+SELECT rows_digest('p') = rows_digest('src') AS parquet_same, rows_digest('a') = rows_digest('src') AS arrow_same;
+ parquet_same | arrow_same 
+--------------+------------
+ t            | t
+(1 row)
+
+SELECT count(*), count(i4), count(t), sum(id), sum(n), min(d), max(ts), max(tz), count(DISTINCT u) FROM p;
+ count  | count  | count  |     sum     |       sum       |    min     |           max            |             max              | count  
+--------+--------+--------+-------------+-----------------+------------+--------------------------+------------------------------+--------
+ 300000 | 266667 | 276924 | 45000150000 | 6428592857.1429 | 03-01-1998 | Fri Sep 12 12:50:00 1969 | Mon Feb 06 22:09:10 2113 PST | 300000
+(1 row)
+
+-- the layout, read back from the files (§2.18): row groups and record batches of 131,072 rows, Parquet's
+-- lz4 with a page index and bloom filters, Arrow uncompressed
+SELECT part, rows, min_rowid, max_rowid, units, min_unit_rows, max_unit_rows, codec, page_index, bloom_filters
+FROM ch.own_files('p');
+   part    |  rows  | min_rowid | max_rowid | units | min_unit_rows | max_unit_rows |  codec  | page_index | bloom_filters 
+-----------+--------+-----------+-----------+-------+---------------+---------------+---------+------------+---------------
+ all_1_1_0 | 300000 |         1 |    300000 |     3 |         37856 |        131072 | LZ4_RAW | t          | t
+(1 row)
+
+SELECT part, rows, units, min_unit_rows, max_unit_rows, codec FROM ch.own_files('a');
+   part    |  rows  | units | min_unit_rows | max_unit_rows | codec 
+-----------+--------+-------+---------------+---------------+-------
+ all_1_1_0 | 300000 |     3 |         37856 |        131072 | NONE
+(1 row)
+
+SELECT file LIKE '%/ch_' || pg_relation_filenode('p') || '/all_1_1_0/data.parquet' AS parquet_file,
+	   bytes = (pg_stat_file(file)).size AS bytes_its_file
+FROM ch.own_files('p');
+ parquet_file | bytes_its_file 
+--------------+----------------
+ t            | t
+(1 row)
+
+-- the codecs: zstd and none, and lz4 frames for Arrow; a codec changed for the next parts
+CREATE TABLE pz (id int, t text) USING parquet WITH (codec = 'zstd');
+CREATE TABLE pn (id int, t text) USING parquet WITH (codec = 'none');
+CREATE TABLE al (id int, t text) USING arrow WITH (codec = 'lz4');
+CREATE TABLE az (id int, t text) USING arrow WITH (codec = 'zstd');
+INSERT INTO pz SELECT g, 't' || g FROM generate_series(1, 1000) g;
+INSERT INTO pn SELECT g, 't' || g FROM generate_series(1, 1000) g;
+INSERT INTO al SELECT g, 't' || g FROM generate_series(1, 1000) g;
+INSERT INTO az SELECT g, 't' || g FROM generate_series(1, 1000) g;
+SELECT 'pz' AS t, codec FROM ch.own_files('pz') UNION ALL SELECT 'pn', codec FROM ch.own_files('pn')
+UNION ALL SELECT 'al', codec FROM ch.own_files('al') UNION ALL SELECT 'az', codec FROM ch.own_files('az');
+ t  |   codec   
+----+-----------
+ pz | ZSTD
+ pn | NONE
+ al | LZ4_FRAME
+ az | ZSTD
+(4 rows)
+
+ALTER TABLE pn SET (codec = 'zstd');
+INSERT INTO pn SELECT g, 't' || g FROM generate_series(1001, 1010) g;
+SELECT part, rows, codec FROM ch.own_files('pn') ORDER BY part;
+   part    | rows | codec 
+-----------+------+-------
+ all_1_1_0 | 1000 | NONE
+ all_2_2_0 |   10 | ZSTD
+(2 rows)
+
+SELECT count(*), sum(id) FROM pn;
+ count |  sum   
+-------+--------
+  1010 | 510555
+(1 row)
+
+-- every other type as the library keeps it (§2.5): its bytes where no file type holds it exactly -- a
+-- numeric of no precision with its NaN, varchar(n), interval, "char", time, an array, a domain, name
+CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+CREATE TABLE ot (id int NOT NULL, n numeric, vc varchar(5), iv interval, c "char", tm time, ar int[], dm posint,
+				 nm name) USING parquet;
+CREATE TABLE ota (LIKE ot) USING arrow;
+INSERT INTO ot SELECT g, g / 7.0 * 1e20, 'v' || g % 100, g * INTERVAL '1 minute 1.5 seconds', chr(65 + g % 26)::"char",
+	   TIME '00:00' + g * INTERVAL '1.25 seconds', ARRAY[g, NULL, g + 1], g, 'n' || g
+FROM generate_series(1, 1000) g;
+INSERT INTO ot VALUES (0, 'NaN', NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT INTO ota SELECT * FROM ot;
+CREATE TABLE ot_heap AS SELECT * FROM ot;
+SELECT rows_digest('ot') = rows_digest('ot_heap') AS parquet_same, rows_digest('ota') = rows_digest('ot_heap') AS arrow_same;
+ parquet_same | arrow_same 
+--------------+------------
+ t            | t
+(1 row)
+
+SELECT * FROM ot WHERE id IN (0, 1, 500) ORDER BY id;
+ id  |                     n                     | vc |            iv             | c |     tm      |       ar       | dm  |  nm  
+-----+-------------------------------------------+----+---------------------------+---+-------------+----------------+-----+------
+   0 |                                       NaN |    |                           |   |             |                |     | 
+   1 | 14285714285714285714.00000000000000000000 | v1 | @ 1 min 1.5 secs          | B | 00:00:01.25 | {1,NULL,2}     |   1 | n1
+ 500 |   7142857142857142860000.0000000000000000 | v0 | @ 8 hours 32 mins 30 secs | G | 00:10:25    | {500,NULL,501} | 500 | n500
+(3 rows)
+
+\set VERBOSITY terse
+INSERT INTO ot (id, vc) VALUES (2000, 'too long');
+ERROR:  value too long for type character varying(5)
+INSERT INTO ot (id, dm) VALUES (2001, -1);
+ERROR:  value for domain posint violates check constraint "posint_check"
+\set VERBOSITY default
+DROP TABLE ot, ota, ot_heap;
+DROP DOMAIN posint;
+-- what does not apply
+\set VERBOSITY terse
+CREATE TABLE bad (id int) USING parquet WITH (codec = 'snappy');
+ERROR:  codec must be "lz4", "zstd" or "none"
+CREATE TABLE bad (id int) USING parquet WITH (location = '/tmp/x.parquet', codec = 'lz4');
+ERROR:  option "codec" does not apply to a table of access method parquet that reads files at a location
+CREATE TABLE bad (id int) USING iceberg;
+ERROR:  a table of access method iceberg needs option "location"
+ALTER TABLE p SET (location = '/tmp/x.parquet');
+ERROR:  option "location" does not apply to a table of its own files
+\set VERBOSITY default
+-- ADD COLUMN: a part written before it lacks the column, its rows the column's missing value -- NULL, or the
+-- DEFAULT it was added with -- as scans, fetches and vexec read them, and as a merge writes them into its part
+CREATE TABLE ac (id int NOT NULL, t text) USING parquet;
+CREATE TABLE aca (id int NOT NULL, t text) USING arrow;
+INSERT INTO ac SELECT g, 't' || g FROM generate_series(1, 1000) g;
+INSERT INTO aca SELECT g, 't' || g FROM generate_series(1, 1000) g;
+ALTER TABLE ac ADD COLUMN x int, ADD COLUMN y int NOT NULL DEFAULT 42, ADD COLUMN z text DEFAULT 'zed';
+ALTER TABLE aca ADD COLUMN x int, ADD COLUMN y int NOT NULL DEFAULT 42, ADD COLUMN z text DEFAULT 'zed';
+INSERT INTO ac SELECT g, 't' || g, g, g * 2, 'new' FROM generate_series(1001, 1010) g;
+INSERT INTO aca SELECT g, 't' || g, g, g * 2, 'new' FROM generate_series(1001, 1010) g;
+SELECT count(*), count(x), sum(y), count(z), min(z), max(z) FROM ac;
+ count | count |  sum  | count | min | max 
+-------+-------+-------+-------+-----+-----
+  1010 |    10 | 62110 |  1010 | new | zed
+(1 row)
+
+SELECT count(*), count(x), sum(y), count(z), min(z), max(z) FROM aca;
+ count | count |  sum  | count | min | max 
+-------+-------+-------+-------+-----+-----
+  1010 |    10 | 62110 |  1010 | new | zed
+(1 row)
+
+SELECT * FROM ac WHERE id IN (1, 1001) ORDER BY id;
+  id  |   t   |  x   |  y   |  z  
+------+-------+------+------+-----
+    1 | t1    |      |   42 | zed
+ 1001 | t1001 | 1001 | 2002 | new
+(2 rows)
+
+SET vexec.mode = force;
+SELECT y, z, count(*) FROM ac GROUP BY y, z ORDER BY y, z LIMIT 3;
+  y   |  z  | count 
+------+-----+-------
+   42 | zed |  1000
+ 2002 | new |     1
+ 2004 | new |     1
+(3 rows)
+
+SELECT y, z, count(*) FROM aca GROUP BY y, z ORDER BY y, z LIMIT 3;
+  y   |  z  | count 
+------+-----+-------
+   42 | zed |  1000
+ 2002 | new |     1
+ 2004 | new |     1
+(3 rows)
+
+SET vexec.mode = off;
+CREATE INDEX ac_id ON ac (id);
+SET enable_seqscan = off;
+SELECT * FROM ac WHERE id IN (5, 1005) ORDER BY id;
+  id  |   t   |  x   |  y   |  z  
+------+-------+------+------+-----
+    5 | t5    |      |   42 | zed
+ 1005 | t1005 | 1005 | 2010 | new
+(2 rows)
+
+RESET enable_seqscan;
+SELECT ch.optimize('ac', true) AS merged, ch.optimize('aca', true) AS merged_arrow;
+ merged | merged_arrow 
+--------+--------------
+      2 |            2
+(1 row)
+
+SELECT count(*), count(x), sum(y), count(z), min(z), max(z) FROM ac;
+ count | count |  sum  | count | min | max 
+-------+-------+-------+-------+-----+-----
+  1010 |    10 | 62110 |  1010 | new | zed
+(1 row)
+
+SELECT count(*), count(x), sum(y), count(z), min(z), max(z) FROM aca;
+ count | count |  sum  | count | min | max 
+-------+-------+-------+-------+-----+-----
+  1010 |    10 | 62110 |  1010 | new | zed
+(1 row)
+
+UPDATE ac SET z = NULL WHERE id = 2;
+ALTER TABLE ac DROP COLUMN t;
+SELECT * FROM ac WHERE id IN (1, 2, 1001) ORDER BY id;
+  id  |  x   |  y   |  z  
+------+------+------+-----
+    1 |      |   42 | zed
+    2 |      |   42 | 
+ 1001 | 1001 | 2002 | new
+(3 rows)
+
+DROP TABLE ac, aca;
+-- DELETE and UPDATE: tombstones, the new versions a part of their own
+DELETE FROM p WHERE id % 3 = 0;
+DELETE FROM src WHERE id % 3 = 0;
+UPDATE p SET i4 = -i4, t = t || ' updated' WHERE id % 1000 = 1;
+UPDATE src SET i4 = -i4, t = t || ' updated' WHERE id % 1000 = 1;
+SELECT rows_digest('p') = rows_digest('src') AS same;
+ same 
+------
+ t
+(1 row)
+
+SELECT part, rows, min_rowid, max_rowid, units FROM ch.own_files('p') ORDER BY part;
+   part    |  rows  | min_rowid | max_rowid | units 
+-----------+--------+-----------+-----------+-------
+ all_1_1_0 | 300000 |         1 |    300000 |     3
+ all_2_2_0 |    200 |    523265 |    523464 |     1
+(2 rows)
+
+SELECT count(*) AS tombstones FROM ch.tombstones WHERE relfilenumber = pg_relation_filenode('p');
+ tombstones 
+------------
+     100200
+(1 row)
+
+-- a transaction's own rows, savepoints, a rollback
+BEGIN;
+INSERT INTO p SELECT * FROM src WHERE id <= 10;
+SELECT count(*) FROM p WHERE id <= 10;
+ count 
+-------
+    14
+(1 row)
+
+SAVEPOINT s;
+DELETE FROM p WHERE id <= 5;
+SELECT count(*) FROM p WHERE id <= 10;
+ count 
+-------
+     6
+(1 row)
+
+ROLLBACK TO s;
+SELECT count(*) FROM p WHERE id <= 10;
+ count 
+-------
+    14
+(1 row)
+
+ROLLBACK;
+SELECT count(*) FROM p WHERE id <= 10;
+ count 
+-------
+     7
+(1 row)
+
+-- TIDs: a row found again by its ctid
+SELECT id, i4 FROM p WHERE ctid = (SELECT ctid FROM p WHERE id = 1001);
+  id  |  i4   
+------+-------
+ 1001 | -7007
+(1 row)
+
+SELECT count(*) FROM p WHERE ctid IN (SELECT ctid FROM p WHERE id BETWEEN 2000 AND 2100);
+ count 
+-------
+    67
+(1 row)
+
+-- indexes: index and bitmap scans after the updates and deletes
+CREATE INDEX p_id ON p (id);
+CREATE INDEX p_t ON p (t);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id, i4, t FROM p WHERE id = 1001;
+         QUERY PLAN         
+----------------------------
+ Index Scan using p_id on p
+   Index Cond: (id = 1001)
+(2 rows)
+
+SELECT id, i4, t FROM p WHERE id IN (1001, 1002, 1003) ORDER BY id;
+  id  |  i4   |      t      
+------+-------+-------------
+ 1001 | -7007 | 
+ 1003 |  7021 | own 1003üüü
+(2 rows)
+
+SELECT id FROM p WHERE t = 'own 4' || repeat('ü', 0);
+ id 
+----
+  4
+(1 row)
+
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM p WHERE id BETWEEN 100 AND 200;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on p
+         Recheck Cond: ((id >= 100) AND (id <= 200))
+         ->  Bitmap Index Scan on p_id
+               Index Cond: ((id >= 100) AND (id <= 200))
+(5 rows)
+
+SELECT count(*), sum(id) FROM p WHERE id BETWEEN 100 AND 200;
+ count |  sum  
+-------+-------
+    68 | 10200
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_seqscan;
+-- merges: the parts below 8M rows into one, its rows in their ids' order, the dead ones folded out with
+-- their tombstones and index entries
+SELECT ch.optimize('p', false) AS merged;
+ merged 
+--------
+      2
+(1 row)
+
+SELECT part, rows, units, min_unit_rows, max_unit_rows, codec, page_index FROM ch.own_files('p');
+   part    |  rows  | units | min_unit_rows | max_unit_rows |  codec  | page_index 
+-----------+--------+-------+---------------+---------------+---------+------------
+ all_1_2_1 | 200000 |     2 |         68928 |        131072 | LZ4_RAW | t
+(1 row)
+
+SELECT count(*) AS tombstones FROM ch.tombstones WHERE relfilenumber = pg_relation_filenode('p');
+ tombstones 
+------------
+          0
+(1 row)
+
+SELECT rows_digest('p') = rows_digest('src') AS same;
+ same 
+------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, i4 FROM p WHERE id IN (3, 1001, 299999, 300000) ORDER BY id;
+   id   |   i4    
+--------+---------
+   1001 |   -7007
+ 299999 | 2099993
+(2 rows)
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+-- ch.fold(): one part, its dead rows written out of it
+DELETE FROM p WHERE id % 5 = 0;
+DELETE FROM src WHERE id % 5 = 0;
+SELECT ch.fold('p') AS folded;
+ folded 
+--------
+  40000
+(1 row)
+
+SELECT part, rows, units FROM ch.own_files('p');
+    part     |  rows  | units 
+-------------+--------+-------
+ all_1_2_1_4 | 160000 |     2
+(1 row)
+
+SELECT count(*) AS tombstones FROM ch.tombstones WHERE relfilenumber = pg_relation_filenode('p');
+ tombstones 
+------------
+          0
+(1 row)
+
+SELECT rows_digest('p') = rows_digest('src') AS same;
+ same 
+------
+ t
+(1 row)
+
+-- Arrow: the same DML and merges
+DELETE FROM a WHERE id % 3 = 0;
+UPDATE a SET i4 = -i4, t = t || ' updated' WHERE id % 1000 = 1;
+DELETE FROM a WHERE id % 5 = 0;
+SELECT rows_digest('a') = rows_digest('src') AS same;
+ same 
+------
+ t
+(1 row)
+
+SELECT ch.optimize('a', true) AS merged;
+ merged 
+--------
+      2
+(1 row)
+
+SELECT part, rows, units, min_unit_rows, max_unit_rows, codec FROM ch.own_files('a');
+   part    |  rows  | units | min_unit_rows | max_unit_rows | codec 
+-----------+--------+-------+---------------+---------------+-------
+ all_1_2_1 | 160000 |     2 |         28928 |        131072 | NONE
+(1 row)
+
+SELECT rows_digest('a') = rows_digest('src') AS same;
+ same 
+------
+ t
+(1 row)
+
+-- the writers and the merges on the caller's thread (§1.2 rule 4): the library's threads as they were
+SELECT threads FROM ch.engine_info();
+ threads 
+---------
+       5
+(1 row)
+
+-- COPY: its rows, in and out, as any table's
+COPY (SELECT * FROM p WHERE id < 20 ORDER BY id) TO '/tmp/chte_own_copy.csv' WITH (FORMAT csv);
+CREATE TABLE pc (LIKE src) USING parquet;
+COPY pc FROM '/tmp/chte_own_copy.csv' WITH (FORMAT csv);
+SELECT count(*), sum(id) FROM pc;
+ count | sum 
+-------+-----
+    11 | 112
+(1 row)
+
+COPY pc TO STDOUT WITH (FORMAT csv);
+1,-99,-7,0.25,0.333333333333333,0.1429,f,03-02-1998,Fri Jan 01 00:17:00.25 1960,Mon Jun 07 02:09:10 2010 PDT,own 1ü updated,v1,"{""g"" : 1}",\x000000001f,11111111-2222-4333-8444-000000000001
+2,-98,14,0.5,0.666666666666667,0.2857,t,03-03-1998,Fri Jan 01 00:34:00.5 1960,Mon Jun 07 05:09:10 2010 PDT,own 2üü,v2,"{""g"" : 2}",\x000000003e,11111111-2222-4333-8444-000000000002
+4,-96,28,1,1.33333333333333,0.5714,t,03-05-1998,Fri Jan 01 01:08:01 1960,Mon Jun 07 11:09:10 2010 PDT,own 4,v4,"{""g"" : 4}",\x000000007c,11111111-2222-4333-8444-000000000004
+7,-93,49,1.75,2.33333333333333,1.0000,f,03-08-1998,Fri Jan 01 01:59:01.75 1960,Mon Jun 07 20:09:10 2010 PDT,own 7üüü,v7,"{""g"" : 7}",\x00000000d9,11111111-2222-4333-8444-000000000007
+8,-92,56,2,2.66666666666667,1.1429,t,03-09-1998,Fri Jan 01 02:16:02 1960,Mon Jun 07 23:09:10 2010 PDT,own 8,v8,"{""g"" : 8}",\x00000000f8,11111111-2222-4333-8444-000000000008
+11,-89,77,2.75,3.66666666666667,1.5714,f,03-12-1998,Fri Jan 01 03:07:02.75 1960,Tue Jun 08 08:09:10 2010 PDT,own 11üüü,v11,"{""g"" : 11}",\x0000000155,11111111-2222-4333-8444-00000000000b
+13,-87,91,3.25,4.33333333333333,1.8571,f,03-14-1998,Fri Jan 01 03:41:03.25 1960,Tue Jun 08 14:09:10 2010 PDT,,v13,"{""g"" : 13}",\x0000000193,11111111-2222-4333-8444-00000000000d
+14,-86,98,3.5,4.66666666666667,2.0000,t,03-15-1998,Fri Jan 01 03:58:03.5 1960,Tue Jun 08 17:09:10 2010 PDT,own 14üü,v14,"{""g"" : 14}",\x00000001b2,11111111-2222-4333-8444-00000000000e
+16,-84,112,4,5.33333333333333,2.2857,t,03-17-1998,Fri Jan 01 04:32:04 1960,Tue Jun 08 23:09:10 2010 PDT,own 16,v16,"{""g"" : 16}",\x00000001f0,11111111-2222-4333-8444-000000000010
+17,-83,119,4.25,5.66666666666667,2.4286,f,03-18-1998,Fri Jan 01 04:49:04.25 1960,Wed Jun 09 02:09:10 2010 PDT,own 17ü,v17,"{""g"" : 17}",\x000000020f,11111111-2222-4333-8444-000000000011
+19,-81,133,4.75,6.33333333333333,2.7143,f,03-20-1998,Fri Jan 01 05:23:04.75 1960,Wed Jun 09 08:09:10 2010 PDT,own 19üüü,v19,"{""g"" : 19}",\x000000024d,11111111-2222-4333-8444-000000000013
+-- CREATE TABLE AS, a rewrite (VACUUM FULL, ALTER TABLE ... TYPE), TRUNCATE, VACUUM
+CREATE TABLE pt USING parquet AS SELECT id, t FROM src WHERE id < 1000;
+SELECT count(*), sum(id) FROM pt;
+ count |  sum   
+-------+--------
+   533 | 266332
+(1 row)
+
+DELETE FROM pt WHERE id < 100;
+VACUUM FULL pt;
+SELECT count(*), sum(id) FROM pt;
+ count |  sum   
+-------+--------
+   480 | 263700
+(1 row)
+
+SELECT count(*) AS tombstones FROM ch.tombstones WHERE relfilenumber = pg_relation_filenode('pt');
+ tombstones 
+------------
+          0
+(1 row)
+
+ALTER TABLE pt ALTER COLUMN id TYPE int4;
+SELECT count(*), sum(id) FROM pt;
+ count |  sum   
+-------+--------
+   480 | 263700
+(1 row)
+
+SELECT pg_typeof(id) FROM pt LIMIT 1;
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+TRUNCATE pt;
+SELECT count(*) FROM pt;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM ch.own_files('pt');
+ count 
+-------
+     0
+(1 row)
+
+INSERT INTO pt SELECT g, 'again' FROM generate_series(1, 10) g;
+VACUUM pt;
+SELECT count(*), max(t) FROM pt;
+ count |  max  
+-------+-------
+    10 | again
+(1 row)
+
+-- temporary and unlogged tables
+CREATE TEMP TABLE tmp (id int, t text) USING parquet;
+INSERT INTO tmp SELECT g, 't' || g FROM generate_series(1, 1000) g;
+DELETE FROM tmp WHERE id > 10;
+SELECT count(*), sum(id) FROM tmp;
+ count | sum 
+-------+-----
+    10 |  55
+(1 row)
+
+CREATE UNLOGGED TABLE ul (id int, t text) USING arrow;
+INSERT INTO ul SELECT g, 't' || g FROM generate_series(1, 1000) g;
+UPDATE ul SET t = 'u' WHERE id = 7;
+SELECT count(*), max(t) FROM ul;
+ count | max 
+-------+-----
+  1000 | u
+(1 row)
+
+-- a parallel scan's participants read the parts' files
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SELECT count(*), sum(id), count(t) FROM p;
+ count  |     sum     | count  
+--------+-------------+--------
+ 160000 | 24000000000 | 147693
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+DROP TABLE p, a, pz, pn, al, az, pc, pt, tmp, ul;
+SELECT count(*) FROM ch.tables t LEFT JOIN pg_class c ON c.oid = t.relid WHERE c.oid IS NULL;
+ count 
+-------
+     0
+(1 row)
+
+DROP FUNCTION rows_digest(regclass);
+DROP TABLE src;
+\! rm -f /tmp/chte_own_copy.csv

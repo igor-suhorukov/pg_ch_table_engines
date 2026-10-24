@@ -639,6 +639,83 @@ CHTE_API int			chte_file_write_finish(chte_file_writer *writer, uint64_t *bytes,
 CHTE_API void		chte_file_write_close(chte_file_writer *writer);
 
 /*
+ * Tables of their own files (ch_table_engines.md §2.18, CH8), each part one file the extension
+ * writes, of rows in their ids' order.  The calls are optional: a library built before them lacks
+ * them, and the extension then makes no such table.
+ *
+ * chte_own_open opens one as chte_external_open opens an external table, of Parquet or Arrow, its
+ * location not read (NULL): its rows carry their ids, _pg_rowid a column UInt64 of every file,
+ * ascending in it, read as it is rather than as a row's place.  Its caller lists its parts' files
+ * itself (chte_external_listing_load); chte_external_list and chte_external_schema refuse it.
+ *
+ * chte_own_write_begin is chte_file_write_begin with each batch written in slices of 65,536 rows,
+ * so that a writer that gathers its rows to a target -- Parquet's row groups, Arrow's record
+ * batches, at the settings the caller gives -- cuts them at it, not at a batch's size.
+ */
+CHTE_API int			chte_own_open(const chte_external_def *def, chte_table **table, chte_error *error);
+
+/*
+ * A listing of a table of its own files: the files given, absolute paths -- a snapshot's parts' --
+ * in their order, each one's identity taken now and its footer read or found kept, as
+ * chte_external_list lists a location's.
+ */
+CHTE_API int			chte_own_list(chte_table *table, const char *const *paths, size_t npaths,
+							  chte_external_listing **listing, chte_error *error);
+CHTE_API int			chte_own_write_begin(const char *format, const char *path, const chte_file_column *columns,
+									 size_t ncolumns, const char *settings, chte_file_writer **writer,
+									 chte_error *error);
+
+/*
+ * The places in a listed file of the rows of ids: offsets[i] the place of ids[i], UINT64_MAX
+ * where the file holds none.  A file's ids are read once in the table, for its identity.
+ */
+CHTE_API int			chte_own_locate(chte_table *table, chte_external_listing *listing, size_t file,
+								const uint64_t *ids, size_t n, uint64_t *offsets, chte_error *error);
+
+/*
+ * The ids of the rows of a listed file's units -- ascending, as its units are -- in their order:
+ * *ids valid until the next call on the table.
+ */
+CHTE_API int			chte_own_unit_ids(chte_table *table, chte_external_listing *listing, size_t file,
+								  const int32_t *units, size_t nunits, const uint64_t **ids, size_t *n,
+								  chte_error *error);
+
+/*
+ * A merge: the rows of listed files -- their columns by the columns' names, _pg_rowid among them
+ * -- but those whose ids dead names (ascending), in their ids' order, written as chte_own_write_*
+ * writes a part's file at path; a column a file lacks, added after it was written, its rows the
+ * column's missing value, missing[c] a vector of one row in chte_write_batch's layout of the
+ * column's source type; dropped[i], where given, set where a row of dead[i] was among them.
+ * Returns the rows and the bytes written.
+ */
+CHTE_API int			chte_own_merge(chte_table *table, chte_external_listing *listing, const size_t *files,
+							   size_t nfiles, const uint64_t *dead, size_t ndead, uint8_t *dropped,
+							   const char *format, const char *path, const chte_file_column *columns,
+							   size_t ncolumns, const chte_vector *missing, const char *settings, uint64_t *rows,
+							   uint64_t *bytes, chte_error *error);
+
+/*
+ * A listed file's layout, as the tests read it back: its units and their rows, the codec of its
+ * first column chunk or record batch ("NONE" where none), and whether every column chunk of a
+ * Parquet file has a page index, and some a bloom filter or a dictionary.  codec is valid until
+ * the next call on the table.
+ */
+typedef struct chte_file_layout
+{
+	uint32_t	units;
+	uint64_t	rows;
+	uint64_t	min_unit_rows;
+	uint64_t	max_unit_rows;
+	const char *codec;
+	int32_t		page_index;
+	int32_t		bloom_filters;
+	int32_t		dictionaries;
+} chte_file_layout;
+
+CHTE_API int			chte_own_file_layout(chte_table *table, chte_external_listing *listing, size_t file,
+									 chte_file_layout *layout, chte_error *error);
+
+/*
  * The tests' Iceberg tables (§2.17), on a local disk, by ClickHouse's own Iceberg writers: a table made by
  * IcebergMetadata::createInitial(), its rows appended by IcebergStorageSink, and its deletes -- which ClickHouse
  * writes only through its interpreter's mutations, and equality deletes never -- by its Parquet writer, its

@@ -691,7 +691,13 @@ ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChSt
 	values[Anum_tables_relfilenumber - 1] = ObjectIdGetDatum(id->locator.relNumber);
 	values[Anum_tables_backend - 1] = Int32GetDatum(id->backend);
 	values[Anum_tables_relid - 1] = ObjectIdGetDatum(RelationGetRelid(rel));
-	values[Anum_tables_engine - 1] = CStringGetTextDatum(ch_engine_name(kind));
+	{
+		ChExternalKind ext_kind;
+
+		/* a table of its own files (§2.18): its access method's name, its parts' format */
+		values[Anum_tables_engine - 1] =
+			CStringGetTextDatum(ch_is_external_rel(rel, &ext_kind) ? ch_external_name(ext_kind) : ch_engine_name(kind));
+	}
 	values[Anum_tables_storage - 1] = CStringGetTextDatum(storage == CH_STORAGE_PAGES ? "pages" : "files");
 	values[Anum_tables_next_rowid - 1] = Int64GetDatum(1);
 	values[Anum_tables_next_block - 1] = Int64GetDatum(1);

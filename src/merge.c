@@ -354,13 +354,17 @@ ch_optimize(PG_FUNCTION_ARGS)
 	bool		final = PG_GETARG_BOOL(1);
 	int			merged;
 
-	if (!ch_is_engine_rel(rel, NULL))
+	if (!ch_is_mvcc_rel(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table of the ClickHouse engines", RelationGetRelationName(rel))));
 	if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, RelationGetRelationName(rel));
-	merged = ch_merge_parts(rel, final ? CH_MERGE_FINAL : CH_MERGE_OPTIMIZE);
+	/* a table of its own files' merges are its own (§2.18, own.c) */
+	if (ch_is_own_rel(rel))
+		merged = ch_own_merge_parts(rel, final ? CH_MERGE_FINAL : CH_MERGE_OPTIMIZE);
+	else
+		merged = ch_merge_parts(rel, final ? CH_MERGE_FINAL : CH_MERGE_OPTIMIZE);
 	relation_close(rel, NoLock);
 	PG_RETURN_INT32(merged);
 }

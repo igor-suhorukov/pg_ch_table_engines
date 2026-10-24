@@ -61,6 +61,8 @@ PSQL=("$BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$D/sock" -U postgres)
 status=0
 passed=0
 kept=0
+own_passed=0
+own_kept=0
 n=0
 for spec in "$out/specs/"*.spec; do
 	name="$(basename "$spec" .spec)"
@@ -71,7 +73,8 @@ for spec in "$out/specs/"*.spec; do
 	# lock_timeout ends the waits that only exclusive row locks make -- a FOR
 	# SHARE queued behind another's -- each the same way in every run, where
 	# they would hold their spec until the leg's timeout
-	for am in heap mergetree; do
+	# parquet's: tables of their own files (§2.18, CH8), whose answers are mergetree's
+	for am in heap mergetree parquet; do
 		db="iso_${am}_$n"
 		"${PSQL[@]}" -d postgres -c "CREATE DATABASE $db" || exit 1
 		"${PSQL[@]}" -d "$db" -c "CREATE EXTENSION ch_table_engines;
@@ -92,6 +95,17 @@ for spec in "$out/specs/"*.spec; do
 		status=1
 		echo "  $name: DIFFERS from heap's ($out/$name.diff)"
 	fi
+	if diff -u "$out/$name.mergetree" "$out/$name.parquet" > "$out/$name.own.diff"; then
+		rm -f "$out/$name.own.diff"
+		own_passed=$((own_passed + 1))
+	elif [ -f "$here/isolation/kept-own/$name.diff" ] && \
+		diff -q <(grep -E '^[-+][^-+]' "$here/isolation/kept-own/$name.diff") <(grep -E '^[-+][^-+]' "$out/$name.own.diff") > /dev/null; then
+		own_kept=$((own_kept + 1))
+		echo "  $name: parquet's, the kept difference from mergetree's"
+	else
+		status=1
+		echo "  $name: parquet's DIFFERS from mergetree's ($out/$name.own.diff)"
+	fi
 done
 server_stop "$D"
 if log_failures "$D"; then
@@ -100,4 +114,5 @@ if log_failures "$D"; then
 	status=1
 fi
 echo "isolation: $n specs: $passed as heap's, $kept with their kept differences, $((n - passed - kept)) differ"
+echo "isolation: over tables of their own files: $own_passed as mergetree's, $own_kept with their kept differences, $((n - own_passed - own_kept)) differ"
 exit $status

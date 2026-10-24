@@ -86,6 +86,8 @@ static const ChOptionName option_names[] = {
 	{"low_cardinality", true},
 	/* an external table's (§2.17): where it reads, which changes at any time */
 	{"location", false},
+	/* a table of its own files' (§2.18): its parts' codec, the next part's and merge's */
+	{"codec", false},
 };
 
 /*
@@ -275,19 +277,57 @@ ch_options_validate(List *defs, ChEngineKind kind)
  * The options of an external table (§2.17): location -- an absolute path,
  * set only by a role that may read the server's files, as COPY FROM a file
  * and file_fdw require -- needed where the table is made; settings,
- * ClickHouse's for its format.  The engines' others do not apply.
+ * ClickHouse's for its format.  A table of parquet or arrow made without a
+ * location is one of its own files (§2.18, CH8), the kind fixed then: its
+ * options settings and codec, its parts' -- lz4, zstd or none, by default
+ * lz4 for Parquet and none for Arrow.  The engines' others do not apply.
+ * own says which kind an existing table is; where it is made, its options do.
  */
 void
-ch_external_options_validate(List *defs, ChExternalKind kind, bool creating)
+ch_external_options_validate(List *defs, ChExternalKind kind, bool creating, bool own)
 {
 	ListCell   *lc;
 	bool		has_location = false;
 
+	if (creating)
+	{
+		own = kind != CH_EXTERNAL_ICEBERG;
+		foreach(lc, defs)
+			if (strcmp(lfirst_node(DefElem, lc)->defname, "location") == 0)
+				own = false;
+	}
 	foreach(lc, defs)
 	{
 		DefElem    *def = lfirst_node(DefElem, lc);
 		const char *name = def->defname;
 
+		if (strcmp(name, "location") == 0 && own)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("option \"location\" does not apply to a table of its own files"),
+					 errdetail("A table of access method %s made without a location keeps its rows in files of its own, "
+							   "and stays so.", ch_external_name(kind)),
+					 errhint("Read files elsewhere with another table: CREATE TABLE ... USING %s WITH (location = '...').",
+							 ch_external_name(kind))));
+		if (strcmp(name, "codec") == 0)
+		{
+			const char *v;
+
+			if (!own)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("option \"codec\" does not apply to a table of access method %s that reads files at a location",
+								ch_external_name(kind)),
+						 errdetail("Its files' codecs are their writers'.")));
+			if (def->defaction == DEFELEM_DROP)
+				continue;
+			v = def_string(def);
+			if (strcmp(v, "lz4") != 0 && strcmp(v, "zstd") != 0 && strcmp(v, "none") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("codec must be \"lz4\", \"zstd\" or \"none\"")));
+			continue;
+		}
 		if (strcmp(name, "location") == 0)
 		{
 			const char *v;
@@ -319,9 +359,10 @@ ch_external_options_validate(List *defs, ChExternalKind kind, bool creating)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("option \"%s\" does not apply to a table of access method %s", name, ch_external_name(kind)),
+					 own ? errhint("Its options are \"codec\" and \"settings\".") :
 					 errhint("Its options are \"location\" and \"settings\".")));
 	}
-	if (creating && !has_location)
+	if (creating && !has_location && !own)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a table of access method %s needs option \"location\"", ch_external_name(kind)),
@@ -373,6 +414,8 @@ apply_option(ChOptions *opts, const char *name, const char *value)
 		opts->low_cardinality = pstrdup(value);
 	else if (strcmp(name, "location") == 0)
 		opts->location = pstrdup(value);
+	else if (strcmp(name, "codec") == 0)
+		opts->codec = pstrdup(value);
 }
 
 /* The engines' options in a reloptions array; the others are heap's */
@@ -446,8 +489,21 @@ ch_relation_options(Relation rel, ChOptions *opts)
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
 	if (!HeapTupleIsValid(tuple))
 	{
-		/* made by the running command, before its options were bound */
+		ListCell   *lc;
+
+		/*
+		 * made by the running command, before its options were bound: the
+		 * CREATE's own -- whether a table of parquet or arrow has its own
+		 * files (§2.18) is known so as its storage is made
+		 */
 		set_defaults(opts);
+		if (pending_create)
+			foreach(lc, pending_defs)
+			{
+				DefElem    *def = lfirst_node(DefElem, lc);
+
+				apply_option(opts, def->defname, defGetString(def));
+			}
 		return;
 	}
 	datum = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions, &isnull);
@@ -720,7 +776,7 @@ alter_table_options(Oid relid, AlterTableCmd *cmd)
 		if (cmd->subtype == AT_ResetRelOptions)
 			foreach(lc, ours)
 				lfirst_node(DefElem, lc)->defaction = DEFELEM_DROP;
-		ch_external_options_validate(ours, ext_kind, false);
+		ch_external_options_validate(ours, ext_kind, false, ch_is_own_rel(rel));
 		defining = false;
 	}
 	else if (!ch_is_engine_rel(rel, &kind))
@@ -879,7 +935,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 						 errmsg("a table of access method %s cannot be partitioned or a partition", ch_external_name(ext_kind))));
 			copy = copyObject(stmt);
 			ours = take_engine_options(&copy->options);
-			ch_external_options_validate(ours, ext_kind, true);
+			ch_external_options_validate(ours, ext_kind, true, false);
 			pending_defs = stringify_defs(ours);
 			pending_create = true;
 			pstmt = copy_with_utility(pstmt, (Node *) copy);
@@ -909,7 +965,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 			CreateTableAsStmt *copy = copyObject(stmt);
 			List	   *ours = take_engine_options(&copy->into->options);
 
-			ch_external_options_validate(ours, ext_kind, true);
+			ch_external_options_validate(ours, ext_kind, true, false);
 			pending_defs = stringify_defs(ours);
 			pending_create = true;
 			pstmt = copy_with_utility(pstmt, (Node *) copy);
@@ -996,6 +1052,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 					alter_table_options(relid, cmd);
 					continue;
 				}
+
 				if (ours && cmd->subtype == AT_DropNotNull)
 				{
 					Relation	r = relation_open(relid, AccessShareLock);
@@ -1130,7 +1187,7 @@ ch_ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree
 				continue;
 			PG_TRY();
 			{
-				if (ch_is_external_rel(r, NULL))
+				if (ch_is_external_rel(r, NULL) && !ch_is_own_rel(r))
 					ch_external_check(r);
 			}
 			PG_FINALLY();
@@ -1194,11 +1251,15 @@ ch_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId, 
 				ch_options_bind(objectId, pending_defs);
 				/*
 				 * §2.17: its columns' types the engine library takes, and the
-				 * files its location names now, each one's columns checked
+				 * files its location names now, each one's columns checked; a
+				 * table of its own files (§2.18), its columns alone
 				 */
 				PG_TRY();
 				{
-					ch_external_check(rel);
+					if (ch_is_own_rel(rel))
+						(void) ch_table(rel);
+					else
+						ch_external_check(rel);
 				}
 				PG_CATCH();
 				{

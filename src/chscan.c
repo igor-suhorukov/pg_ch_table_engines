@@ -686,7 +686,7 @@ chscan_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		bool		external = ch_is_external_rel(s->rel, &kind);
 		const char *units = !external ? "Granules" : kind == CH_EXTERNAL_ARROW ? "Record Batches" :
 			kind == CH_EXTERNAL_ICEBERG ? "Data Files" : "Row Groups";
-		const char *parts = !external ? "parts" : "files";
+		const char *parts = !external || ch_is_own_rel(s->rel) ? "parts" : "files";
 
 		if (s->scan && !s->counted)
 			c = *ch_scan_counts(s->scan);

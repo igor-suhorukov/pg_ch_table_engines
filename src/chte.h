@@ -72,6 +72,8 @@ typedef struct ChOptions
 	char	   *low_cardinality;
 	/* an external table's (§2.17): where its files are -- a file, a glob or a directory */
 	char	   *location;
+	/* a table of its own files' (§2.18, CH8): its parts' codec, "lz4", "zstd" or "none"; NULL: its format's default */
+	char	   *codec;
 } ChOptions;
 
 /*
@@ -130,12 +132,17 @@ extern bool ch_external_am_name_kind(const char *amname, ChExternalKind *kind);
 extern const char *ch_external_name(ChExternalKind kind);
 /* a table of an engine, or an external one: what scan.c, ChScan and vexec's source read */
 extern bool ch_is_scan_rel(Relation rel);
+/* a table of its own files (§2.18, CH8): an external access method's without a location */
+extern bool ch_is_own_rel(Relation rel);
+extern bool ch_is_own_relid(Oid relid);
+/* a table whose rows are PostgreSQL's: an engine's, or one of its own files */
+extern bool ch_is_mvcc_rel(Relation rel);
 
 /* options.c */
 extern void ch_options_init(void);
 extern bool ch_is_option_name(const char *name);
 extern void ch_options_validate(List *defs, ChEngineKind kind);
-extern void ch_external_options_validate(List *defs, ChExternalKind kind, bool creating);
+extern void ch_external_options_validate(List *defs, ChExternalKind kind, bool creating, bool own);
 extern void ch_options_parse(Datum reloptions, ChOptions *opts);
 extern void ch_relation_options(Relation rel, ChOptions *opts);
 extern void ch_options_bind(Oid relid, List *defs);
@@ -192,6 +199,17 @@ typedef struct ChTable
 	bool		external;
 	ChExternalKind ext_kind;
 	struct ChListing *listing;
+	/*
+	 * A table of its own files (§2.18, CH8), external too: its parts' format
+	 * and file name, their columns as the writer takes them -- the builder's
+	 * vectors', _pg_rowid last -- and the writer's settings, its layout's
+	 */
+	bool		own;
+	const char *own_format;		/* "Parquet", "Arrow" */
+	const char *own_file;		/* "data.parquet", "data.arrow" */
+	chte_file_column *file_columns;
+	int			nfile_columns;
+	char	   *write_settings;
 } ChTable;
 
 extern void ch_storage_id(Relation rel, const RelFileLocator *locator, ChStorageId *id);
@@ -349,6 +367,8 @@ typedef struct ChListing
 
 extern void ch_external_columns_for(Relation rel, TupleDesc desc, MemoryContext cxt, chte_external_column **columns,
 									int *ncolumns);
+extern ChListing *ch_own_listing(ChTable *t, List *parts);
+extern char *ch_own_part_file(ChTable *t, const char *part);
 extern ChListing *ch_external_listing(Relation rel, ChTable *t);
 extern ChListing *ch_external_listing_load(ChTable *t, const void *bytes, Size size);
 extern void ch_listing_pin(ChListing *l);
@@ -356,6 +376,7 @@ extern void ch_listing_unpin(ChListing *l);
 extern void ch_external_xact_end(void);
 extern void ch_external_check(Relation rel);
 extern bool ch_external_rewrite_target(Relation rel);
+extern Oid	ch_rewrite_source(Relation rel);
 extern Node *ch_external_copy_to(CopyStmt *stmt, Oid relid);
 extern void ch_external_truncated(Relation rel);
 extern void ch_external_totals(Relation rel, double *rows, uint64 *bytes);
@@ -441,5 +462,12 @@ extern double ch_fetch_price(Relation rel, int ncols);
 
 /* vexec.c: vexec's batch source and sink (§3) */
 extern void ch_vexec_register(void);
+
+/* own.c: tables of their own files (§2.18, CH8) */
+extern void ch_own_table_setup(Relation rel, TupleDesc desc, ChTable *t);
+extern void ch_own_write_part(Relation rel, ChTable *t, const ChStorageId *id, ChVectorBuilder *builder,
+							  uint64 first_rowid, uint64 last_rowid, CommandId cid);
+extern int	ch_own_merge_parts(Relation rel, ChMergeMode mode);
+extern int64 ch_own_fold(Relation rel);
 
 #endif							/* CHTE_H */

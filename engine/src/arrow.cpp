@@ -10,6 +10,7 @@
  */
 #include "external.h"
 
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
 #include <DataTypes/DataTypeLowCardinality.h>
@@ -101,8 +102,9 @@ struct ArrowRead
     /// chte_external_read_rows': the rows at these offsets alone, ascending
     std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read;
     size_t wanted = 0;
-    /// per column asked for: the table's column, or SIZE_MAX the row id
+    /// per column asked for: the table's column, or SIZE_MAX the row id; and whether the file lacks it (§2.18)
     std::vector<size_t> columns;
+    std::vector<uint8_t> absent;
 
     /// The dictionaries the asked columns use, decoded before any record batch, as the input format does
     void loadDictionaries()
@@ -174,8 +176,16 @@ struct ArrowRead
             for (size_t i = 0; i < decoded.size(); ++i)
                 by_name.emplace(decoded[i].name, i);
             ColumnsWithTypeAndName out;
-            for (size_t column : columns)
+            for (size_t k = 0; k < columns.size(); ++k)
             {
+                size_t column = columns[k];
+                if (absent[k])
+                {
+                    /// not in the file: defaults, which the caller passes over (chte_read_present)
+                    const auto & c = table->columns[column];
+                    out.emplace_back(c.type->createColumnConstWithDefaultValue(rows)->convertToFullColumnIfConst(), c.type, c.name);
+                    continue;
+                }
                 if (column == SIZE_MAX)
                 {
                     auto ids = ColumnUInt64::create(rows);
@@ -285,13 +295,18 @@ std::unique_ptr<chte_reader> openArrowReader(chte_table & table, std::shared_ptr
     const auto & footer = *state->resolved->footer;
     for (const auto & name : names)
     {
-        if (name == ROWID)
+        /// the row id a row's place, but a table of its own files' (§2.18), a column of the file
+        if (name == ROWID && !ext.own)
         {
             state->columns.push_back(SIZE_MAX);
+            state->absent.push_back(0);
             continue;
         }
         size_t i = ext.columnIndex(name);
         state->columns.push_back(i);
+        state->absent.push_back(state->resolved->isAbsent(i) ? 1 : 0);
+        if (state->absent.back())
+            continue;
         state->fields.insert(state->resolved->names[i]);
         state->target_types[state->resolved->names[i]] = fileReadType(ext, *state->resolved, i);
     }
@@ -316,6 +331,9 @@ std::unique_ptr<chte_reader> openArrowReader(chte_table & table, std::shared_ptr
     auto r = std::make_unique<chte_reader>();
     r->table = &table;
     r->present.assign(names.size(), 1);
+    for (size_t k = 0; k < names.size(); ++k)
+        if (state->absent[k])
+            r->present[k] = 0;
     r->next_block = [raw = state.get()](Block & block) { return raw->next(block); };
     r->external_state = std::move(state);
     return r;
@@ -329,6 +347,19 @@ void arrowColumnBytes(const ExternalFooter & footer, size_t ncolumns, uint64_t *
         body += static_cast<UInt64>(std::max<Int64>(block.body_length, 0));
     size_t fields = std::max<size_t>(footer.arrow->schema.fields.size(), 1);
     *compressed = *uncompressed = body * ncolumns / fields;
+}
+
+String arrowCodec(const String & path, const ExternalFooter & footer)
+{
+    if (footer.arrow->record_batch_blocks.empty())
+        return "NONE";
+    auto buf = openListed(path, footer.size, footer.mtime);
+    ArrowIPC::MessageReader reader(*buf);
+    ArrowIPC::MessageReader::Message msg;
+    const auto & batch = recordBatchAt(*buf, reader, footer.arrow->record_batch_blocks.front(), msg, path);
+    if (!batch.compression())
+        return "NONE";
+    return batch.compression()->codec() == ArrowIPC::flatbuf::CompressionType_ZSTD ? "ZSTD" : "LZ4_FRAME";
 }
 
 void registerArrowOutput()

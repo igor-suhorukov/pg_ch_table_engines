@@ -128,6 +128,16 @@ ch_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid, Snapshot
 			pgstat_count_heap_fetch(rel);
 		return found;
 	}
+	/* a table of its own files' row (§2.18): found by its id in its part's file, uncached */
+	if (ch_is_own_rel(rel))
+	{
+		found = ch_fetch_row(rel, tid, snapshot, slot);
+		if (found)
+			pgstat_count_heap_fetch(rel);
+		else if (all_dead && snapshot && IsMVCCSnapshot(snapshot) && ItemPointerIsValid(tid))
+			*all_dead = dead_to_all(rel, CH_TID_TO_ROWID(tid), NULL);
+		return found;
+	}
 	if (f->slot != slot || f->cache == NULL)
 	{
 		f->slot = slot;

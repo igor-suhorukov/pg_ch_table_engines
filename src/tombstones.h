@@ -51,6 +51,7 @@ typedef struct ChTombstone
 
 extern void ch_row_state(const ChStorageId *id, uint64 rowid, ChRowState *state);
 extern void ch_tombstone_insert(const ChStorageId *id, uint64 rowid, char kind, uint64 successor, CommandId cid);
+extern bool ch_tombstones_visible_any(const ChStorageId *id, Snapshot snapshot);
 extern uint64 *ch_tombstones_visible(const ChStorageId *id, Snapshot snapshot, uint64 lo, uint64 hi, int *n);
 extern bool ch_tombstone_visible(const ChStorageId *id, Snapshot snapshot, uint64 rowid, uint64 *successor);
 extern bool ch_tombstones_any(const ChStorageId *id);

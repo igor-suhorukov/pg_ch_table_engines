@@ -104,8 +104,9 @@ names them.  `ch.engine_info()` counts a process's threads and functions.
 
 ## Tables of files
 
-`parquet` reads Parquet files PostgreSQL does not own, through ClickHouse's
-own Parquet reader, and never writes them:
+`parquet` with a `location` reads Parquet files PostgreSQL does not own,
+through ClickHouse's own Parquet reader, and never writes them; without one,
+a table keeps files of its own ([below](#tables-of-their-own-files)):
 
 ```sql
 CREATE TABLE trips (id bigint NOT NULL, fare numeric(10, 2), pickup timestamptz, zone text)
@@ -184,6 +185,44 @@ among them.
 
 The engine library is built with ClickHouse's Parquet and Arrow IPC formats,
 Avro and their libraries (`engine/submodules.txt`).
+
+## Tables of their own files
+
+A `parquet` or `arrow` table made without a `location` keeps its rows in
+files of its own, laid out for a GPU to read them
+([pg_accel](https://github.com/igor-suhorukov/pg_accel)'s `vexec_gpu`):
+a part is one Parquet or Arrow IPC file in the files store's directory,
+`ch_<relfilenumber>/<part>/data.parquet` or `data.arrow`, written by
+ClickHouse's own writers, under PostgreSQL's MVCC and WAL as a mergetree
+part of the files store is:
+
+```sql
+CREATE TABLE trips (id bigint NOT NULL, fare numeric(10, 2), pickup timestamptz, zone text)
+    USING parquet WITH (codec = 'zstd');
+```
+
+`codec` is `lz4` (Parquet's default, written as LZ4_RAW), `zstd` or `none`
+(Arrow's default); `ALTER TABLE ... SET (codec = ...)` applies to the parts
+written next.  Such a table refuses `location`, and an external one `codec`.
+A part's row groups and record batches hold 131,072 rows, but its last;
+Parquet's have a page index and bloom filters.  A column's name in the files
+is `c<attnum>`, so that a renamed column keeps its files, and `_pg_rowid`
+holds each row's id.  `ch.own_files(rel)` reads each part's layout back from
+its file.  The columns take every type a mergetree table does -- those
+without a type of the file's own as their bytes -- and a column added later
+reads its missing value from the parts written before it.
+
+The rest is a mergetree table's: INSERT and COPY, DELETE and UPDATE as
+tombstones, row locks, savepoints, indexes, TIDs, TRUNCATE, rewrites,
+VACUUM, temporary and unlogged tables, parallel scans, ChScan and vexec's
+source, crash recovery, streaming replicas and pg_dump.  The merge workers
+and `ch.optimize()` merge runs of adjacent parts below 8M rows, at most 100
+at a time, leaving the deleted rows out; `ch.fold(rel)` writes a part with
+deleted rows again without them.  A fetch by TID reads a page of each column
+it needs, uncached, and the planner prices it so.  With `vexec_gpu`, vexec's
+groupings read the parts on the GPU, each part's deleted rows left out.  Not
+yet: partitions, a fetch cache, vexec's sink (rows are written through the
+write buffer), the pages store and sort keys.
 
 ## On the Cloudberry port
 

@@ -32,6 +32,7 @@
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -186,6 +187,69 @@ bool
 ch_is_scan_rel(Relation rel)
 {
 	return ch_is_engine_rel(rel, NULL) || ch_is_external_rel(rel, NULL);
+}
+
+/* What the relcache keeps of a table of an external access method (rd_amcache, freed at its invalidation) */
+typedef struct ChAmCache
+{
+	bool		own;
+} ChAmCache;
+
+/*
+ * A table of its own files (§2.18, CH8): of access method parquet or arrow,
+ * made without a location -- the options the running CREATE gives it where
+ * they are not bound yet (ch_relation_options())
+ */
+bool
+ch_is_own_rel(Relation rel)
+{
+	ChExternalKind kind;
+	ChOptions	opts;
+	ChAmCache  *cache;
+
+	Oid			source;
+	bool		own;
+
+	if (!ch_is_external_rel(rel, &kind) || kind == CH_EXTERNAL_ICEBERG)
+		return false;
+	if (rel->rd_amcache != NULL)
+		return ((ChAmCache *) rel->rd_amcache)->own;
+	/*
+	 * a rewrite's transient table is its table's kind: it is made before its
+	 * options, the table's, can be read (make_new_heap())
+	 */
+	source = ch_rewrite_source(rel);
+	if (OidIsValid(source))
+		own = ch_is_own_relid(source);
+	else
+	{
+		ch_relation_options(rel, &opts);
+		own = opts.location == NULL;
+	}
+	cache = MemoryContextAllocZero(CacheMemoryContext, sizeof(ChAmCache));
+	cache->own = own;
+	rel->rd_amcache = cache;
+	return own;
+}
+
+bool
+ch_is_own_relid(Oid relid)
+{
+	Relation	rel = RelationIdGetRelation(relid);
+	bool		own;
+
+	if (!RelationIsValid(rel))
+		return false;
+	own = ch_is_own_rel(rel);
+	RelationClose(rel);
+	return own;
+}
+
+/* A table whose rows are PostgreSQL's, under its MVCC: an engine's, or one of its own files */
+bool
+ch_is_mvcc_rel(Relation rel)
+{
+	return ch_is_engine_rel(rel, NULL) || ch_is_own_rel(rel);
 }
 
 /* ------------------------------------------------------------------------
@@ -367,7 +431,7 @@ ch_relation_dropped(Oid relid)
 
 	if (!RelationIsValid(rel))
 		return;
-	if (ch_is_engine_rel(rel, NULL) && RelFileNumberIsValid(rel->rd_locator.relNumber))
+	if (ch_is_mvcc_rel(rel) && RelFileNumberIsValid(rel->rd_locator.relNumber))
 	{
 		ch_storage_id(rel, &rel->rd_locator, &id);
 		ch_buffer_forget_relation(relid);
@@ -600,11 +664,18 @@ read_only(Relation rel, const char *what)
 					   ch_external_name(kind))));
 }
 
+/*
+ * A table of its own files (§2.18, CH8) is of an external access method, and
+ * its rows are PostgreSQL's as an engine's are: each callback below takes the
+ * engines' for it.
+ */
 static void
 ext_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options, BulkInsertStateData *bistate)
 {
+	if (ch_is_own_rel(rel))
+		ch_tuple_insert(rel, slot, cid, options, bistate);
 	/* a rewrite of an external table copies no row: they are its files' */
-	if (!ch_external_rewrite_target(rel))
+	else if (!ch_external_rewrite_target(rel))
 		read_only(rel, "insert into");
 }
 
@@ -612,7 +683,9 @@ static void
 ext_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid, uint32 options,
 				 BulkInsertStateData *bistate)
 {
-	if (!ch_external_rewrite_target(rel))
+	if (ch_is_own_rel(rel))
+		ch_multi_insert(rel, slots, nslots, cid, options, bistate);
+	else if (!ch_external_rewrite_target(rel))
 		read_only(rel, "insert into");
 }
 
@@ -620,12 +693,16 @@ static void
 ext_tuple_insert_speculative(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 							 BulkInsertStateData *bistate, uint32 specToken)
 {
+	if (ch_is_own_rel(rel))
+		ch_tuple_insert_speculative(rel, slot, cid, options, bistate, specToken);
 	read_only(rel, "insert into");
 }
 
 static void
 ext_tuple_complete_speculative(Relation rel, TupleTableSlot *slot, uint32 specToken, bool succeeded)
 {
+	if (ch_is_own_rel(rel))
+		ch_tuple_complete_speculative(rel, slot, specToken, succeeded);
 	read_only(rel, "insert into");
 }
 
@@ -633,6 +710,8 @@ static TM_Result
 ext_tuple_delete(Relation rel, ItemPointer tid, CommandId cid, uint32 options, Snapshot snapshot, Snapshot crosscheck,
 				 bool wait, TM_FailureData *tmfd)
 {
+	if (ch_is_own_rel(rel))
+		return ch_tuple_delete(rel, tid, cid, options, snapshot, crosscheck, wait, tmfd);
 	read_only(rel, "delete from");
 }
 
@@ -641,6 +720,9 @@ ext_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot, CommandId
 				 Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *tmfd, LockTupleMode *lockmode,
 				 TU_UpdateIndexes *update_indexes)
 {
+	if (ch_is_own_rel(rel))
+		return ch_tuple_update(rel, otid, slot, cid, options, snapshot, crosscheck, wait, tmfd, lockmode,
+							   update_indexes);
 	read_only(rel, "update");
 }
 
@@ -648,23 +730,31 @@ static TM_Result
 ext_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot, CommandId cid,
 			   LockTupleMode mode, LockWaitPolicy wait_policy, uint8 flags, TM_FailureData *tmfd)
 {
+	if (ch_is_own_rel(rel))
+		return ch_tuple_lock(rel, tid, snapshot, slot, cid, mode, wait_policy, flags, tmfd);
 	read_only(rel, "lock rows of");
 }
 
 static void
 ext_finish_bulk_insert(Relation rel, uint32 options)
 {
+	if (ch_is_own_rel(rel))
+		ch_finish_bulk_insert(rel, options);
 }
 
-/* A row never moves: its TID is its file's and its place there */
+/* A row of an external table never moves: its TID is its file's and its place there */
 static void
 ext_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
 {
+	if (ch_is_own_rel(scan->rs_rd))
+		ch_tuple_get_latest_tid(scan, tid);
 }
 
 static bool
 ext_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapshot)
 {
+	if (ch_is_own_rel(rel))
+		return ch_tuple_satisfies_snapshot(rel, slot, snapshot);
 	return true;
 }
 
@@ -680,29 +770,39 @@ no_indexes(Relation rel)
 static struct IndexFetchTableData *
 ext_index_fetch_begin(Relation rel, uint32 flags)
 {
+	if (ch_is_own_rel(rel))
+		return ch_index_fetch_begin(rel, flags);
 	no_indexes(rel);
 }
 
 static void
 ext_index_fetch_reset(struct IndexFetchTableData *data)
 {
+	if (ch_is_own_rel(data->rel))
+		ch_index_fetch_reset(data);
 }
 
 static void
 ext_index_fetch_end(struct IndexFetchTableData *data)
 {
+	if (ch_is_own_rel(data->rel))
+		ch_index_fetch_end(data);
 }
 
 static bool
 ext_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 					  bool *call_again, bool *all_dead)
 {
+	if (ch_is_own_rel(scan->rel))
+		return ch_index_fetch_tuple(scan, tid, snapshot, slot, call_again, all_dead);
 	no_indexes(scan->rel);
 }
 
 static TransactionId
 ext_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
+	if (ch_is_own_rel(rel))
+		return ch_index_delete_tuples(rel, delstate);
 	no_indexes(rel);
 }
 
@@ -711,6 +811,9 @@ ext_index_build_range_scan(Relation table_rel, Relation index_rel, struct IndexI
 						   bool anyvisible, bool progress, BlockNumber start_blockno, BlockNumber numblocks,
 						   IndexBuildCallback callback, void *callback_state, TableScanDesc scan)
 {
+	if (ch_is_own_rel(table_rel))
+		return ch_index_build_range_scan(table_rel, index_rel, index_info, allow_sync, anyvisible, progress,
+										 start_blockno, numblocks, callback, callback_state, scan);
 	no_indexes(table_rel);
 }
 
@@ -718,6 +821,11 @@ static void
 ext_index_validate_scan(Relation table_rel, Relation index_rel, struct IndexInfo *index_info, Snapshot snapshot,
 						struct ValidateIndexState *state)
 {
+	if (ch_is_own_rel(table_rel))
+	{
+		ch_index_validate_scan(table_rel, index_rel, index_info, snapshot, state);
+		return;
+	}
 	no_indexes(table_rel);
 }
 
@@ -725,12 +833,16 @@ static bool
 ext_scan_bitmap_next_tuple(TableScanDesc scan, TupleTableSlot *slot, bool *recheck, uint64 *lossy_pages,
 						   uint64 *exact_pages)
 {
+	if (ch_is_own_rel(scan->rs_rd))
+		return ch_scan_bitmap_next_tuple(scan, slot, recheck, lossy_pages, exact_pages);
 	no_indexes(scan->rs_rd);
 }
 
 static bool
 ext_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 {
+	if (ch_is_own_rel(scan->rs_rd))
+		return ch_scan_sample_next_block(scan, scanstate);
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("TABLESAMPLE is not supported on \"%s\"", RelationGetRelationName(scan->rs_rd))));
@@ -755,6 +867,11 @@ ext_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator
 {
 	SMgrRelation srel;
 
+	if (ch_is_own_rel(rel))
+	{
+		ch_relation_set_new_filelocator(rel, newrlocator, persistence, freezeXid, minmulti);
+		return;
+	}
 	*freezeXid = InvalidTransactionId;
 	*minmulti = InvalidMultiXactId;
 	srel = RelationCreateStorage(*newrlocator, persistence, true);
@@ -772,7 +889,10 @@ ext_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator
 static void
 ext_relation_nontransactional_truncate(Relation rel)
 {
-	ch_external_truncated(rel);
+	if (ch_is_own_rel(rel))
+		ch_relation_nontransactional_truncate(rel);
+	else
+		ch_external_truncated(rel);
 }
 
 /* SET TABLESPACE: the main fork as heap copies it (heapam_handler.c) */
@@ -781,6 +901,11 @@ ext_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
 	SMgrRelation dstrel;
 
+	if (ch_is_own_rel(rel))
+	{
+		ch_relation_copy_data(rel, newrlocator);
+		return;
+	}
 	FlushRelationBuffers(rel);
 	dstrel = RelationCreateStorage(*newrlocator, rel->rd_rel->relpersistence, true);
 	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM, rel->rd_rel->relpersistence);
@@ -802,6 +927,12 @@ ext_relation_copy_for_cluster(Relation OldTable, Relation NewTable, Relation Old
 							  MultiXactId *multi_cutoff, double *num_tuples, double *tups_vacuumed,
 							  double *tups_recently_dead)
 {
+	if (ch_is_own_rel(OldTable))
+	{
+		ch_relation_copy_for_cluster(OldTable, NewTable, OldIndex, use_sort, OldestXmin, snapshot, xid_cutoff,
+									 multi_cutoff, num_tuples, tups_vacuumed, tups_recently_dead);
+		return;
+	}
 	if (OldIndex != NULL)
 		no_indexes(OldTable);
 	*num_tuples = 0;
@@ -814,6 +945,8 @@ ext_relation_copy_for_cluster(Relation OldTable, Relation NewTable, Relation Old
 static void
 ext_relation_vacuum(Relation rel, const VacuumParams *params, BufferAccessStrategy bstrategy)
 {
+	if (ch_is_own_rel(rel))
+		ch_relation_vacuum(rel, params, bstrategy);
 }
 
 /* The files' bytes, as the statement lists them: ANALYZE's blocks (§2.17) */
@@ -823,6 +956,8 @@ ext_relation_size(Relation rel, ForkNumber forkNumber)
 	double		rows;
 	uint64		bytes;
 
+	if (ch_is_own_rel(rel))
+		return ch_relation_size(rel, forkNumber);
 	if (forkNumber != MAIN_FORKNUM && forkNumber != InvalidForkNumber)
 		return 0;
 	ch_external_totals(rel, &rows, &bytes);
@@ -836,6 +971,11 @@ ext_relation_estimate_size(Relation rel, int32 *attr_widths, BlockNumber *pages,
 	double		rows;
 	uint64		bytes;
 
+	if (ch_is_own_rel(rel))
+	{
+		ch_relation_estimate_size(rel, attr_widths, pages, tuples, allvisfrac);
+		return;
+	}
 	ch_external_totals(rel, &rows, &bytes);
 	*pages = (BlockNumber) Min((bytes + BLCKSZ - 1) / BLCKSZ, (uint64) MaxBlockNumber);
 	*tuples = rows;

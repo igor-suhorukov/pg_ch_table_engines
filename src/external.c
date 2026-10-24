@@ -166,6 +166,28 @@ external_column(Relation rel, Form_pg_attribute att, chte_external_column *out)
 	}
 }
 
+/*
+ * A column of a table of its own files (§2.18, CH8): its files' are
+ * PostgreSQL's, written as the library keeps the column -- §2.5's type of it,
+ * or its bytes -- a date and a timestamp as a file's Date32 and DateTime64,
+ * named c<attnum> there as in the library
+ */
+static void
+own_column(Form_pg_attribute att, chte_external_column *out)
+{
+	ChColumn	col;
+
+	memset(out, 0, sizeof(*out));
+	ch_column_for_attribute(att, &col);
+	out->name = psprintf("c%d", att->attnum);
+	out->file_name = out->name;
+	out->type = pstrdup(col.chtype);
+	out->not_null = att->attnotnull ? 1 : 0;
+	out->convert = att->atttypid == DATEOID ? CHTE_CONVERT_DATE :
+		att->atttypid == TIMESTAMPOID || att->atttypid == TIMESTAMPTZOID ? CHTE_CONVERT_TIMESTAMP :
+		CHTE_CONVERT_NONE;
+}
+
 /* The columns of a descriptor of an external table, as the engine library takes them */
 void
 ch_external_columns_for(Relation rel, TupleDesc desc, MemoryContext cxt, chte_external_column **columns,
@@ -173,6 +195,7 @@ ch_external_columns_for(Relation rel, TupleDesc desc, MemoryContext cxt, chte_ex
 {
 	MemoryContext old = MemoryContextSwitchTo(cxt);
 	int			n = 0;
+	bool		own = ch_is_own_rel(rel);
 
 	*columns = palloc0(sizeof(chte_external_column) * Max(desc->natts, 1));
 	for (int i = 0; i < desc->natts; i++)
@@ -181,6 +204,11 @@ ch_external_columns_for(Relation rel, TupleDesc desc, MemoryContext cxt, chte_ex
 
 		if (att->attisdropped)
 			continue;
+		if (own)
+		{
+			own_column(att, &(*columns)[n++]);
+			continue;
+		}
 		if (get_typtype(att->atttypid) == TYPTYPE_DOMAIN)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -303,6 +331,58 @@ ch_external_listing_load(ChTable *t, const void *bytes, Size size)
 	return listing_make(handle);
 }
 
+/* A part's file of a table of its own files (§2.18): <storage>/<part>/data.<format>, an absolute path */
+char *
+ch_own_part_file(ChTable *t, const char *part)
+{
+	char	   *dir = ch_storage_path(&t->storage, false);
+	char	   *path = psprintf("%s%s/%s", dir, part, t->own_file);
+
+	pfree(dir);
+	return path;
+}
+
+/*
+ * A listing of a table of its own files (§2.18): the files of the parts
+ * given -- a snapshot's, of the catalog -- each part's attached to it
+ * (part->listing, part->file) for the readers of external tables to read.
+ * Its units are the part's marks, as the part was written.
+ */
+ChListing *
+ch_own_listing(ChTable *t, List *parts)
+{
+	const ChEngine *eng = ch_engine();
+	chte_external_listing *handle;
+	const char **paths;
+	ChListing  *l;
+	ListCell   *lc;
+	int			i = 0;
+
+	Assert(t->own);
+	paths = palloc(sizeof(char *) * Max(list_length(parts), 1));
+	foreach(lc, parts)
+		paths[i++] = ch_own_part_file(t, ((ChPart *) lfirst(lc))->name);
+	CH_CALL("listing a table's files", eng->own_list(t->handle, paths, (size_t) i, &handle, CH_ERR));
+	l = listing_make(handle);
+	i = 0;
+	foreach(lc, parts)
+	{
+		ChPart	   *p = lfirst(lc);
+		ChPart	   *file = list_nth(l->parts, i);
+
+		if (file->marks != p->marks || file->rows != p->rows)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("part \"%s\" of \"%s\" holds %lld rows in %d units, where its catalog row has %lld in %d",
+							p->name, get_rel_name(t->relid), (long long) file->rows, file->marks,
+							(long long) p->rows, p->marks)));
+		p->listing = l;
+		p->file = i++;
+	}
+	pfree(paths);
+	return l;
+}
+
 /* At the transaction's end every listing goes: no scan outlives it (table.c clears the tables' first) */
 void
 ch_external_xact_end(void)
@@ -418,10 +498,11 @@ ch_unit_stats(ChTable *t, const ChPart *p, const char *column, chte_column_stats
  * Whether a relation is the transient table of a rewrite of an external
  * table -- ALTER TABLE's (make_new_heap(): "pg_temp_<oid>" beside the
  * table, made in this transaction) -- whose rows are the files', so that it
- * copies none of them
+ * copies none of them; ch_rewrite_source(), the table it rewrites, of the
+ * same access method, or InvalidOid
  */
-bool
-ch_external_rewrite_target(Relation rel)
+Oid
+ch_rewrite_source(Relation rel)
 {
 	const char *name = RelationGetRelationName(rel);
 	unsigned int old;
@@ -429,9 +510,19 @@ ch_external_rewrite_target(Relation rel)
 
 	if (rel->rd_createSubid == InvalidSubTransactionId ||
 		sscanf(name, "pg_temp_%u%c", &old, &tail) != 1)
-		return false;
-	return get_rel_relam((Oid) old) == rel->rd_rel->relam &&
-		get_rel_namespace((Oid) old) == RelationGetNamespace(rel);
+		return InvalidOid;
+	if (get_rel_relam((Oid) old) != rel->rd_rel->relam || get_rel_namespace((Oid) old) != RelationGetNamespace(rel))
+		return InvalidOid;
+	return (Oid) old;
+}
+
+bool
+ch_external_rewrite_target(Relation rel)
+{
+	Oid			source = ch_rewrite_source(rel);
+
+	/* a table of its own files' rows are its parts', which its rewrite copies (§2.18) */
+	return OidIsValid(source) && !ch_is_own_relid(source);
 }
 
 void
@@ -459,7 +550,8 @@ ch_external_copy_to(CopyStmt *stmt, Oid relid)
 	Relation	rel;
 	char	   *relname;
 
-	if (!ch_is_external_am(get_rel_relam(relid), &kind))
+	/* a table of its own files (§2.18) is dumped with its rows, as any table */
+	if (!ch_is_external_am(get_rel_relam(relid), &kind) || ch_is_own_relid(relid))
 		return NULL;
 	select = makeNode(SelectStmt);
 	if (stmt->attlist != NIL)

@@ -225,6 +225,17 @@ CREATE FUNCTION ch.external_files(rel regclass,
 	RETURNS SETOF record
 	AS 'MODULE_PATHNAME', 'ch_external_files' LANGUAGE C STRICT VOLATILE;
 
+-- A table of its own files (§2.18, CH8): the parts the caller's snapshot sees,
+-- each one's file and its layout as read back from it -- its units, Parquet's
+-- row groups or Arrow's record batches, and their rows; its codec; whether a
+-- Parquet file has a page index and bloom filters.
+CREATE FUNCTION ch.own_files(rel regclass,
+	OUT part text, OUT file text, OUT bytes bigint, OUT rows bigint, OUT min_rowid bigint, OUT max_rowid bigint,
+	OUT units integer, OUT min_unit_rows bigint, OUT max_unit_rows bigint, OUT codec text, OUT page_index boolean,
+	OUT bloom_filters boolean)
+	RETURNS SETOF record
+	AS 'MODULE_PATHNAME', 'ch_own_files' LANGUAGE C STRICT VOLATILE;
+
 -- A query's rows written to a file by ClickHouse's own writer of the format,
 -- 'Parquet' or 'Arrow', as the tests make their tables' files (§2.17): columns,
 -- ClickHouse's "name type, ..." of the file -- by default the query's columns,

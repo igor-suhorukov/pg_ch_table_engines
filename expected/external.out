@@ -440,9 +440,10 @@ ERROR:  checking the files of "bad": location /tmp/chte_external/missing.parquet
 DETAIL:  ClickHouse error code 107.
 CREATE TABLE bad (id bigint) USING parquet WITH (location = 'all.parquet');
 ERROR:  location "all.parquet" is not an absolute path
-CREATE TABLE bad (id bigint) USING parquet;
-ERROR:  a table of access method parquet needs option "location"
-HINT:  Name its files: CREATE TABLE ... USING parquet WITH (location = '/path/to/files').
+-- without a location, parquet and arrow make a table of their own files (§2.18, CH8): iceberg needs one
+CREATE TABLE bad (id bigint) USING iceberg;
+ERROR:  a table of access method iceberg needs option "location"
+HINT:  Name its files: CREATE TABLE ... USING iceberg WITH (location = '/path/to/files').
 CREATE TABLE bad (id bigint) USING parquet WITH (location = '/tmp/chte_external/all.parquet', storage = 'files');
 ERROR:  option "storage" does not apply to a table of access method parquet
 HINT:  Its options are "location" and "settings".

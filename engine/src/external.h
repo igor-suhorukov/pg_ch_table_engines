@@ -34,6 +34,9 @@ constexpr Int64 PG_EPOCH_MICROSECONDS = Int64(PG_EPOCH_DAYS) * 86400 * 1000000;
 /// The row id column every reader may be asked for (chte.h's CH_ROWID_COLUMN)
 constexpr const char * ROWID = "_pg_rowid";
 
+/// A reader's column the file lacks (ResolvedFile::absent): its place in no header
+constexpr size_t ABSENT = SIZE_MAX - 1;
+
 /// A column of an external table
 struct ExternalColumn
 {
@@ -66,6 +69,11 @@ struct ResolvedFile
     std::vector<String> names;              /// per table column: the file's name of it
     std::vector<DataTypePtr> file_types;    /// and its type there, Nullable where it may hold NULLs
     std::vector<uint8_t> nullable;
+    /// per table column: not in the file -- a table of its own files' column added after the file was written
+    /// (§2.18), whose rows take the column's missing value; a reader hands it not present
+    std::vector<uint8_t> absent;
+
+    bool isAbsent(size_t i) const { return i < absent.size() && absent[i]; }
 };
 
 /// A file of a listing
@@ -87,6 +95,16 @@ struct IcebergTable;
 struct IcebergSnapshot;
 struct IcebergWriter;
 
+/// A file of a table of its own files (§2.18, CH8): its rows' ids, as its _pg_rowid holds them, ascending, read
+/// once for its identity, and each unit's first row
+struct OwnRowIds
+{
+    UInt64 size = 0;
+    Int64 mtime = 0;
+    PaddedPODArray<UInt64> ids;
+    std::vector<UInt64> unit_first;
+};
+
 class ExternalTable
 {
 public:
@@ -106,6 +124,12 @@ public:
     std::vector<chte_external_field> fields;
     /// an Iceberg table's: ClickHouse's metadata of it, made as it is first listed (iceberg.cpp)
     std::shared_ptr<IcebergTable> iceberg;
+    /// a table of its own files (§2.18, CH8): _pg_rowid a column of the files, not a row's place; and the files'
+    /// row ids read so far, by path
+    bool own = false;
+    std::map<String, std::shared_ptr<const OwnRowIds>> row_ids;
+    /// chte_own_file_layout's codec, until the next call
+    String layout_codec;
 
     const ExternalColumn & column(const String & caller_name) const { return columns[columnIndex(caller_name)]; }
     size_t columnIndex(const String & caller_name) const;
@@ -160,6 +184,8 @@ std::unique_ptr<chte_reader> openArrowReader(chte_table & table, std::shared_ptr
                                              std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read);
 void arrowColumnBytes(const ExternalFooter & footer, size_t ncolumns, uint64_t * compressed, uint64_t * uncompressed);
 void registerArrowOutput();
+/// an Arrow file's codec, its first record batch's ("NONE" where it has none)
+String arrowCodec(const String & path, const ExternalFooter & footer);
 
 /// iceberg.cpp: a listing of an Iceberg table's snapshot, the newest at the call (or the one its settings pin),
 /// each data file with the deletes that apply to it; its bytes for a parallel scan's workers, and theirs read;

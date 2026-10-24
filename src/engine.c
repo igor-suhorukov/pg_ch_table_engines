@@ -314,6 +314,29 @@ ch_engine(void)
 	*(void **) &engine.file_write_batch = dlsym(handle, "chte_file_write_batch");
 	*(void **) &engine.file_write_finish = dlsym(handle, "chte_file_write_finish");
 	*(void **) &engine.file_write_close = dlsym(handle, "chte_file_write_close");
+	/*
+	 * CH8's, optional: a library built before them lacks them, and the
+	 * external access methods refuse a table without a location (table.c)
+	 */
+	*(void **) &engine.own_open = dlsym(handle, "chte_own_open");
+	*(void **) &engine.own_list = dlsym(handle, "chte_own_list");
+	*(void **) &engine.own_write_begin = dlsym(handle, "chte_own_write_begin");
+	*(void **) &engine.own_locate = dlsym(handle, "chte_own_locate");
+	*(void **) &engine.own_unit_ids = dlsym(handle, "chte_own_unit_ids");
+	*(void **) &engine.own_merge = dlsym(handle, "chte_own_merge");
+	*(void **) &engine.own_file_layout = dlsym(handle, "chte_own_file_layout");
+	if (engine.own_open == NULL || engine.own_list == NULL || engine.own_write_begin == NULL ||
+		engine.own_locate == NULL || engine.own_unit_ids == NULL || engine.own_merge == NULL ||
+		engine.own_file_layout == NULL)
+	{
+		engine.own_open = NULL;
+		engine.own_list = NULL;
+		engine.own_write_begin = NULL;
+		engine.own_locate = NULL;
+		engine.own_unit_ids = NULL;
+		engine.own_merge = NULL;
+		engine.own_file_layout = NULL;
+	}
 	if (engine.write_part_summary == NULL || engine.summary_column_bytes == NULL ||
 		engine.summary_stats == NULL || engine.filter_summary_select == NULL)
 	{

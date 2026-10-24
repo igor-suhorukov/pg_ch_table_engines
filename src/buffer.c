@@ -187,6 +187,15 @@ flush(ChBuffer *b)
 	eng = ch_engine();
 	rel = relation_open(b->relid, NoLock);
 	table = b->table;
+	if (table->own)
+	{
+		/* §2.18: a part of the table's own files, its rows in their ids' order, as they came */
+		ch_own_write_part(rel, table, &b->storage, b->builder, b->first_rowid,
+						  ch_builder_rowid(b->builder, nrows - 1), b->cid);
+		relation_close(rel, NoLock);
+		ch_builder_reset(b->builder);
+		return;
+	}
 	wait_for_merges(rel, b);
 	ch_counters_allocate(&b->storage, 0, 1, &ignored, &block);
 
