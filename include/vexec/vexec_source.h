@@ -46,13 +46,15 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		9	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		10	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
 									 * price; 5: columns in steps; 6:
 									 * set_join_keys; 7: next_unit,
 									 * read_unit; 8: MergeTree's units,
-									 * read_unit_bytes; 9: unit_tids */
+									 * read_unit_bytes; 9: unit_tids; 10:
+									 * a column's flags, granules passed
+									 * over */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -118,6 +120,11 @@ typedef enum VexecEncoding
  *
  * vexec ignores the fields a layout does not read: a source may leave them
  * as it likes.
+ *
+ * From minor version 10, flags, in what was the padding byte after
+ * arrow_values, so that the struct's size and members stay where they were:
+ * vexec reads them only of a source of minor version 10 or later, which
+ * sets them or leaves them 0.
  */
 typedef struct VexecColumn
 {
@@ -125,6 +132,7 @@ typedef struct VexecColumn
 	uint8		encoding;		/* VexecEncoding */
 	bool		arrow_values;	/* date, timestamp[tz], interval: Arrow's
 								 * epoch and struct */
+	uint8		flags;			/* from minor version 10: VEXEC_COL_* */
 	int16		scale;			/* SCALED: digits after the point */
 	int32		width;			/* FIXED: bytes a value; SCALED: 8 or 16 */
 	int32		stride;			/* FIXED: bytes from one value to the next */
@@ -139,6 +147,19 @@ typedef struct VexecColumn
 	const struct VexecColumn *dictionary;	/* DICT: its values */
 	int			ndictionary;	/* DICT: how many */
 } VexecColumn;
+
+/*
+ * VexecColumn.flags, from minor version 10.
+ *
+ * VEXEC_COL_TEXT_WHOLE: a text column's values -- a DICT column's
+ * dictionary's -- each the database encoding's whole, no NUL, no truncated
+ * or invalid character, as the source vouches: written through
+ * PostgreSQL's input functions, as every Datum a table access method's row
+ * is, and kept as they were.  vexec checks none of them again, as
+ * PostgreSQL checks none of a stored value's (pg_vector_executor.md §3.28,
+ * F5); a source that cannot say so leaves it clear, and vexec checks them.
+ */
+#define VEXEC_COL_TEXT_WHOLE	0x01
 
 /* VexecSourceSpec.flags */
 #define VEXEC_SRC_COMPACT	0x0001	/* hand only visible rows */
@@ -182,6 +203,22 @@ typedef struct VexecSourceSpec
 	 */
 	int			nsteps;
 	const int  *step_ends;
+
+	/*
+	 * From minor version 10 (VC30; pg_vector_executor.md §3.28, F7), vexec's
+	 * condition cache.  Where set, a source whose units are granules of
+	 * storage that never changes while it lives -- a MergeTree part's marks
+	 * -- calls it as it selects a unit's granules, with the unit's identity
+	 * (VexecSourceBatch's unit_id), its granules' count, and those of them
+	 * it is to read, [begin, end): NULL passes none over, else a bit a
+	 * granule of the unit's, set for one no row of which is true of the
+	 * scan's quals, which the source then leaves unread.  The bits are valid
+	 * until the next call.  Each batch then names its rows' granule, so that
+	 * vexec learns the granules none of whose rows its quals passed.
+	 */
+	const uint64 *(*granules_passed) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
+									  uint32 end);
+	void	   *granules_arg;
 } VexecSourceSpec;
 
 /* One batch from a source. */
@@ -193,6 +230,20 @@ typedef struct VexecSourceBatch
 	const ItemPointerData *tids;	/* when VEXEC_SRC_TIDS */
 	VexecColumn *columns;		/* the layouts of §3.4 */
 	void	   *owner;			/* what retain/release name */
+
+	/*
+	 * From minor version 10, where the spec has granules_passed: the unit the
+	 * batch's rows are of, by an identity no other unit has while vexec may
+	 * keep it -- zeros for none -- the granule of the unit every one of them
+	 * is of, -1 where the source cannot say, and whether the batch holds the
+	 * granule's last row, a granule coming in one batch or more.  vexec
+	 * zeroes them before each next(), and reads them of a source of minor
+	 * version 10 or later; a source writes them only where the spec, of
+	 * that size, has granules_passed set.
+	 */
+	uint64		unit_id[2];
+	int64		granule;
+	bool		granule_last;
 } VexecSourceBatch;
 
 /*

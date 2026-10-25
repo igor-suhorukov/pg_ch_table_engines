@@ -135,6 +135,10 @@ typedef struct ChEngine
 	uint64_t	(*parts_loaded) (void);
 	/* optional (VC25): the files' footers the process has read, for the tests */
 	uint64_t	(*footers_read) (void);
+	/* optional (pg_accel's F7, VC30): the granule the last batch's rows are of */
+	void		(*read_granule) (chte_reader *, int64_t *, int32_t *);
+	/* optional (pg_accel's F6, VC27): the rows the process read alone of Arrow batches, for the tests */
+	uint64_t	(*rows_read_alone) (void);
 } ChEngine;
 
 /* GUCs */
@@ -143,6 +147,8 @@ extern char *ch_engine_log_level;
 extern char *ch_engine_settings;
 extern bool ch_engine_preload;
 extern int	ch_engine_functions;
+extern bool ch_fast_exit;
+extern bool ch_keep_freed_memory;
 
 /* ch.engine_functions */
 typedef enum ChEngineFunctions
@@ -156,6 +162,9 @@ extern const ChEngine *ch_engine(void);
 
 /* The postmaster's: the library mapped, nothing of it called (VC12) */
 extern void ch_engine_map(void);
+
+/* From _PG_init, preloading: the exits' counts in shared memory (VC23) */
+extern void ch_engine_shmem_init(void);
 
 /* The library's objects, owned by the resource owner they are made under */
 #include "utils/resowner.h"

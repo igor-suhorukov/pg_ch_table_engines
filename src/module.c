@@ -36,6 +36,7 @@ bool		ch_enable_part_summaries = true;
 bool		ch_enable_summary_pruning = true;
 double		ch_fetch_cost = 55.0;
 double		ch_fetch_value_cost = 0.0025;
+int			ch_own_parquet_dictionary_filter = 64 * 1024;	/* bytes */
 bool		ch_preloaded = false;
 
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
@@ -236,12 +237,33 @@ _PG_init(void)
 	/* the parts' streams for a GPU's units, in the postmaster's shared memory (VC29) */
 	if (process_shared_preload_libraries_in_progress)
 		ch_streams_init();
+	/* the exits' counts, in the postmaster's shared memory (VC23) */
+	if (process_shared_preload_libraries_in_progress)
+		ch_engine_shmem_init();
 	DefineCustomEnumVariable("ch.engine_functions",
 							 "Which of ClickHouse's functions a process registers as it first loads the engine library.",
 							 "used: those the filters use, the others as a table's definition, a write, a merge "
 							 "or a rewrite first needs them; all: every one at once.",
 							 &ch_engine_functions,
 							 CH_FUNCTIONS_USED, functions_options,
+							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.fast_exit",
+							 "Whether a process that started the engine ends by _exit() once PostgreSQL's own "
+							 "exits have run.",
+							 "Off, the engine is torn down and the library's static destructors run as the "
+							 "process exits, a millisecond or two of each parallel worker.",
+							 &ch_fast_exit,
+							 true,
+							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.keep_freed_memory",
+							 "Whether a process that starts the engine keeps the memory it frees, rather than "
+							 "handing it back to the system and faulting it in again.",
+							 "Read as the process starts the engine: glibc's malloc then serves requests of up "
+							 "to 32 MB from its heap and trims the heap's top only past 1 GB free.",
+							 &ch_keep_freed_memory,
+							 true,
 							 PGC_SUSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomIntVariable("ch.max_merge_workers",
@@ -323,6 +345,16 @@ _PG_init(void)
 							 55.0, 0.0, 1e10,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("ch.own_parquet_dictionary_filter",
+							"The largest dictionary page of a Parquet column a filter is checked against to pass "
+							"a row group of a table of its own files over.",
+							"ClickHouse's input_format_parquet_dictionary_filter_push_down for these tables, "
+							"where neither ch.engine_settings nor the table's settings name it, read as a "
+							"process opens the table; 0 checks none, -1 leaves ClickHouse's own limit, 1 MB.",
+							&ch_own_parquet_dictionary_filter,
+							64 * 1024, -1, INT_MAX,
+							PGC_USERSET, GUC_UNIT_BYTE,
+							NULL, NULL, NULL);
 	DefineCustomRealVariable("ch.fetch_value_cost",
 							 "The planner's cost of decoding a value of a granule a fetch by TID reads.",
 							 "A fetch decodes a granule, index_granularity rows, of each column it reads.",

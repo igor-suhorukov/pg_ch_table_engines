@@ -111,6 +111,7 @@ extern bool ch_enable_part_summaries;
 extern bool ch_enable_summary_pruning;
 extern double ch_fetch_cost;
 extern double ch_fetch_value_cost;
+extern int	ch_own_parquet_dictionary_filter;
 extern int	ch_insert_buffer_rows;
 extern int	ch_insert_buffer_bytes;
 extern int	ch_default_storage;
@@ -210,6 +211,8 @@ typedef struct ChTable
 	chte_file_column *file_columns;
 	int			nfile_columns;
 	char	   *write_settings;
+	/* an external table's: the ClickHouse settings it is read with, the extension's defaults first (VC26) */
+	char	   *read_settings;
 } ChTable;
 
 extern void ch_storage_id(Relation rel, const RelFileLocator *locator, ChStorageId *id);
@@ -255,6 +258,13 @@ typedef struct ChPart
 								 * (VC20's B6): as stored until read (ch_part_summary());
 								 * NULL where none was kept */
 	TransactionId xmin;			/* its catalog row's inserter, as listed (ch_parts_visible()) */
+	/*
+	 * Its text values each its encoding's whole as written (pg_accel's F5):
+	 * rows of PostgreSQL's -- through its input functions, as every Datum a
+	 * row of a table AM takes is -- or a merge or fold of such parts alone;
+	 * not a part of vexec's sink's batches, nor an external table's file
+	 */
+	bool		text_checked;
 	/*
 	 * An external table's file, as its statement's listing has it (§2.17):
 	 * marks its units, min_rowid its first row's id; NULL for a part
@@ -317,6 +327,9 @@ extern void ch_builder_add_columns(ChVectorBuilder *b, const struct VexecColumn 
 								   const uint64 *rowids);
 extern Size ch_builder_columns_in(ChVectorBuilder *b, const struct VexecColumn *columns, uint32 nrows,
 								  const uint64 *rowids, MemoryContext cxt, chte_column_in *out);
+/* F5: whether the builder's text, or a sink's batch's, is each value the database encoding's whole */
+extern bool ch_builder_text_whole(ChVectorBuilder *b);
+extern bool ch_builder_batch_text_whole(ChVectorBuilder *b, const struct VexecColumn *columns, uint32 nrows);
 
 /* buffer.c: the write buffer (§2.7) */
 extern void ch_buffer_insert(Relation rel, TupleTableSlot *slot, CommandId cid);
@@ -476,7 +489,7 @@ extern void ch_streams_described(void);
 
 /* own.c: tables of their own files (§2.18, CH8) */
 extern void ch_own_table_setup(Relation rel, TupleDesc desc, ChTable *t);
-extern void ch_own_write_part(Relation rel, ChTable *t, const ChStorageId *id, ChVectorBuilder *builder,
+extern void ch_own_write_part(Relation rel, ChTable *t, const ChStorageId *id, ChVectorBuilder *builder, bool text_checked,
 							  uint64 first_rowid, uint64 last_rowid, CommandId cid);
 extern int	ch_own_merge_parts(Relation rel, ChMergeMode mode);
 extern int64 ch_own_fold(Relation rel);

@@ -69,7 +69,7 @@
 #define Anum_tables_plain 10
 
 /* ch.parts's columns */
-#define Natts_parts 13
+#define Natts_parts 14
 #define Anum_parts_tablespace 1
 #define Anum_parts_relfilenumber 2
 #define Anum_parts_backend 3
@@ -83,6 +83,7 @@
 #define Anum_parts_manifest 11
 #define Anum_parts_created 12
 #define Anum_parts_summary 13
+#define Anum_parts_text_checked 14
 
 static bool
 twin(const ChStorageId *id)
@@ -274,6 +275,9 @@ parts_visible(const ChStorageId *id, Snapshot snapshot, bool keep_toasted)
 				memcpy(p->summary, value, VARSIZE_ANY(value));
 			}
 		}
+		/* a catalog made before the column was: no part's text checked */
+		p->text_checked = RelationGetDescr(catalog)->natts >= Anum_parts_text_checked &&
+			!nulls[Anum_parts_text_checked - 1] && DatumGetBool(values[Anum_parts_text_checked - 1]);
 		parts = lappend(parts, p);
 	}
 	systable_endscan(scan);
@@ -574,6 +578,7 @@ ch_part_insert(const ChStorageId *id, const ChPart *part, CommandId cid)
 		values[Anum_parts_summary - 1] = PointerGetDatum(part->summary);
 	else
 		nulls[Anum_parts_summary - 1] = true;
+	values[Anum_parts_text_checked - 1] = BoolGetDatum(part->text_checked);
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	insert_with_cid(catalog, tuple, cid);
 	heap_freetuple(tuple);

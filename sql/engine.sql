@@ -107,4 +107,22 @@ RESET enable_bitmapscan;
 SELECT count(*) AS postmaster_threads
   FROM pg_ls_dir('/proc/' || split_part(pg_read_file('postmaster.pid'), E'\n', 1) || '/task');
 
+-- VC23: a process that started the engine ends by _exit() once PostgreSQL's own exits have run, the engine's
+-- teardown and the library's static destructors left out (ch.fast_exit, on by default): a parallel scan's
+-- workers end so; with ch.fast_exit off, which they take from their leader, through the teardown
+\c
+SET client_min_messages = warning;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SELECT fast, torn_down FROM ch.engine_exits() \gset before_
+SELECT count(*), sum(c60) FROM ew WHERE c1 % 2 = 0;
+SELECT fast - :before_fast >= 1 AS fast_exits, torn_down = :before_torn_down AS none_torn_down
+  FROM ch.engine_exits();
+SET ch.fast_exit = off;
+SELECT count(*), sum(c60) FROM ew WHERE c1 % 3 = 0;
+SELECT torn_down - :before_torn_down >= 1 AS torn_down FROM ch.engine_exits();
+RESET ch.fast_exit;
+
 DROP TABLE ef, eu, ew;

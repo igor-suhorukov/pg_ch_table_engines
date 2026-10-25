@@ -87,6 +87,32 @@ ch_definition(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(def));
 }
 
+/*
+ * The ClickHouse settings an external table, or one of its own files, is
+ * read with, as the session's process opens it now (VC26): the extension's
+ * defaults, then the table's own; NULL where there are none.
+ */
+PG_FUNCTION_INFO_V1(ch_read_settings);
+Datum
+ch_read_settings(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	ChTable    *t;
+	char	   *settings;
+
+	if (!ch_is_external_rel(rel, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not an external table or a table of its own files",
+						RelationGetRelationName(rel))));
+	t = ch_table(rel);
+	settings = t->read_settings ? pstrdup(t->read_settings) : NULL;
+	relation_close(rel, AccessShareLock);
+	if (settings == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(settings));
+}
+
 PG_FUNCTION_INFO_V1(ch_table_size);
 Datum
 ch_table_size(PG_FUNCTION_ARGS)
@@ -140,6 +166,21 @@ ch_footers_read(PG_FUNCTION_ARGS)
 	if (eng->footers_read == NULL)
 		PG_RETURN_NULL();
 	PG_RETURN_INT64((int64) eng->footers_read());
+}
+
+/*
+ * The rows the session's process has read alone of an Arrow file's record
+ * batches (VC27), for the tests; NULL where the engine library predates it.
+ */
+PG_FUNCTION_INFO_V1(ch_rows_read_alone);
+Datum
+ch_rows_read_alone(PG_FUNCTION_ARGS)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (eng->rows_read_alone == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) eng->rows_read_alone());
 }
 
 /*

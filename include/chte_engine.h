@@ -468,6 +468,22 @@ CHTE_API int			chte_read_begin(chte_table *table, const char *part_name, const c
 							const chte_mark_range *ranges, size_t nranges,
 							chte_reader **reader, chte_error *error);
 CHTE_API int			chte_read_next(chte_reader *reader, uint32_t *nrows, chte_error *error);
+/*
+ * pg_accel's F7 (ch_table_engines.md §3, VC30): the granule -- the part's mark -- the
+ * rows of the batch chte_read_next read last are of, every one of them that granule's,
+ * and whether the batch holds its last row: a granule may come in several batches.
+ * *granule is -1 where the reader cannot say: a file's of an external table or of a
+ * table of its own files, rows by offset, a batch over two granules.  Optional: a
+ * library built before it lacks it.
+ */
+CHTE_API void		chte_read_granule(chte_reader *reader, int64_t *granule, int32_t *last);
+
+/*
+ * pg_accel's F6 (ch_table_engines.md §3, VC27): the rows the process has read alone of an Arrow file's
+ * uncompressed record batches, a fetch's rows by offset read from their batch's buffers at those rows,
+ * where the whole batch's asked columns were decoded; for the tests.  Optional.
+ */
+CHTE_API uint64_t	chte_rows_read_alone(void);
 CHTE_API int			chte_read_vector(chte_reader *reader, uint32_t column, chte_vector *vector,
 							 chte_error *error);
 CHTE_API void		chte_read_end(chte_reader *reader);

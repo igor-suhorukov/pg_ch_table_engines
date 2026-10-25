@@ -731,6 +731,34 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 }
 
 /*
+ * The ClickHouse settings an external table is read with: the table's own,
+ * after the extension's defaults for a table of its own files (VC26) --
+ * Parquet's dictionary filter limited to ch.own_parquet_dictionary_filter
+ * bytes a dictionary page, where ClickHouse's reader takes 1 MB: it hashes a
+ * row group's dictionary for each filtered column, 68% of a ClickBench Q19
+ * worker's cycles over a dictionary of UserID's, and finds nothing for a
+ * filter like "<> ''" (ch_table_engines.md §3, "ClickBench after V8g, the
+ * extension's share").  Left out where the table's settings or
+ * ch.engine_settings name the setting, or ch.own_parquet_dictionary_filter
+ * is -1: the context the table is read in is ch.engine_settings', and the
+ * table's settings are applied over it.
+ */
+static char *
+external_read_settings(const ChTable *t)
+{
+	static const char *const dictionary_filter = "input_format_parquet_dictionary_filter_push_down";
+	const char *own = t->options.settings;
+
+	if (!t->own || t->ext_kind != CH_EXTERNAL_PARQUET || ch_own_parquet_dictionary_filter < 0 ||
+		(own != NULL && mentions_setting(own, dictionary_filter)) ||
+		(ch_engine_settings != NULL && mentions_setting(ch_engine_settings, dictionary_filter)))
+		return t->options.settings;
+	if (own != NULL && own[0] != '\0')
+		return psprintf("%s = %d, %s", dictionary_filter, ch_own_parquet_dictionary_filter, own);
+	return psprintf("%s = %d", dictionary_filter, ch_own_parquet_dictionary_filter);
+}
+
+/*
  * An external table's (§2.17): its columns, as the engine library reads them
  * from the files, and their kinds as an engine's table keeps them (§2.5),
  * which scan.c, ChScan and vexec's source read alike
@@ -774,6 +802,7 @@ open_external(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext
 		t->relative_path = ch_storage_path(id, true);
 		ch_own_table_setup(rel, desc, t);
 	}
+	t->read_settings = external_read_settings(t);
 	MemoryContextSwitchTo(old);
 
 	if (eng->external_open == NULL)
@@ -795,7 +824,7 @@ open_external(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext
 	def.format = formats[kind];
 	def.name = RelationGetRelationName(rel);
 	def.location = t->options.location;
-	def.settings = t->options.settings;
+	def.settings = t->read_settings;
 	def.columns = columns;
 	def.ncolumns = ncolumns;
 	if (t->own)

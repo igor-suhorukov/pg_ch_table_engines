@@ -41,8 +41,11 @@ CREATE TABLE ch.parts (
 	marks			integer NOT NULL,	-- its granules
 	manifest		bytea,				-- the pages store's: each file's pages; NULL in the files store
 	created			timestamptz NOT NULL,	-- when it was written: its age for the merge selector
-	summary			bytea				-- its columns' bytes and statistics, the engine library's: the
+	summary			bytea,				-- its columns' bytes and statistics, the engine library's: the
 										-- planner's without loading the part; NULL where none was kept
+	text_checked	boolean NOT NULL DEFAULT false	-- its text values each their encoding's whole as
+										-- written: rows through PostgreSQL's input functions, or
+										-- a merge or fold of such parts alone (pg_accel's F5)
 ) USING heap;
 CREATE UNIQUE INDEX parts_storage_name ON ch.parts (tablespace, relfilenumber, backend, name);
 
@@ -169,6 +172,12 @@ CREATE FUNCTION ch.parts(rel regclass,
 CREATE FUNCTION ch.definition(rel regclass) RETURNS text
 	AS 'MODULE_PATHNAME', 'ch_definition' LANGUAGE C STRICT STABLE;
 
+-- The ClickHouse settings an external table, or one of its own files, is read
+-- with (ch_table_engines.md §3, VC26): the extension's defaults -- Parquet's
+-- dictionary filter limited for a table of its own files -- then the table's.
+CREATE FUNCTION ch.read_settings(rel regclass) RETURNS text
+	AS 'MODULE_PATHNAME', 'ch_read_settings' LANGUAGE C STRICT VOLATILE;
+
 -- The bytes of a table's parts the snapshot sees.
 CREATE FUNCTION ch.table_size(rel regclass) RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_table_size' LANGUAGE C STRICT STABLE;
@@ -201,6 +210,20 @@ CREATE FUNCTION ch.device_streams(OUT kept integer, OUT found bigint, OUT descri
 -- files' footers read by its units' readers alone.
 CREATE FUNCTION ch.footers_read() RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_footers_read' LANGUAGE C VOLATILE;
+
+-- The rows the session's process has read alone of the uncompressed record
+-- batches of Arrow files (ch_table_engines.md §3, VC27): a fetch's rows by
+-- their TIDs read from their batch's buffers at those rows, not the batch's
+-- columns whole.
+CREATE FUNCTION ch.rows_read_alone() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_rows_read_alone' LANGUAGE C VOLATILE;
+
+-- How the processes that started the engine have exited since the server
+-- started (ch_table_engines.md §3, VC23): by _exit() once PostgreSQL's own
+-- exits had run (ch.fast_exit), or through the engine's teardown and the
+-- static destructors; NULLs where the extension is not preloaded.
+CREATE FUNCTION ch.engine_exits(OUT fast bigint, OUT torn_down bigint)
+	AS 'MODULE_PATHNAME', 'ch_engine_exits' LANGUAGE C STRICT VOLATILE;
 
 -- The deletions every snapshot sees, folded into their parts (§2.10): each
 -- part holding their rows written again without them, their tombstones

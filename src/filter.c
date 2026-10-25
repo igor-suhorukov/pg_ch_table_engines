@@ -694,12 +694,13 @@ translate_key(ChTable *t, const ScanKeyData *key)
 
 /*
  * Whether a table's units carry what a filter prunes them by: an engine's granules and parts, a Parquet
- * file's row groups their statistics; an Arrow file's record batches carry none (§2.17)
+ * file's row groups their statistics, a table of its own Arrow files' record batches their parts' summaries'
+ * ranges (pg_accel's F6, VC28); an external Arrow file's record batches carry none (§2.17)
  */
 static bool
 prunable(const ChTable *t)
 {
-	return !t->external || t->ext_kind != CH_EXTERNAL_ARROW;
+	return !t->external || t->ext_kind != CH_EXTERNAL_ARROW || t->own;
 }
 
 /* The quals of a list a filter is made from */

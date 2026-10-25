@@ -20,8 +20,10 @@
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "lib/stringinfo.h"
+#include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
 
@@ -43,6 +45,7 @@ typedef struct BuilderColumn
 	Bytes		offsets;		/* uint64, strings only */
 	Bytes		nulls;
 	bool		has_nulls;
+	bool		text;			/* text, varchar or bpchar: its values checked as a part is written (F5) */
 } BuilderColumn;
 
 struct ChVectorBuilder
@@ -110,12 +113,140 @@ ch_builder_create(ChTable *table, MemoryContext cxt)
 		if (table->columns[i].kind == CH_COL_DROPPED)
 			continue;
 		b->cols[n].col = &table->columns[i];
+		if (table->columns[i].kind == CH_COL_VARLENA)
+		{
+			Oid			base = getBaseType(table->columns[i].typid);
+
+			b->cols[n].text = base == TEXTOID || base == VARCHAROID || base == BPCHAROID;
+		}
 		b->attnums[n] = i;
 		n++;
 	}
 	b->attnums[n] = -1;
 	ch_builder_reset(b);
 	return b;
+}
+
+/*
+ * F5 (pg_accel's pg_vector_executor.md §3.28): whether len bytes of UTF8
+ * values are the encoding's whole, checked at once by PostgreSQL's
+ * verifier -- no NUL, no truncated or invalid character -- a gigabyte at a
+ * time, each piece ending where a character begins.
+ */
+static bool
+utf8_bytes_whole(const char *p, Size len)
+{
+	while (len > 0)
+	{
+		Size		n = Min(len, (Size) 1 << 30);
+
+		while (n < len && n > 0 && ((unsigned char) p[n] & 0xC0) == 0x80)
+			n--;
+		if (n == 0 || !pg_verify_mbstr(PG_UTF8, p, (int) n, true))
+			return false;
+		p += n;
+		len -= n;
+	}
+	return true;
+}
+
+/*
+ * F5: whether the builder's text is each value the database encoding's
+ * whole, so that its part's text is vouched for to vexec (ChPart's
+ * text_checked) and no scan of it checks them again.  In UTF8 a column's
+ * bytes at once, as vexec's text kernels check a batch's
+ * (vexec_text_batch_whole()), and no value beginning at a continuation
+ * byte, inside a character; in another encoding a value at a time.
+ */
+bool
+ch_builder_text_whole(ChVectorBuilder *b)
+{
+	int			enc = GetDatabaseEncoding();
+
+	for (int c = 0; c < b->ncols; c++)
+	{
+		BuilderColumn *bc = &b->cols[c];
+		const uint64 *ends = (const uint64 *) bc->offsets.data;
+		const char *data = bc->values.data;
+		uint64		prev = 0;
+
+		if (!bc->text || b->nrows == 0)
+			continue;
+		if (enc == PG_UTF8)
+		{
+			uint64		last = ends[b->nrows - 1];
+
+			if (!utf8_bytes_whole(data, last))
+				return false;
+			for (uint32 i = 0; i + 1 < b->nrows; i++)
+				if (ends[i] < last && ((unsigned char) data[ends[i]] & 0xC0) == 0x80)
+					return false;
+			continue;
+		}
+		for (uint32 i = 0; i < b->nrows; prev = ends[i++])
+			if (!pg_verify_mbstr(enc, data + prev, (int) (ends[i] - prev), true))
+				return false;
+	}
+	return true;
+}
+
+/*
+ * F5: the same of a sink's batch of nrows rows, its text in the layouts the
+ * sink took (sink_supports(), vexec.c): offsets, a column's bytes at once
+ * in UTF8; Datums, a value at a time.  A NULL row's bytes among the offsets
+ * are checked too.
+ */
+bool
+ch_builder_batch_text_whole(ChVectorBuilder *b, const VexecColumn *columns, uint32 nrows)
+{
+	int			enc = GetDatabaseEncoding();
+
+	for (int c = 0; c < b->ncols; c++)
+	{
+		const VexecColumn *vc;
+
+		if (!b->cols[c].text || nrows == 0)
+			continue;
+		vc = &columns[b->attnums[c]];
+		if (vc->encoding != VEXEC_FLAT)
+			return false;
+		if (vc->layout == VEXEC_OFFSETS)
+		{
+			const int32 *off = vc->values;
+			const char *data = vc->buffers[0];
+
+			if (enc == PG_UTF8)
+			{
+				if (!utf8_bytes_whole(data + off[0], (Size) (off[nrows] - off[0])))
+					return false;
+				for (uint32 i = 1; i < nrows; i++)
+					if (off[i] < off[nrows] && ((unsigned char) data[off[i]] & 0xC0) == 0x80)
+						return false;
+				continue;
+			}
+			for (uint32 i = 0; i < nrows; i++)
+				if (!pg_verify_mbstr(enc, data + off[i], off[i + 1] - off[i], true))
+					return false;
+		}
+		else if (vc->layout == VEXEC_DATUM)
+		{
+			const Datum *datums = vc->values;
+
+			for (uint32 i = 0; i < nrows; i++)
+			{
+				struct varlena *v;
+
+				if (vc->validity != NULL && !(vc->validity[i / 64] & (UINT64CONST(1) << (i % 64))))
+					continue;
+				v = (struct varlena *) DatumGetPointer(datums[i]);
+				if (!pg_verify_mbstr(enc, VARDATA_ANY(v), (int) VARSIZE_ANY_EXHDR(v), true))
+					return false;
+			}
+		}
+		else
+			return false;
+	}
+	return true;
 }
 
 void

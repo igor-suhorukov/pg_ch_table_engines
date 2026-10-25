@@ -200,6 +200,10 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 		next.created = 0;
 		next.summary = ch_part_summary_written(writer, 0);
 		next.xmin = InvalidTransactionId;
+		/* F5: its text checked where every input's was */
+		next.text_checked = true;
+		for (int i = 0; i < n; i++)
+			next.text_checked &= chosen[i].part->text_checked;
 		store_part(rel, t, info.temp_dir, &next);
 		/* a part of the pages store is in pages now: its directory goes, uncommitted */
 		if (t->options.storage != CH_STORAGE_PAGES)

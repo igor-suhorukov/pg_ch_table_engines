@@ -64,6 +64,7 @@
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
 #include "pgstat.h"
+#include "common/hashfn.h"
 #include "lib/ilist.h"
 #include "port/atomics.h"
 #include "storage/predicate.h"
@@ -134,6 +135,8 @@ typedef struct ChScanDescData
 	bool		filter_stale;	/* made anew before the next unit is claimed */
 	ChUnitCheck unit_check;		/* NULL: every unit is read */
 	void	   *unit_check_arg;
+	ChGranuleSkip granule_skip; /* F7: NULL, every granule the filter keeps is read */
+	void	   *granule_skip_arg;
 
 	/* the claimed unit */
 	ChPart	   *part;			/* NULL: none */
@@ -405,6 +408,7 @@ setup_units(ChScanDesc scan)
 
 static bool claim_one_unit(ChScanDesc scan);
 static void refresh_filter(ChScanDesc scan);
+static void skip_granules(ChScanDesc scan);
 
 /* Takes the next unit the scan's unit check keeps, passing over the others: false at the end */
 static bool
@@ -771,6 +775,8 @@ next_batch(ChScanDesc scan)
 				return false;
 		}
 		select_unit(scan);
+		/* F7: a CPU's batches of the unit, the granules the caller passes over left out */
+		skip_granules(scan);
 		if (scan->unit_rows == 0)
 		{
 			release_unit(scan);
@@ -1385,6 +1391,19 @@ ch_scan_next_batch(TableScanDesc sscan, ChScanBatch *batch)
 	batch->reader = scan->reader;
 	batch->visible = NULL;
 	batch->nvisible = scan->nrows;
+	batch->part = scan->part;
+	batch->granule = -1;
+	batch->granule_last = false;
+	/* F7: a part's granule, as the library read it */
+	if (scan->reader != NULL && scan->part->listing == NULL && ch_engine()->read_granule != NULL)
+	{
+		int64_t		g;
+		int32_t		last;
+
+		ch_engine()->read_granule(scan->reader, &g, &last);
+		batch->granule = g;
+		batch->granule_last = last != 0;
+	}
 	if (scan->dead_lo < scan->dead_hi)
 	{
 		uint64	   *bits = MemoryContextAllocZero(scan->batch_cxt, sizeof(uint64) * ((scan->nrows + 63) / 64));
@@ -1413,6 +1432,115 @@ ch_scan_set_unit_check(TableScanDesc sscan, ChUnitCheck check, void *arg)
 
 	scan->unit_check = check;
 	scan->unit_check_arg = arg;
+}
+
+void
+ch_scan_set_granule_skip(TableScanDesc sscan, ChGranuleSkip skip, void *arg)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	scan->granule_skip = skip;
+	scan->granule_skip_arg = arg;
+}
+
+void
+ch_part_unit_id(const ChTable *t, const ChPart *part, uint64 *id)
+{
+	struct
+	{
+		Oid			db;
+		Oid			spc;
+		RelFileNumber rel;
+		int64		rows;
+		TimestampTz created;
+	}			k;
+
+	id[0] = id[1] = 0;
+	if (t->storage.backend >= 0 || part->listing != NULL)
+		return;
+	memset(&k, 0, sizeof(k));
+	k.db = t->storage.locator.dbOid;
+	k.spc = t->storage.locator.spcOid;
+	k.rel = t->storage.locator.relNumber;
+	k.rows = part->rows;
+	k.created = part->created;
+	id[0] = hash_bytes_extended((const unsigned char *) &k, sizeof(k), 0) ^
+		hash_bytes_extended((const unsigned char *) part->name, strlen(part->name), 1);
+	id[1] = hash_bytes_extended((const unsigned char *) &k, sizeof(k), 2) ^
+		hash_bytes_extended((const unsigned char *) part->name, strlen(part->name), 3);
+	if (id[0] == 0 && id[1] == 0)
+		id[1] = 1;
+}
+
+/*
+ * F7 (VC30): the claimed unit's granules the filter kept, less those its
+ * granule skip passes over -- whole runs of them where none is passed -- and
+ * the rows left none where none is left
+ */
+static void
+skip_granules(ChScanDesc scan)
+{
+	const uint64 *skip;
+	uint64		id[2];
+	uint32		begin = scan->unit_begin;
+	uint32		end = scan->unit_end ? scan->unit_end : (uint32) scan->part->marks;
+	chte_mark_range whole;
+	const chte_mark_range *from;
+	size_t		nfrom;
+	chte_mark_range *out;
+	size_t		nout = 0;
+	int64		passed = 0;
+
+	if (scan->granule_skip == NULL || scan->part->listing != NULL || scan->unit_rows == 0 ||
+		scan->part->marks <= 0)
+		return;
+	ch_part_unit_id(scan->table, scan->part, id);
+	if (id[0] == 0 && id[1] == 0)
+		return;
+	skip = scan->granule_skip(scan->granule_skip_arg, id, (uint32) scan->part->marks, begin, end);
+	if (skip == NULL)
+		return;
+	whole.begin = begin;
+	whole.end = end;
+	from = scan->nranges > 0 ? scan->ranges : &whole;
+	nfrom = scan->nranges > 0 ? scan->nranges : 1;
+	/* at most a range for each granule kept, in a copy: the ranges are rewritten in place */
+	out = palloc(sizeof(chte_mark_range) * Max(end - begin, 1));
+	for (size_t i = 0; i < nfrom; i++)
+		for (uint32 m = from[i].begin; m < from[i].end; m++)
+		{
+			if (skip[m / 64] & (UINT64CONST(1) << (m % 64)))
+			{
+				passed++;
+				continue;
+			}
+			if (nout > 0 && out[nout - 1].end == m)
+				out[nout - 1].end = m + 1;
+			else
+			{
+				out[nout].begin = m;
+				out[nout].end = m + 1;
+				nout++;
+			}
+		}
+	if (passed > 0)
+	{
+		if (nout > scan->ranges_cap)
+		{
+			scan->ranges = scan->ranges ? repalloc(scan->ranges, sizeof(chte_mark_range) * nout) :
+				MemoryContextAlloc(scan->scan_cxt, sizeof(chte_mark_range) * nout);
+			scan->ranges_cap = nout;
+		}
+		if (nout > 0)
+			memcpy(scan->ranges, out, sizeof(chte_mark_range) * nout);
+		scan->nranges = nout;
+		/* the rows kept an upper bound, none where no granule is left */
+		if (nout == 0)
+			scan->unit_rows = 0;
+		scan->counts.marks_skipped += passed;
+		scan->counts.marks_read -= passed;
+	}
+	pfree(out);
 }
 
 bool

@@ -576,22 +576,66 @@ std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData:
             /* read_with_direct_io= */ false, /* prefetch= */ false);
     };
     r->runs = markRuns(mark_ranges);
+    r->granularity = part->index_granularity;
     return r;
 }
 
 }
 
+/// F7: the granule a block of `rows` rows of the current run is of, as MergeTreeSequentialSource reads a
+/// run's granules in turn, a granule's rows in one block or more (MergeTreeSequentialSource.cpp:228-241);
+/// a block past its granule's rows -- a compact part's longer last granule -- leaves the run's not known.
+void chte_reader::noteGranule(size_t rows)
+{
+    batch_granule = -1;
+    batch_granule_last = false;
+    if (!run_mark || rows == 0)
+        return;
+    if (rows > run_mark_left)
+    {
+        run_mark.reset();
+        return;
+    }
+    batch_granule = static_cast<int64_t>(*run_mark);
+    run_mark_left -= rows;
+    batch_granule_last = run_mark_left == 0;
+    if (batch_granule_last)
+    {
+        ++*run_mark;
+        run_mark_left = *run_mark < granularity->getMarksCountWithoutFinal() ? granularity->getMarkRows(*run_mark) : 0;
+    }
+}
+
 bool chte_reader::pull(Block & block)
 {
     if (next_block)
+    {
+        batch_granule = -1;
+        batch_granule_last = false;
         return next_block(block);
+    }
     for (;;)
     {
         if (executor && executor->pull(block))
+        {
+            noteGranule(block.rows());
             return true;
+        }
         if (next_run >= runs.size())
             return false;
         executor.reset();
+        /// F7: the run's first granule, its rows
+        run_mark.reset();
+        if (granularity)
+        {
+            size_t first = runs[next_run] ? runs[next_run]->front().begin : 0;
+
+            if (first < granularity->getMarksCountWithoutFinal())
+            {
+                run_mark = first;
+                run_mark_left = granularity->getMarkRows(first);
+            }
+        }
         pipeline = QueryPipeline(open_run(std::move(runs[next_run++])));
         executor = std::make_unique<PullingPipelineExecutor>(pipeline);
     }
@@ -984,7 +1028,12 @@ extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error
         {
             checkInterrupted();
             if (nextGranule(*reader))
+            {
                 *nrows = static_cast<uint32_t>(reader->granule_rows);
+                /// F7: a granule a call, whole
+                reader->batch_granule = static_cast<int64_t>(*reader->granule);
+                reader->batch_granule_last = true;
+            }
             else
             {
                 reader->columns.clear();
@@ -1021,6 +1070,8 @@ extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error
                     }
                 }
                 columns.pop_back();
+                /// F7: some of a granule's rows alone
+                reader->batch_granule = -1;
                 if (kept == 0)
                     continue;
                 if (kept < rows)
@@ -1033,6 +1084,12 @@ extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error
             return;
         }
     });
+}
+
+extern "C" void chte_read_granule(chte_reader * reader, int64_t * granule, int32_t * last)
+{
+    *granule = reader->batch_granule;
+    *last = reader->batch_granule_last ? 1 : 0;
 }
 
 extern "C" int chte_read_vector(chte_reader * reader, uint32_t i, chte_vector * vector, chte_error * error)

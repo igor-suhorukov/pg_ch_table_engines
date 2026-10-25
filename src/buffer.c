@@ -67,6 +67,8 @@ typedef struct ChBuffer
 	uint64		end_rowid;
 	uint64		chunk;			/* the next range's size */
 	uint64		first_rowid;	/* of the buffered rows */
+	bool		text_unchecked; /* F5: a sink's batch in the writer whose text is not each value the
+								 * encoding's whole: the part's text not vouched for */
 } ChBuffer;
 
 /* The buffers of the running transaction, in TopTransactionContext */
@@ -98,6 +100,7 @@ close_writer(ChBuffer *b)
 	b->writer = NULL;
 	b->wrows = 0;
 	b->wbytes = 0;
+	b->text_unchecked = false;
 }
 
 /* The buffer's rows, of either kind */
@@ -176,6 +179,7 @@ flush(ChBuffer *b)
 	size_t		nparts;
 	ResourceOwner owner;
 	uint64		last_rowid;
+	bool		text_checked;
 
 	b->reserve_rows = 0;
 	if (nrows == 0)
@@ -190,8 +194,8 @@ flush(ChBuffer *b)
 	if (table->own)
 	{
 		/* §2.18: a part of the table's own files, its rows in their ids' order, as they came */
-		ch_own_write_part(rel, table, &b->storage, b->builder, b->first_rowid,
-						  ch_builder_rowid(b->builder, nrows - 1), b->cid);
+		ch_own_write_part(rel, table, &b->storage, b->builder, ch_builder_text_whole(b->builder),
+						  b->first_rowid, ch_builder_rowid(b->builder, nrows - 1), b->cid);
 		relation_close(rel, NoLock);
 		ch_builder_reset(b->builder);
 		return;
@@ -214,6 +218,12 @@ flush(ChBuffer *b)
 		CH_CALL("starting a part", eng->write_begin(table->handle, block, &writer, CH_ERR));
 		ch_handle_opened(owner, CH_HANDLE_WRITER, writer);
 	}
+	/*
+	 * F5: the part's text vouched for to vexec where each value is the
+	 * encoding's whole, checked here once -- the builder's rows at once, a
+	 * sink's batches as each came -- so that no scan of it checks them again
+	 */
+	text_checked = sink ? !b->text_unchecked : ch_builder_text_whole(b->builder);
 	PG_TRY();
 	{
 		if (!sink)
@@ -241,6 +251,7 @@ flush(ChBuffer *b)
 			part.manifest = NULL;
 			part.created = 0;
 			part.summary = ch_part_summary_written(writer, i);
+			part.text_checked = text_checked;
 			if (table->options.storage == CH_STORAGE_PAGES)
 			{
 				const chte_part_file *files = NULL;
@@ -283,6 +294,7 @@ flush(ChBuffer *b)
 		b->writer = NULL;
 		b->wrows = 0;
 		b->wbytes = 0;
+		b->text_unchecked = false;
 	}
 
 	relation_close(rel, NoLock);
@@ -483,6 +495,9 @@ ch_buffer_put_columns(Relation rel, CommandId cid, const VexecColumn *columns, u
 		rowids[i] = take_rowid(b);
 	if (nrows > 0 && b->wrows == 0)
 		b->first_rowid = rowids[0];
+	/* F5: the batch's text checked as it comes, the writer's rows being gone from here */
+	if (!b->text_unchecked && !ch_builder_batch_text_whole(b->builder, columns, nrows))
+		b->text_unchecked = true;
 	in = MemoryContextAlloc(b->batch_cxt, sizeof(chte_column_in) * ch_builder_ncolumns(b->builder));
 	b->wbytes += ch_builder_columns_in(b->builder, columns, nrows, rowids, b->batch_cxt, in);
 	CH_CALL("writing a part", eng->write_columns(b->writer, nrows, in, CH_ERR));

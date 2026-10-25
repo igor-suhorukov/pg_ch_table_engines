@@ -227,6 +227,11 @@ std::unique_ptr<chte_reader> openArrowReader(chte_table & table, std::shared_ptr
                                              std::optional<std::vector<size_t>> units,
                                              std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read);
 void arrowColumnBytes(const ExternalFooter & footer, size_t ncolumns, uint64_t * compressed, uint64_t * uncompressed);
+/// VC28 (pg_accel's F6): an Arrow file's record batches in turn, the table's columns asked (by index) decoded as a
+/// reader reads them, each cast to the type it is read as and nothing converted; false, nothing read, where an asked
+/// column is dictionary-encoded
+bool forEachArrowBatch(const ExternalTable & table, const ListedFile & listed, const ResolvedFile & resolved,
+                       const std::vector<size_t> & columns, const std::function<void(size_t, const Columns &)> & each);
 void registerArrowOutput();
 /// an Arrow file's codec, its first record batch's ("NONE" where it has none)
 String arrowCodec(const String & path, const ExternalFooter & footer);

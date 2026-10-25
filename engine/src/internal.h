@@ -527,8 +527,19 @@ struct chte_reader
     std::function<bool(DB::Block &)> next_block;
     std::shared_ptr<void> external_state;
 
+    /// F7 (chte_read_granule): the part's index granularity, for the runs' granules; the granule the next
+    /// block's rows begin in and its rows not yet read, none where it is not known; the last batch's
+    /// granule, -1 where not known, and whether it held the granule's last row
+    std::shared_ptr<const DB::MergeTreeIndexGranularity> granularity;
+    std::optional<size_t> run_mark;
+    size_t run_mark_left = 0;
+    int64_t batch_granule = -1;
+    bool batch_granule_last = false;
+
     /// The next block of the runs, the next run's source opened when one is done: false at the end
     bool pull(DB::Block & block);
+    /// F7: the granule a block of the runs is of, as it is pulled
+    void noteGranule(size_t rows);
 };
 
 struct chte_table

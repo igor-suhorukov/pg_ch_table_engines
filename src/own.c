@@ -243,7 +243,7 @@ store_own_part(Relation rel, ChTable *t, const char *tmp, ChPart *part, CommandI
  * ids' order, then stored.  The writer, on an error, removes its file.
  */
 void
-ch_own_write_part(Relation rel, ChTable *t, const ChStorageId *id, ChVectorBuilder *builder,
+ch_own_write_part(Relation rel, ChTable *t, const ChStorageId *id, ChVectorBuilder *builder, bool text_checked,
 				  uint64 first_rowid, uint64 last_rowid, CommandId cid)
 {
 	const ChEngine *eng = ch_engine();
@@ -262,6 +262,7 @@ ch_own_write_part(Relation rel, ChTable *t, const ChStorageId *id, ChVectorBuild
 	part.name = psprintf("all_" UINT64_FORMAT "_" UINT64_FORMAT "_0", block, block);
 	part.min_rowid = (int64) first_rowid;
 	part.max_rowid = (int64) last_rowid;
+	part.text_checked = text_checked;
 	tmp = psprintf("tmp_insert_%s", part.name);
 	dir = tmp_part_dir(id, tmp);
 	file = psprintf("%s/%s", dir, t->own_file);
@@ -354,6 +355,8 @@ merge_own(Relation rel, ChTable *t, List *chosen, bool fold_only, int *nfolded)
 	memset(&next, 0, sizeof(next));
 	next.min_rowid = PG_INT64_MAX;
 	next.max_rowid = PG_INT64_MIN;
+	/* F5: its text checked where every input's was; a missing value is PostgreSQL's */
+	next.text_checked = true;
 	foreach(lc, chosen)
 	{
 		ChPart	   *p = lfirst(lc);
@@ -371,6 +374,7 @@ merge_own(Relation rel, ChTable *t, List *chosen, bool fold_only, int *nfolded)
 		level = Max(level, l);
 		next.min_rowid = Min(next.min_rowid, p->min_rowid);
 		next.max_rowid = Max(next.max_rowid, p->max_rowid);
+		next.text_checked &= p->text_checked;
 		files[i++] = (size_t) p->file;
 		if (dead.n > 0)
 			nmine = ch_dead_rows_of_part(t, p, &dead, &mine, NULL);

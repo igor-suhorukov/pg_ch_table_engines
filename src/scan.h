@@ -30,6 +30,14 @@ typedef struct ChScanBatch
 	chte_reader *reader;		/* NULL for a scan of no column */
 	const uint64 *visible;		/* NULL: every row; else nrows bits, 1 = not deleted */
 	uint32		nvisible;		/* the rows not deleted */
+	const ChPart *part;			/* whose rows they are: a part, or an external table's file */
+	/*
+	 * F7 (VC30): the part's granule every row of the batch is of, -1 where
+	 * not known (a file's, a library's without chte_read_granule), and
+	 * whether the batch holds the granule's last row
+	 */
+	int64		granule;
+	bool		granule_last;
 } ChScanBatch;
 
 /* A unit, claimed and not yet read */
@@ -50,6 +58,7 @@ typedef struct ChScanCounts
 	int64		units_passed;	/* answered from statistics or passed over by a bound */
 	int64		marks;			/* granules of the units taken */
 	int64		marks_read;		/* of them, those read */
+	int64		marks_skipped;	/* F7: of those the filter kept, those a granule skip passed over */
 } ChScanCounts;
 
 /*
@@ -79,6 +88,19 @@ extern bool ch_scan_next_batch(TableScanDesc scan, ChScanBatch *batch);
  */
 typedef bool (*ChUnitCheck) (void *arg, const ChScanUnit *unit);
 extern void ch_scan_set_unit_check(TableScanDesc scan, ChUnitCheck check, void *arg);
+
+/*
+ * F7 (VC30): asked as a unit's granules are selected, of a part of a table of
+ * an engine whose storage is not temporary, by its identity (ch_part_unit_id())
+ * and its granules' count: NULL passes none over, else a bit a granule, set
+ * for one the scan need not read -- no row of it is true of the quals of the
+ * caller's that keeps the bits.  Valid until the next call.
+ */
+typedef const uint64 *(*ChGranuleSkip) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
+										uint32 end);
+extern void ch_scan_set_granule_skip(TableScanDesc scan, ChGranuleSkip skip, void *arg);
+/* A part's identity, never another's: of its storage, name, rows and time of writing; zeros for a temporary table's */
+extern void ch_part_unit_id(const ChTable *t, const ChPart *part, uint64 *id);
 
 /* Between batches: the next unit, claimed, which the next batch reads unless passed */
 extern bool ch_scan_claim_unit(TableScanDesc scan, ChScanUnit *unit);

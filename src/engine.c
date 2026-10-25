@@ -13,13 +13,22 @@
 #include "postgres.h"
 
 #include <dlfcn.h>
+#include <malloc.h>
+#include <stdlib.h>
+#include <unistd.h>
 
+#include "access/htup_details.h"
 #include "access/xact.h"
+#include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "common/file_utils.h"
+#include "port/atomics.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/elog.h"
@@ -32,9 +41,29 @@ char	   *ch_engine_log_level = NULL;
 char	   *ch_engine_settings = NULL;
 bool		ch_engine_preload = true;
 int			ch_engine_functions = CH_FUNCTIONS_USED;
+bool		ch_fast_exit = true;
+bool		ch_keep_freed_memory = true;
 
 static ChEngine engine;
 static bool loaded = false;
+
+/*
+ * VC23: how the processes that started the engine ended, counted in the
+ * postmaster's shared memory where the extension is preloaded -- by _exit()
+ * once PostgreSQL's own exits had run, or through the engine's teardown and
+ * the static destructors -- for ch.engine_exits().
+ */
+typedef struct ChEngineExits
+{
+	pg_atomic_uint64 fast;
+	pg_atomic_uint64 torn_down;
+} ChEngineExits;
+
+static ChEngineExits *exits = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static int	exit_code = 0;
+static bool exit_fast = false;
 
 /* the postmaster's mapping of the library, which its children inherit */
 static void *mapped_handle = NULL;
@@ -121,8 +150,107 @@ engine_log(void *arg, int level, const char *message)
 static void
 engine_on_exit(int code, Datum arg)
 {
-	if (loaded)
-		engine.shutdown();
+	if (!loaded || exit_fast)
+		return;
+	if (exits != NULL)
+		pg_atomic_fetch_add_u64(&exits->torn_down, 1);
+	engine.shutdown();
+}
+
+/*
+ * VC23: the process's end once PostgreSQL's exits have run.  exit() calls
+ * what atexit() registered in reverse order, and this is registered last, as
+ * the process exits: so it comes before the engine's own handler
+ * (chte_shutdown(), which waits for the executors' threads) and the
+ * library's and OpenSSL's static destructors and cleanup, which took a
+ * parallel worker's exit 1.5 ms, 27% of its cycles (ch_table_engines.md §3,
+ * "ClickBench after V8g, the extension's share").  Nothing of the engine's
+ * is durable there: a part is written, merged or dropped within its
+ * statement.
+ */
+static void
+exit_now(void)
+{
+	_exit(exit_code);
+}
+
+/*
+ * Registered after engine_on_exit(), so it runs before it: with ch.fast_exit
+ * on, the engine's teardown is left out and exit_now() registered for exit();
+ * every other callback of on_proc_exit() -- the process's temporary
+ * directory's removal, PostgreSQL's own: its temporary files, its socket --
+ * still runs before exit() is called.
+ */
+static void
+fast_exit_on_exit(int code, Datum arg)
+{
+	if (!ch_fast_exit)
+		return;
+	exit_code = code;
+	if (atexit(exit_now) != 0)
+		return;
+	exit_fast = true;
+	if (exits != NULL)
+		pg_atomic_fetch_add_u64(&exits->fast, 1);
+}
+
+static void
+exits_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+	RequestAddinShmemSpace(sizeof(ChEngineExits));
+}
+
+static void
+exits_shmem_startup(void)
+{
+	bool		found;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	exits = ShmemInitStruct("ch_table_engines engine exits", sizeof(ChEngineExits), &found);
+	if (!found)
+	{
+		pg_atomic_init_u64(&exits->fast, 0);
+		pg_atomic_init_u64(&exits->torn_down, 0);
+	}
+	LWLockRelease(AddinShmemInitLock);
+}
+
+void
+ch_engine_shmem_init(void)
+{
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = exits_shmem_request;
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = exits_shmem_startup;
+}
+
+/*
+ * ch.engine_exits(): the processes that started the engine and have exited
+ * since the server started, by _exit() and through the teardown; NULLs where
+ * the extension is not preloaded.
+ */
+PG_FUNCTION_INFO_V1(ch_engine_exits);
+Datum
+ch_engine_exits(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	if (exits == NULL)
+		nulls[0] = nulls[1] = true;
+	else
+	{
+		values[0] = Int64GetDatum((int64) pg_atomic_read_u64(&exits->fast));
+		values[1] = Int64GetDatum((int64) pg_atomic_read_u64(&exits->torn_down));
+	}
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
 
 #define LOAD(field, symbol) \
@@ -279,6 +407,10 @@ ch_engine(void)
 		engine.own_list_summaries = NULL;
 	}
 	*(void **) &engine.footers_read = dlsym(handle, "chte_footers_read");
+	/* optional: a library built before pg_accel's F7 says no batch's granule */
+	*(void **) &engine.read_granule = dlsym(handle, "chte_read_granule");
+	/* optional: a library built before pg_accel's F6 reads no row alone */
+	*(void **) &engine.rows_read_alone = dlsym(handle, "chte_rows_read_alone");
 	/* optional: a library built before VC2 reads no step, its columns all at once */
 	*(void **) &engine.read_begin_steps = dlsym(handle, "chte_read_begin_steps");
 	*(void **) &engine.read_step = dlsym(handle, "chte_read_step");
@@ -406,12 +538,29 @@ ch_engine(void)
 	options.callbacks.interrupted = engine_interrupted;
 	options.callbacks.log = engine_log;
 
+	/*
+	 * VC24: memory the process frees kept in it, not handed back to the
+	 * system at each free and faulted in again at its next use -- ClickHouse's
+	 * columns' buffers, a fresh worker's at each of its blocks: Q20's faults
+	 * 46% fewer (ch_table_engines.md §3).  Up to 32 MB a request from the heap
+	 * rather than a mapping of its own, glibc's largest (HEAP_MAX_SIZE / 2),
+	 * and no trim of the heap's top under 1 GB free.  The process's, its
+	 * PostgreSQL allocations' with ClickHouse's.
+	 */
+	if (ch_keep_freed_memory)
+	{
+		(void) mallopt(M_MMAP_THRESHOLD, 32 * 1024 * 1024);
+		(void) mallopt(M_TRIM_THRESHOLD, 1024 * 1024 * 1024);
+	}
+
 	if (engine.init(&options, &err) != 0)
 		ch_engine_raise(&err, "initializing the engine library");
 
 	loaded = true;
 	/* before exit() runs static destructors, which would wait for the executors' threads */
 	on_proc_exit(engine_on_exit, (Datum) 0);
+	/* after it, so first: the teardown left out where the process ends by _exit() (VC23) */
+	on_proc_exit(fast_exit_on_exit, (Datum) 0);
 	if (ch_engine_functions == CH_FUNCTIONS_ALL && engine.register_all_functions != NULL &&
 		engine.register_all_functions(&err) != 0)
 		ch_engine_raise(&err, "registering ClickHouse's functions");

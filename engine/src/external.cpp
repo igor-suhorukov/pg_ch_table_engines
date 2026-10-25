@@ -677,6 +677,9 @@ void keptByFooter(const ExternalTable & table, const ListedFile & file, const Ex
 namespace
 {
 
+void keptByArrowRanges(const ExternalTable & table, const ListedFile & file, const ResolvedFile & resolved,
+                       const Block & keys, const FormatFilterInfoPtr & info, std::vector<uint8_t> & kept);
+
 /// The row groups of a file the filter keeps by their statistics, as the reader keeps them
 /// (Parquet::Reader::prefilterAndInitRowGroups()), worked out once a filter and a file
 const std::vector<uint8_t> & keptUnits(chte_filter & filter, const ExternalTable & table, const ListedFile & file,
@@ -720,7 +723,10 @@ const std::vector<uint8_t> & keptUnits(chte_filter & filter, const ExternalTable
         {
             CheckingReads checking_reads;
             std::vector<uint8_t> again(kept.size(), 1);
-            keptByFooter(table, file, *fullFooter(table, file), keys, info, again);
+            if (table.format == CHTE_EXTERNAL_ARROW)
+                keptByArrowRanges(table, file, resolved, keys, info, again);
+            else
+                keptByFooter(table, file, *fullFooter(table, file), keys, info, again);
             if (again != kept)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: the units its summary keeps of a filter are not those its footer keeps",
                                 file.path);
@@ -1059,6 +1065,156 @@ FileColumnStats parquetFileStats(const ExternalTable & ext, const ResolvedFile &
 }
 
 /// VC25: a table column's own in its file's part's summary, where the summary has it of the type the table reads it as
+/*
+ * VC28 (pg_accel's pg_vector_executor.md §3.28, F6): an Arrow file's statistics of columns of the table's -- rows and
+ * NULLs, the least and greatest values -- and each record batch's range of each one's values, as parquetRanges()
+ * makes a row group's of its statistics for the reader's pruning, every batch decoded once (forEachArrowBatch()): a
+ * table of its own files' part keeps them in its summary, an Arrow file none.  A column of a floating type, which a
+ * NaN leaves unordered, has its rows and NULLs alone; false, nothing known, where a column is dictionary-encoded.
+ */
+bool arrowFileStats(const ExternalTable & ext, const ListedFile & listed, const ResolvedFile & resolved,
+                    const std::vector<size_t> & present, std::vector<std::vector<std::optional<Range>>> & ranges,
+                    std::vector<FileColumnStats> & stats)
+{
+    size_t nunits = resolved.footer->unit_rows.size();
+    std::vector<uint8_t> orderable(present.size(), 0);
+    std::vector<uint8_t> any(present.size(), 0);
+    bool null_as_default = ext.read_options.format.null_as_default;
+
+    ranges.assign(present.size(), std::vector<std::optional<Range>>(nunits));
+    stats.assign(present.size(), FileColumnStats{});
+    for (size_t k = 0; k < present.size(); ++k)
+    {
+        WhichDataType which(removeNullable(fileReadType(ext, resolved, present[k])));
+        orderable[k] = which.isInteger() || which.isDecimal() || which.isDateOrDate32OrDateTimeOrDateTime64() ||
+            which.isStringOrFixedString() || which.isUUID();
+        stats[k].counted = true;
+    }
+    bool read = forEachArrowBatch(ext, listed, resolved, present, [&](size_t u, const Columns & columns)
+    {
+        for (size_t k = 0; k < columns.size(); ++k)
+        {
+            const IColumn & column = *columns[k];
+            size_t rows = column.size();
+            size_t nulls = 0;
+            bool nullable = false;
+            if (const auto * n = typeid_cast<const ColumnNullable *>(&column))
+            {
+                nullable = true;
+                for (UInt8 b : n->getNullMapData())
+                    nulls += b != 0;
+            }
+            stats[k].rows += rows;
+            stats[k].nulls += nulls;
+            if (!orderable[k] || rows == 0)
+                continue;
+            DataTypePtr type = fileReadType(ext, resolved, present[k]);
+            Range range = Range::createWholeUniverse();
+            if (nulls == rows)
+            {
+                if (null_as_default)
+                    range.right = range.left = type->getDefault();
+                else
+                    range.right = range.left;
+                ranges[k][u] = range;
+                continue;
+            }
+            Field min;
+            Field max;
+            column.getExtremes(min, max, 0, rows);
+            if (min.isNull() || max.isNull() || accurateLess(max, min))
+                continue;
+            range = Range(min, true, max, true);
+            if (nullable && nulls > 0)
+            {
+                if (null_as_default)
+                {
+                    Field default_value = type->getDefault();
+                    if (!default_value.isNull() && accurateLess(default_value, range.left))
+                        range.left = default_value;
+                    if (!default_value.isNull() && accurateLess(range.right, default_value))
+                        range.right = default_value;
+                }
+                else
+                    range.left = NEGATIVE_INFINITY;
+            }
+            ranges[k][u] = range;
+            if (!any[k])
+            {
+                stats[k].min = min;
+                stats[k].max = max;
+                any[k] = 1;
+            }
+            else
+            {
+                if (accurateLess(min, stats[k].min))
+                    stats[k].min = min;
+                if (accurateLess(stats[k].max, max))
+                    stats[k].max = max;
+            }
+        }
+    });
+    if (!read)
+    {
+        ranges.clear();
+        stats.assign(present.size(), FileColumnStats{});
+        return false;
+    }
+    for (size_t k = 0; k < present.size(); ++k)
+        stats[k].bounded = orderable[k] && any[k];
+    return true;
+}
+
+/*
+ * The record batches of an Arrow file a filter keeps by their ranges as the file's batches give them, every batch
+ * read: the spec check's of what its part's summary keeps (VC28)
+ */
+void keptByArrowRanges(const ExternalTable & table, const ListedFile & file, const ResolvedFile & resolved,
+                       const Block & keys, const FormatFilterInfoPtr & info, std::vector<uint8_t> & kept)
+{
+    std::vector<size_t> columns;
+    std::vector<int> column_of(keys.columns(), -1);
+    std::vector<std::vector<std::optional<Range>>> ranges;
+    std::vector<FileColumnStats> stats;
+    DataTypes types = keys.getDataTypes();
+
+    if (!table.read_options.format.parquet.filter_push_down)
+        return;
+    for (size_t c = 0; c < keys.columns(); ++c)
+    {
+        const auto & k = keys.getByPosition(c);
+        for (size_t i = 0; i < table.columns.size(); ++i)
+            if (!resolved.isAbsent(i) && resolved.names[i] == k.name &&
+                fileReadType(table, resolved, i)->getName() == k.type->getName())
+            {
+                column_of[c] = static_cast<int>(columns.size());
+                columns.push_back(i);
+                break;
+            }
+    }
+    if (columns.empty() || !arrowFileStats(table, file, resolved, columns, ranges, stats))
+        return;
+    for (size_t u = 0; u < kept.size(); ++u)
+    {
+        Hyperrectangle hyperrectangle(keys.columns(), Range::createWholeUniverse());
+        for (size_t c = 0; c < keys.columns(); ++c)
+            if (column_of[c] >= 0 && ranges[column_of[c]][u])
+                hyperrectangle[c] = *ranges[column_of[c]][u];
+        kept[u] = info->key_condition->checkInHyperrectangle(hyperrectangle, types).can_be_true ? 1 : 0;
+    }
+}
+
+/* An Arrow file's statistics of one column, every batch read: the spec check's of its part's summary (VC28) */
+FileColumnStats arrowColumnStats(const ExternalTable & ext, const ListedFile & listed, const ResolvedFile & resolved, size_t i)
+{
+    std::vector<std::vector<std::optional<Range>>> ranges;
+    std::vector<FileColumnStats> stats;
+
+    if (!arrowFileStats(ext, listed, resolved, {i}, ranges, stats))
+        return FileColumnStats{};
+    return stats[0];
+}
+
 const OwnSummaryColumn * summaryColumn(const ExternalTable & ext, const ResolvedFile & resolved, size_t i)
 {
     const auto & summary = resolved.footer->summary;
@@ -1083,6 +1239,7 @@ void parquetStats(chte_table & table, const ExternalTable & ext, const ListedFil
     if (resolved.isAbsent(i))
         return;
     FileColumnStats s;
+    bool arrow = ext.format == CHTE_EXTERNAL_ARROW;
     if (const auto * kept = summaryColumn(ext, resolved, i))
     {
         s.counted = kept->counted;
@@ -1094,13 +1251,16 @@ void parquetStats(chte_table & table, const ExternalTable & ext, const ListedFil
         if (specCheck())
         {
             CheckingReads checking_reads;
-            auto again = parquetFileStats(ext, resolved, *fullFooter(ext, file)->parquet, i);
+            auto again = arrow ? arrowColumnStats(ext, file, resolved, i) :
+                parquetFileStats(ext, resolved, *fullFooter(ext, file)->parquet, i);
             if (again.counted != s.counted || again.rows != s.rows || again.nulls != s.nulls || again.bounded != s.bounded
                 || again.min != s.min || again.max != s.max)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: column {}'s statistics in its summary are not its footer's",
                                 file.path, name);
         }
     }
+    else if (arrow)
+        return;					/* an Arrow file keeps none: its part's summary alone has them */
     else
         s = parquetFileStats(ext, resolved, *fullFooter(ext, file)->parquet, i);
     if (!s.counted)
@@ -1434,8 +1594,10 @@ extern "C" int chte_external_select(chte_table * table, chte_external_listing * 
         const auto & unit_rows = resolved->footer->unit_rows;
         size_t last = end == 0 ? unit_rows.size() : std::min<size_t>(end, unit_rows.size());
         size_t first = std::min<size_t>(begin, last);
-        /// Parquet's row groups by their statistics; Arrow's record batches have none
-        const std::vector<uint8_t> * kept = filter && !filter->nodes.empty() && ext.format == CHTE_EXTERNAL_PARQUET
+        /// Parquet's row groups by their statistics; Arrow's record batches by their part's summary's ranges of them, a
+        /// table of its own files' (VC28), an Arrow file having none
+        const std::vector<uint8_t> * kept = filter && !filter->nodes.empty() &&
+            (ext.format == CHTE_EXTERNAL_PARQUET || (ext.format == CHTE_EXTERNAL_ARROW && resolved->footer->summary))
             ? &keptUnits(*filter, ext, f, *resolved) : nullptr;
 
         size_t n = 0;
@@ -1538,8 +1700,8 @@ extern "C" int chte_external_stats(chte_table * table, chte_external_listing * l
         const auto & f = listedFile(*listing, file);
         *stats = {};
         /// Parquet's from its footer, an Iceberg data file's from its own where nothing deletes its rows; an Arrow IPC
-        /// file keeps none
-        if (ext.format == CHTE_EXTERNAL_PARQUET)
+        /// file keeps none, a table of its own files' part's summary has them (VC28)
+        if (ext.format == CHTE_EXTERNAL_PARQUET || (ext.format == CHTE_EXTERNAL_ARROW && ext.own))
             parquetStats(*table, ext, f, *resolvedFor(ext, *listing, f), column ? column : "", stats);
         else if (ext.format == CHTE_EXTERNAL_ICEBERG)
             icebergStats(*table, ext, *listing, f, column ? column : "", stats);
@@ -2094,8 +2256,11 @@ String ownSummaryBytes(const ExternalTable & ext, const ListedFile & listed)
             names.push_back(ext.columns[i].name);
         }
     std::vector<std::vector<std::optional<Range>>> ranges;
+    std::vector<FileColumnStats> arrow_stats;
     if (footer->parquet)
         ranges = parquetRanges(ext, *footer->parquet, fileHeader(ext, resolved, names));
+    else if (footer->arrow && !arrowFileStats(ext, listed, resolved, present, ranges, arrow_stats))
+        arrow_stats.clear();
     writeVarUInt(present.size(), out);
     for (size_t k = 0; k < present.size(); ++k)
     {
@@ -2119,6 +2284,8 @@ String ownSummaryBytes(const ExternalTable & ext, const ListedFile & listed)
                 }
             s = parquetFileStats(ext, resolved, *footer->parquet, i);
         }
+        else if (!arrow_stats.empty())
+            s = arrow_stats[k];
         writeVarUInt(compressed, out);
         writeVarUInt(uncompressed, out);
         writeBinary(UInt8((s.counted ? 1 : 0) | (s.bounded ? 2 : 0)), out);

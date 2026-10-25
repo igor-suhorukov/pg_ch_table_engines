@@ -198,6 +198,10 @@ typedef struct SrcState
 	uint32		mt_end;
 	chte_page_file *mt_files;	/* the pages store's: the claimed part's manifest */
 	size_t		mt_nfiles;
+	/* F7 (minor 10, VC30): vexec's condition cache, which names the granules passed over; NULL none */
+	const uint64 *(*granules_passed) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
+									  uint32 end);
+	void	   *granules_arg;
 } SrcState;
 
 static uint64 null_row = 0;		/* a constant's validity: its one value NULL */
@@ -279,6 +283,15 @@ make_missing(SrcState *st, SrcColumn *c, TupleDesc desc)
 	}
 	vc->encoding = VEXEC_CONST;
 	vc->validity = isnull ? &null_row : NULL;
+}
+
+/* F7: the part's granules vexec's condition cache passes over (scan.c's skip_granules()) */
+static const uint64 *
+granules_skip(void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin, uint32 end)
+{
+	SrcState   *st = arg;
+
+	return st->granules_passed(st->granules_arg, unit_id, ngranules, begin, end);
 }
 
 static void *
@@ -397,6 +410,18 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 	}
 	if (spec->quals != NIL)
 		(void) ch_scan_set_filter(scan, spec->quals);
+	/*
+	 * F7 (minor 10, VC30): vexec's condition cache names a part's granules
+	 * to pass over as the scan selects them, and learns each batch's
+	 * granule, where the spec is of that size and has it
+	 */
+	if (spec->size >= offsetof(VexecSourceSpec, granules_arg) + sizeof(spec->granules_arg) &&
+		spec->granules_passed != NULL)
+	{
+		st->granules_passed = spec->granules_passed;
+		st->granules_arg = spec->granules_arg;
+		ch_scan_set_granule_skip(scan, granules_skip, st);
+	}
 	if (spec->nkeys > 0)
 	{
 		st->nspec_keys = spec->nkeys;
@@ -742,6 +767,22 @@ fill_dict_datums(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 	vc->validity = any_null ? words : NULL;
 }
 
+/*
+ * F5 (the source contract's minor version 10): a text column's flags -- its
+ * values each the encoding's whole, VEXEC_COL_TEXT_WHOLE, where the batch's
+ * part's text was checked as it was written (ChPart.text_checked): rows of
+ * PostgreSQL's, or a merge or fold of such parts alone.  vexec then checks
+ * none of them again, as PostgreSQL checks no stored value.
+ */
+static uint8
+text_flags(const SrcState *st, const SrcColumn *c)
+{
+	if (st->batch.part == NULL || !st->batch.part->text_checked ||
+		(c->basetype != TEXTOID && c->basetype != VARCHAROID && c->basetype != BPCHAROID))
+		return 0;
+	return VEXEC_COL_TEXT_WHOLE;
+}
+
 static void
 fill_column(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 {
@@ -759,6 +800,7 @@ fill_column(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 	{
 		if (!fill_dict(st, out, i, pos, n))
 			fill_dict_datums(st, out, i, pos, n);
+		vc->flags = text_flags(st, c);
 		return;
 	}
 	switch (col->kind)
@@ -815,6 +857,7 @@ fill_column(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 			elog(ERROR, "a column of kind %d cannot be handed as a batch", (int) col->kind);
 	}
 	vc->validity = validity_of(out, v, pos, n);
+	vc->flags = text_flags(st, c);
 }
 
 /* Whether a part's statistics leave a row within the keys: false passes its units over */
@@ -931,6 +974,18 @@ src_next(void *arg, VexecSourceBatch *out_batch)
 	out_batch->tids = st->tids ? out->tids : NULL;
 	out_batch->columns = out->columns;
 	out_batch->owner = out;
+	/*
+	 * F7 (minor 10): the part's granule the rows are of, the library's batch
+	 * a granule's rows or some of them, the last slice of it the granule's
+	 * last where the library's batch was
+	 */
+	if (st->granules_passed != NULL)
+	{
+		if (st->batch.granule >= 0 && st->batch.part != NULL)
+			ch_part_unit_id(ch_scan_table(st->scan), st->batch.part, out_batch->unit_id);
+		out_batch->granule = st->batch.granule;
+		out_batch->granule_last = st->batch.granule_last && pos + n == st->batch.nrows;
+	}
 
 	/* as getnextslot counts each row it returns */
 	if (pgstat_should_count_relation(st->rel))

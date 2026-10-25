@@ -85,6 +85,53 @@ SELECT count(*), sum(id) FROM p WHERE t = 'own 7' OR ts < TIMESTAMP '1960-01-02'
 SELECT count(*), sum(id) FROM a WHERE id BETWEEN 140000 AND 150000;
 RESET ch.enable_part_summaries;
 
+-- an Arrow part's record batches pruned by their ranges, which its summary keeps as Parquet's row groups keep their
+-- statistics (VC28): a filter reads the batches it may keep alone, and the answers are heap's; the columns' least and
+-- greatest values from the summary, as a Parquet part's from its footer's.  A fresh backend: this one listed the
+-- part from its footer above, which an Arrow file's holds no range in
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*), sum(id) FROM a WHERE id BETWEEN 140000 AND 150000;
+SELECT count(*), sum(id), min(d), max(t), count(u) FROM a WHERE id BETWEEN 140000 AND 150000;
+SELECT count(*), sum(id) FROM a WHERE t = 'own 72' OR ts < TIMESTAMP '1960-01-02';
+SELECT count(*), sum(id) FROM src WHERE t = 'own 72' OR ts < TIMESTAMP '1960-01-02';
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM a WHERE id > 1000000;
+
+-- Parquet's dictionary filter (VC26): a table of its own Parquet files is read with ClickHouse's dictionary
+-- filter limited to ch.own_parquet_dictionary_filter bytes a dictionary page, 64 kB by default, where
+-- ClickHouse's reader takes 1 MB; not for Arrow, nor where ch.engine_settings or the table's settings name
+-- it; -1 leaves ClickHouse's own limit.  Read as a process opens the table.
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+SELECT ch.read_settings('p') AS parquet, ch.read_settings('a') AS arrow;
+SELECT count(*), sum(id) FROM p WHERE t = 'own 72' OR t = 'own 73ü';
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+SET ch.own_parquet_dictionary_filter = '1MB';
+SELECT ch.read_settings('p') AS parquet;
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+SET ch.own_parquet_dictionary_filter = -1;
+SELECT ch.read_settings('p') AS parquet;
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+SET ch.engine_settings = 'input_format_parquet_dictionary_filter_push_down = 0';
+SELECT ch.read_settings('p') AS parquet;
+SELECT count(*), sum(id) FROM p WHERE t = 'own 72' OR t = 'own 73ü';
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+CREATE TABLE pd (id int, t text) USING parquet WITH (settings = 'input_format_parquet_dictionary_filter_push_down = 0');
+SELECT ch.read_settings('pd') AS parquet;
+DROP TABLE pd;
+
 -- the codecs: zstd and none, and lz4 frames for Arrow; a codec changed for the next parts
 CREATE TABLE pz (id int, t text) USING parquet WITH (codec = 'zstd');
 CREATE TABLE pn (id int, t text) USING parquet WITH (codec = 'none');
@@ -163,6 +210,28 @@ UPDATE ac SET z = NULL WHERE id = 2;
 ALTER TABLE ac DROP COLUMN t;
 SELECT * FROM ac WHERE id IN (1, 2, 1001) ORDER BY id;
 DROP TABLE ac, aca;
+
+-- an Arrow part's rows fetched by their TIDs (F6, VC27): each row's values alone read from its uncompressed record
+-- batch -- validity bits, values, offsets and bytes -- and decoded as the whole batch's would be: every type, NULLs
+-- among them, at the batches' edges, as heap's; a compressed batch's columns read whole
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+CREATE INDEX a_id ON a (id);
+CREATE INDEX al_id ON al (id);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT ch.rows_read_alone() AS before;
+SELECT (SELECT md5(string_agg(x::text, ',' ORDER BY x.id)) FROM a x WHERE id IN (1, 9, 13, 131072, 131073, 299999, 300000)) =
+	   (SELECT md5(string_agg(y::text, ',' ORDER BY y.id)) FROM src y WHERE id IN (1, 9, 13, 131072, 131073, 299999, 300000))
+	   AS same;
+SELECT * FROM a WHERE ctid = (SELECT ctid FROM a WHERE id = 117);
+SELECT ch.rows_read_alone() >= 8 AS read_alone;
+SELECT id, t FROM al WHERE id IN (5, 999) ORDER BY id;
+SELECT ch.rows_read_alone() >= 8 AS read_alone;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+DROP INDEX a_id, al_id;
 
 -- DELETE and UPDATE: tombstones, the new versions a part of their own
 DELETE FROM p WHERE id % 3 = 0;
