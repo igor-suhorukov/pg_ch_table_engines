@@ -400,6 +400,11 @@ extern "C" int chte_function_count(void)
     }
 }
 
+extern "C" uint64_t chte_parts_loaded(void)
+{
+    return chte::partsLoaded();
+}
+
 extern "C" int chte_thread_count(void)
 {
     int n = 0;

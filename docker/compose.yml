@@ -65,6 +65,7 @@ x-run: &run
     CHTE_PRELOAD: ${CHTE_PRELOAD:-}
     CHTE_SEGMENTS: ${CHTE_SEGMENTS:-}
     CHTE_CLUSTER_PARTS: ${CHTE_CLUSTER_PARTS:-}
+    CHTE_SPEC_CHECK: ${CHTE_SPEC_CHECK:-}
     CHTE_ENGINE: /engine/libchte_engine.so
 
 services:

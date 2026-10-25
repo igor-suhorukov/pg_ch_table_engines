@@ -13,9 +13,15 @@
 #   CHTE_SETTINGS a setting for every server of the suite, such as
 #                debug_discard_caches = 1: every cache discarded wherever an
 #                invalidation may be taken, on a server with assertions
+#   CHTE_SPEC_CHECK  the servers' engine library checks what it makes of a
+#                table's definition's parts (VC21) and of its parts'
+#                summaries (VC25) against what the definition's CREATE TABLE
+#                and the parts' files make, a difference the statement's
+#                error: on by default, 0 for none
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
+export CHTE_SPEC_CHECK="${CHTE_SPEC_CHECK:-1}"
 WORK="${CHTE_WORK:-/work}"
 BUILD=/tmp/chte-build
 

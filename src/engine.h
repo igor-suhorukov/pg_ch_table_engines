@@ -125,6 +125,16 @@ typedef struct ChEngine
 							  uint8_t *, const char *, const char *, const chte_file_column *, size_t,
 							  const chte_vector *, const char *, uint64_t *, uint64_t *, chte_error *);
 	int			(*own_file_layout) (chte_table *, chte_external_listing *, size_t, chte_file_layout *, chte_error *);
+	/* optional (VC21): a table opened from its definition's parts */
+	int			(*table_open_spec) (const chte_table_spec *, chte_table **, chte_error *);
+	/* optional (VC25): a table of its own files' parts summarized, and listed from their summaries; both, or neither */
+	int			(*own_summary) (chte_table *, chte_external_listing *, size_t, const void **, size_t *, chte_error *);
+	int			(*own_list_summaries) (chte_table *, const char *const *, const void *const *, const size_t *, size_t,
+									   chte_external_listing **, chte_error *);
+	/* optional (VC29): the parts the process has loaded, for the tests */
+	uint64_t	(*parts_loaded) (void);
+	/* optional (VC25): the files' footers the process has read, for the tests */
+	uint64_t	(*footers_read) (void);
 } ChEngine;
 
 /* GUCs */

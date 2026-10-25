@@ -6,15 +6,21 @@
 #include "internal.h"
 
 #include <Common/Exception.h>
+#include <Compression/CompressionFactory.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/StoragePolicy.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Interpreters/InterpreterCreateQuery.h>
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSetQuery.h>
+#include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ParserCreateQuery.h>
+#include <Parsers/ParserSetQuery.h>
 #include <Parsers/parseQuery.h>
 #include <Storages/IndicesDescription.h>
 #include <Storages/KeyDescription.h>
@@ -24,6 +30,8 @@
 #include <Storages/StorageInMemoryMetadata.h>
 
 #include <base/scope_guard.h>
+
+#include <atomic>
 
 namespace DB::MergeTreeSetting
 {
@@ -173,6 +181,40 @@ namespace
 /// The table whose part this thread is loading, for getInMemoryMetadataPtr()
 thread_local const PgMergeTree * loading_part_of = nullptr;
 
+/// The parts loaded in the process (VC29's tests)
+std::atomic<uint64_t> parts_loaded{0};
+
+}
+
+uint64_t partsLoaded()
+{
+    return parts_loaded.load(std::memory_order_relaxed);
+}
+
+namespace
+{
+
+/// VC21: a process's types read from their names, once each: a table's hundred columns name a few
+std::unordered_map<String, DataTypePtr> known_types;
+
+}
+
+DataTypePtr typeNamed(const String & name)
+{
+    auto it = known_types.find(name);
+    if (it == known_types.end())
+        it = known_types.emplace(name, DataTypeFactory::instance().get(name)).first;
+    return it->second;
+}
+
+bool specCheck()
+{
+    static const bool check = []
+    {
+        const char * value = getenv("CHTE_SPEC_CHECK");
+        return value && *value && strcmp(value, "0") != 0;
+    }();
+    return check;
 }
 
 StorageMetadataHandle PgMergeTree::getInMemoryMetadataPtr(ContextPtr query_context, bool bypass_metadata_cache) const
@@ -208,6 +250,7 @@ MergeTreeData::MutableDataPartPtr PgMergeTree::loadPart(const String & part_name
     SCOPE_EXIT({ loading_part_of = nullptr; });
     part->loadColumnsChecksumsIndexes(/* require_columns_checksums= */ true, /* check_consistency= */ false);
     part->setState(DataPartState::Active);
+    parts_loaded.fetch_add(1, std::memory_order_relaxed);
     return part;
 }
 
@@ -383,13 +426,53 @@ bool statisticsNeedFunctions(const ColumnsDescription & columns)
     return false;
 }
 
-chte_table * openTable(const chte_table_def * def)
+/// A definition's MergeTree settings, storage_def's, as the storage takes them
+std::unique_ptr<MergeTreeSettings> loadSettings(ContextMutablePtr context, ASTStorage & storage_def)
+{
+    auto settings = std::make_unique<MergeTreeSettings>(context->getMergeTreeSettings());
+    settings->loadFromQuery(storage_def, context, /* is_loading_from_existing_metadata= */ true);
+    return settings;
+}
+
+/// The table of a definition's columns and keys, in either open: its settings -- storage_def's, loaded --
+/// its columns' statistics, where the columns do not carry them yet, and the storage; its projections
+/// described as first needed (describeProjections)
+chte_table * makeTable(const chte_table_def * def, ContextMutablePtr context, StorageInMemoryMetadata & metadata,
+                       ASTStorage & storage_def, const MergeTreeData::MergingParams & merging, ASTPtr projections,
+                       std::unique_ptr<MergeTreeSettings> settings, bool with_statistics)
 {
     auto & e = engine();
+    if (storage_def.settings)
+        metadata.settings_changes = storage_def.settings->ptr();
+
+    /// Statistics of every column, as registerStorageMergeTree.cpp:1022-1027 adds them: the
+    /// parts' least and greatest values and NULLs, built as a part is written or merged.
+    String statistics_types = (*settings)[MergeTreeSetting::auto_statistics_types];
+    if (!statistics_types.empty() && !with_statistics)
+        addImplicitStatistics(metadata.columns, statistics_types);
+    if (statisticsNeedFunctions(metadata.columns))
+        registerAllFunctions();
+
+    StorageID id("chte", def->name && *def->name ? def->name : "table");
+    std::shared_ptr<PagesDisk> pages_disk;
+    if (def->pages)
+        pages_disk = std::make_shared<PagesDisk>("chte_pages", e.parts_disk->getPath(), *def->pages);
+    auto storage = std::make_shared<PgMergeTree>(id, def->relative_path, metadata, context, merging, std::move(settings),
+                                                 std::move(pages_disk));
+    StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
+    StorageMetadataPtr snapshot = handle;
+    auto * table = new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}, {}, {}};
+    if (projections && !projections->children.empty())
+        table->projections = projections;
+    return table;
+}
+
+chte_table * openTable(const chte_table_def * def)
+{
     if (!def || !def->create_query || !def->relative_path)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_table_open: create_query and relative_path are required");
 
-    auto context = Context::createCopy(e.global);
+    auto context = Context::createCopy(engine().global);
     ParserCreateQuery parser;
     String query = def->create_query;
     ASTPtr ast = parseQuery(parser, query, "table definition", DBMS_DEFAULT_MAX_QUERY_SIZE,
@@ -452,31 +535,214 @@ chte_table * openTable(const chte_table_def * def)
     /// ClickHouse analyzes each one's query to describe it, 0.6 to 0.9 ms of a fresh process's 1.6 for
     /// the table's open, which a scan never reads
     ASTPtr projections = create.columns_list->projections ? create.columns_list->projections->clone() : nullptr;
+    auto settings = loadSettings(context, storage_def);
+    return makeTable(def, context, metadata, storage_def, merging, projections, std::move(settings), /* with_statistics= */ false);
+}
 
-    auto settings = std::make_unique<MergeTreeSettings>(context->getMergeTreeSettings());
-    settings->loadFromQuery(storage_def, context, /* is_loading_from_existing_metadata= */ true);
-    if (storage_def.settings)
-        metadata.settings_changes = storage_def.settings->ptr();
+/// VC21: a process's codecs read from their definitions' text, once each -- a table's hundred
+/// columns name a few -- as InterpreterCreateQuery::getColumnsDescription() makes them at ATTACH:
+/// validated for the column's type as already accepted; a generic compression alone -- LZ4, LZ4HC,
+/// ZSTD, NONE -- once for every type, which its validation neither changes nor refuses
+std::map<std::pair<String, String>, ASTPtr> known_codecs;
 
-    /// Statistics of every column, as registerStorageMergeTree.cpp:1022-1027 adds them: the
-    /// parts' least and greatest values and NULLs, built as a part is written or merged.
+/// The statistics addImplicitStatistics() gives every column, of auto_statistics_types' text, read once a
+/// process as its parseColumnStatisticsFromString() reads them (Statistics.cpp at the tag)
+std::map<String, ColumnStatisticsDescription::StatisticsTypeDescMap> known_statistics;
+
+const ColumnStatisticsDescription::StatisticsTypeDescMap & implicitStatistics(const String & types)
+{
+    auto it = known_statistics.find(types);
+    if (it != known_statistics.end())
+        return it->second;
+    ParserStatisticsType parser;
+    auto ast = parseQuery(parser, "(" + types + ")", 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    ColumnStatisticsDescription::StatisticsTypeDescMap result;
+    for (const auto & arg : ast->as<ASTFunction &>().arguments->children)
+    {
+        const auto * function = arg->as<ASTFunction>();
+        if (!function)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected a function for statistic type, got: {}", arg->formatForLogging());
+        auto type = stringToStatisticsType(function->name);
+        result.emplace(type, SingleStatisticsDescription(type, arg, true));
+    }
+    return known_statistics.emplace(types, std::move(result)).first->second;
+}
+
+bool genericCodec(const String & arguments)
+{
+    if (arguments.find(',') != String::npos)
+        return false;
+    String family = arguments.substr(0, arguments.find('('));
+    return family == "LZ4" || family == "LZ4HC" || family == "ZSTD" || family == "NONE";
+}
+
+ASTPtr codecFor(const String & arguments, const DataTypePtr & type)
+{
+    auto key = std::make_pair(arguments, genericCodec(arguments) ? String() : type->getName());
+    auto it = known_codecs.find(key);
+    if (it == known_codecs.end())
+    {
+        ParserCodec parser;
+        String text = "(" + arguments + ")";
+        ASTPtr ast = parseQuery(parser, text, "codec", DBMS_DEFAULT_MAX_QUERY_SIZE, DBMS_DEFAULT_MAX_PARSER_DEPTH,
+                                DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        it = known_codecs.emplace(key, CompressionCodecFactory::instance().validateCodecAndGetPreprocessedAST(
+            ast, type, CodecValidationSettings::trusted())).first;
+    }
+    return it->second->clone();
+}
+
+/// A key's columns as ClickHouse's parser reads its definition's text: one as itself in parentheses, "(a)";
+/// more as the tuple operator of parentheses, "(a, b)"; none as the function call "tuple()"
+ASTPtr keyOf(const char * const * names, size_t n)
+{
+    if (n == 1)
+    {
+        auto column = make_intrusive<ASTIdentifier>(names[0]);
+        column->setParenthesized(true);
+        return column;
+    }
+    auto tuple = n > 1 ? makeASTOperator("tuple") : makeASTFunction("tuple");
+    for (size_t i = 0; i < n; ++i)
+        tuple->arguments->children.push_back(make_intrusive<ASTIdentifier>(names[i]));
+    return tuple;
+}
+
+/// A key's description over its own columns, where ClickHouse's analysis of it reads every column of the
+/// table: the key's -- columns, the additional ones among them, and the virtual ones -- alone resolve it
+KeyDescription keyOver(const ASTPtr & ast, const ColumnsDescription & columns, const char * const * names, size_t n,
+                       const VirtualColumnsDescription & virtuals, ContextPtr context,
+                       const NamesAndTypesList & additional_columns = {})
+{
+    /// in the table's order, as the analysis of every column finds them: its actions' inputs the same
+    std::set<String> key;
+    for (size_t i = 0; i < n; ++i)
+        key.insert(names[i]);
+    for (const auto & column : additional_columns)
+        key.insert(column.name);
+    ColumnsDescription own;
+    for (const auto & column : columns)
+        if (key.contains(column.name))
+            own.add(column);
+    return KeyDescription::getKeyFromAST(ast, own, virtuals, context, additional_columns);
+}
+
+chte_table * openTableSpec(const chte_table_spec * spec)
+{
+    const chte_table_def * def = spec->def;
+    if (!def || !def->relative_path || !spec->engine || spec->ncolumns == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_table_open_spec: columns, an engine and relative_path are required");
+
+    auto context = Context::createCopy(engine().global);
+    /// the storage's clauses as ClickHouse's parser makes them of a definition's text: what the settings'
+    /// loading and the engine's parameters read
+    auto storage_ast = make_intrusive<ASTStorage>();
+    auto & storage_def = *storage_ast;
+    auto engine_ast = make_intrusive<ASTFunction>();
+    engine_ast->name = spec->engine;
+    engine_ast->setNoEmptyArgs(true);
+    if (spec->nengine_args > 0)
+    {
+        engine_ast->arguments = make_intrusive<ASTExpressionList>();
+        engine_ast->children.push_back(engine_ast->arguments);
+        if (spec->engine_tuple)
+            engine_ast->arguments->children.push_back(keyOf(spec->engine_args, spec->nengine_args));
+        else
+            for (size_t i = 0; i < spec->nengine_args; ++i)
+                engine_ast->arguments->children.push_back(make_intrusive<ASTIdentifier>(spec->engine_args[i]));
+    }
+    storage_def.set(storage_def.engine, engine_ast);
+    storage_def.set(storage_def.order_by, keyOf(spec->order_by, spec->norder_by));
+    if (spec->nprimary_key > 0)
+        storage_def.set(storage_def.primary_key, keyOf(spec->primary_key, spec->nprimary_key));
+    auto settings_ast = make_intrusive<ASTSetQuery>();
+    settings_ast->is_standalone = false;
+    for (size_t i = 0; i < spec->nsettings; ++i)
+    {
+        const auto & s = spec->settings[i];
+        settings_ast->changes.emplace_back(s.name, s.string ? Field(String(s.string)) : Field(UInt64(s.number)));
+    }
+    if (spec->user_settings && *spec->user_settings)
+    {
+        ParserSetQuery parser(/* parse_only_internals_= */ true);
+        ASTPtr user = parseQuery(parser, spec->user_settings, "table settings", DBMS_DEFAULT_MAX_QUERY_SIZE,
+                                 DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        for (const auto & change : user->as<ASTSetQuery &>().changes)
+            settings_ast->changes.push_back(change);
+    }
+    storage_def.set(storage_def.settings, settings_ast);
+
+    std::optional<String> key_column;
+    auto merging = mergingParams(*storage_def.engine, key_column);
+
+    /// the settings first, so that each column is made with its statistics, as addImplicitStatistics() adds
+    /// them to every column after -- whose ColumnsDescription::modify() takes each column's subcolumns out and
+    /// puts them back
+    auto settings = loadSettings(context, storage_def);
     String statistics_types = (*settings)[MergeTreeSetting::auto_statistics_types];
-    if (!statistics_types.empty())
-        addImplicitStatistics(metadata.columns, statistics_types);
-    if (statisticsNeedFunctions(metadata.columns))
-        registerAllFunctions();
+    const auto * statistics = statistics_types.empty() ? nullptr : &implicitStatistics(statistics_types);
 
-    StorageID id("chte", def->name && *def->name ? def->name : "table");
-    std::shared_ptr<PagesDisk> pages_disk;
-    if (def->pages)
-        pages_disk = std::make_shared<PagesDisk>("chte_pages", e.parts_disk->getPath(), *def->pages);
-    auto storage = std::make_shared<PgMergeTree>(id, def->relative_path, metadata, context, merging, std::move(settings),
-                                                 std::move(pages_disk));
-    StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
-    StorageMetadataPtr snapshot = handle;
-    auto * table = new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}, {}};
-    if (projections && !projections->children.empty())
-        table->projections = projections;
+    StorageInMemoryMetadata metadata;
+    {
+        ColumnsDescription columns;
+        for (size_t i = 0; i < spec->ncolumns; ++i)
+        {
+            const auto & c = spec->columns[i];
+            ColumnDescription column;
+            column.name = c.name;
+            column.type = typeNamed(c.type);
+            if (c.codec && *c.codec)
+                column.codec = codecFor(c.codec, column.type);
+            if (statistics)
+            {
+                ColumnStatisticsDescription desc;
+                desc.data_type = column.type;
+                desc.types_to_desc = *statistics;
+                desc = MergeTreeStatisticsFactory::instance().cloneWithSupportedStatistics(desc, column.type);
+                if (!desc.empty())
+                    column.statistics.merge(desc, column.name, column.type, /* if_not_exists= */ true);
+            }
+            columns.add(std::move(column));
+        }
+        metadata.setColumns(std::move(columns));
+    }
+
+    /// Keys as openTable() builds them, each over its own columns: no partition key; the primary key the
+    /// sorting key's where it is the same columns and the engine adds none to the sorting key
+    metadata.partition_key = KeyDescription::getKeyFromAST(nullptr, ColumnsDescription{}, MergeTreeData::createVirtuals(nullptr), context);
+    metadata.virtuals = MergeTreeData::createVirtuals(&metadata.partition_key);
+    NamesAndTypesList additional_columns;
+    if (key_column)
+        additional_columns.emplace_back(*key_column, metadata.columns.getPhysical(*key_column).type);
+    metadata.sorting_key = keyOver(storage_def.order_by->ptr(), metadata.columns, spec->order_by, spec->norder_by,
+                                   metadata.virtuals, context, additional_columns);
+    if (spec->nprimary_key > 0)
+    {
+        auto primary = keyOver(storage_def.primary_key->ptr(), metadata.columns, spec->primary_key, spec->nprimary_key,
+                               metadata.virtuals, context);
+        /// as getPrimaryKeyFromAST() takes the sorting key's directions
+        if (!metadata.sorting_key.reverse_flags.empty())
+            primary.reverse_flags.assign(metadata.sorting_key.reverse_flags.begin(),
+                                         metadata.sorting_key.reverse_flags.begin()
+                                             + std::min(primary.column_names.size(), metadata.sorting_key.reverse_flags.size()));
+        metadata.primary_key = std::move(primary);
+    }
+    else if (additional_columns.empty())
+    {
+        metadata.primary_key = metadata.sorting_key;
+        metadata.primary_key.definition_ast = nullptr;
+    }
+    else
+    {
+        metadata.primary_key = keyOver(storage_def.order_by->ptr(), metadata.columns, spec->order_by, spec->norder_by,
+                                       metadata.virtuals, context);
+        metadata.primary_key.definition_ast = nullptr;
+    }
+
+    auto * table = makeTable(def, context, metadata, storage_def, merging, nullptr, std::move(settings),
+                             /* with_statistics= */ statistics != nullptr);
+    for (size_t i = 0; i < spec->nprojections; ++i)
+        table->projection_texts.emplace_back(spec->projections[i]);
     return table;
 }
 
@@ -484,6 +750,19 @@ chte_table * openTable(const chte_table_def * def)
 
 void chte::describeProjections(chte_table & table)
 {
+    if (!table.projections && !table.projection_texts.empty())
+    {
+        /// VC21: a definition opened from its parts, its projections' declarations as their text
+        auto list = make_intrusive<ASTExpressionList>();
+        for (const auto & text : table.projection_texts)
+        {
+            ParserProjectionDeclaration parser;
+            list->children.push_back(parseQuery(parser, text, "projection", DBMS_DEFAULT_MAX_QUERY_SIZE,
+                                                DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS));
+        }
+        table.projections = list;
+        table.projection_texts.clear();
+    }
     if (!table.projections)
         return;
     Names names;
@@ -502,6 +781,82 @@ void chte::describeProjections(chte_table & table)
     table.projections = nullptr;
 }
 
+namespace
+{
+
+/// What a table is, for the tests' comparison of its two opens: its columns, their codecs and statistics,
+/// its keys -- their definitions, columns, types, directions, sample blocks and actions -- its settings,
+/// as its metadata and as its storage has them, its engine's parameters, and its projections described
+String describeTable(chte_table & table)
+{
+    describeProjections(table);
+    const auto & m = *table.metadata;
+    WriteBufferFromOwnString out;
+    auto ast = [](const ASTPtr & a) { return a ? a->formatWithSecretsOneLine() : String("-"); };
+    for (const auto & c : m.getColumns())
+    {
+        out << c.name << ' ' << c.type->getName() << ' ' << ast(c.codec) << " stats "
+            << (c.statistics.data_type ? c.statistics.data_type->getName() : "-");
+        for (const auto & [type, desc] : c.statistics.types_to_desc)
+            out << ' ' << static_cast<int>(type) << (desc.is_implicit ? " implicit " : " explicit ") << ast(desc.ast);
+        out << '\n';
+    }
+    auto key = [&](const char * what, const KeyDescription & k)
+    {
+        out << what << ": " << ast(k.definition_ast) << " | " << ast(k.expression_list_ast) << " |";
+        for (const auto & name : k.column_names)
+            out << ' ' << name;
+        for (const auto & type : k.data_types)
+            out << ' ' << type->getName();
+        for (bool reverse : k.reverse_flags)
+            out << (reverse ? " desc" : " asc");
+        out << " | " << k.sample_block.dumpStructure() << " | " << (k.expression ? k.expression->dumpActions() : "-") << '\n';
+    };
+    key("partition", m.partition_key);
+    key("sorting", m.sorting_key);
+    key("primary", m.primary_key);
+    key("sampling", m.sampling_key);
+    out << "virtuals:";
+    for (const auto & v : m.virtuals)
+        out << ' ' << v.name << ' ' << v.type->getName();
+    out << "\nsettings: " << ast(m.settings_changes) << '\n';
+    for (const auto & change : table.storage->getSettings()->changes())
+        out << change.name << '=' << change.value.dump() << ' ';
+    const auto & p = table.storage->merging_params;
+    out << "\nmerging: " << p.getModeName() << ' ' << p.sign_column << ' ' << p.version_column << ' ' << p.is_deleted_column;
+    for (const auto & name : p.columns_to_sum)
+        out << ' ' << name;
+    out << '\n';
+    for (const auto & projection : m.getProjections())
+        out << "projection " << projection.name << ' ' << ast(projection.definition_ast) << " | "
+            << projection.sample_block.dumpStructure() << '\n';
+    out.finalize();
+    return out.str();
+}
+
+/// CHTE_SPEC_CHECK in the environment, for the tests: each open from a definition's parts compared with an
+/// open of its CREATE TABLE, both described afresh, the first difference an error
+void checkSpec(const chte_table_spec * spec)
+{
+    std::unique_ptr<chte_table> from_parts(openTableSpec(spec));
+    std::unique_ptr<chte_table> from_query(openTable(spec->def));
+    String a = describeTable(*from_parts);
+    String b = describeTable(*from_query);
+    if (a != b)
+    {
+        size_t at = 0;
+        while (at < a.size() && at < b.size() && a[at] == b[at])
+            ++at;
+        size_t from = a.rfind('\n', at);
+        from = from == String::npos ? 0 : from + 1;
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_table_open_spec: {} opened from its parts differs from its CREATE TABLE "
+                        "at\n  {}\n  where the query makes\n  {}", spec->def->name ? spec->def->name : "a table",
+                        a.substr(from, a.find('\n', at) - from), b.substr(from, b.find('\n', at) - from));
+    }
+}
+
+}
+
 extern "C" int chte_table_open(const chte_table_def * def, chte_table ** table, chte_error * error)
 {
     return guarded(error, [&]
@@ -518,6 +873,42 @@ extern "C" int chte_table_open(const chte_table_def * def, chte_table ** table, 
                 throw;
             registerAllFunctions();
             *table = openTable(def);
+        }
+    });
+}
+
+extern "C" int chte_table_open_spec(const chte_table_spec * spec, chte_table ** table, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        if (!spec || spec->size < sizeof(chte_table_spec))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_table_open_spec: a spec of {} bytes, {} expected",
+                            spec ? spec->size : 0, sizeof(chte_table_spec));
+        try
+        {
+            *table = openTableSpec(spec);
+        }
+        catch (const Exception & e)
+        {
+            /// as chte_table_open(): a function the analysis looks up that the first registrations lack
+            if (allFunctionsRegistered()
+                || (e.code() != ErrorCodes::UNKNOWN_FUNCTION && e.code() != ErrorCodes::UNKNOWN_AGGREGATE_FUNCTION))
+                throw;
+            registerAllFunctions();
+            *table = openTableSpec(spec);
+        }
+        if (specCheck())
+        {
+            try
+            {
+                checkSpec(spec);
+            }
+            catch (...)
+            {
+                delete *table;
+                *table = nullptr;
+                throw;
+            }
         }
     });
 }

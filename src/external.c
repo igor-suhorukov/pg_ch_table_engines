@@ -36,6 +36,7 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -50,10 +51,12 @@
 #include "storage/proc.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
+#include "varatt.h"
 
 #include "chte.h"
 
@@ -343,10 +346,82 @@ ch_own_part_file(ChTable *t, const char *part)
 }
 
 /*
+ * The own parts' summaries (VC25) a backend's listings handed the engine
+ * library, kept as read from TOAST: each listing -- twice a plan, the
+ * planner's estimate and vexec's -- read every part's summary from TOAST
+ * and decompressed it again, two thirds of a warm backend's planning of
+ * ClickBench's count(*) over its Parquet table, 0.02 -> 0.07 ms.  Keyed by
+ * the TOAST value, which a part's row keeps for the part's life, its size
+ * with it; emptied before a listing once it holds OWN_SUMMARIES_MAX bytes,
+ * so that the summaries of a listing stay while the library reads them.
+ */
+#define OWN_SUMMARIES_MAX	(16 * 1024 * 1024)
+
+typedef struct OwnSummaryKey
+{
+	Oid			toastrelid;
+	Oid			valueid;
+	int32		rawsize;
+} OwnSummaryKey;
+
+typedef struct OwnSummary
+{
+	OwnSummaryKey key;
+	bytea	   *summary;
+} OwnSummary;
+
+static MemoryContext own_summaries_cxt = NULL;
+static HTAB *own_summaries = NULL;
+static Size own_summaries_bytes = 0;
+
+/* A part's summary, from the backend's own summaries where its row's is in TOAST, else ch_part_summary()'s */
+static bytea *
+own_summary(ChPart *part)
+{
+	struct varatt_external toast;
+	OwnSummaryKey key;
+	OwnSummary *entry;
+
+	if (part->summary == NULL || !VARATT_IS_EXTERNAL_ONDISK(part->summary))
+		return ch_part_summary(part);
+	VARATT_EXTERNAL_GET_POINTER(toast, part->summary);
+	memset(&key, 0, sizeof(key));
+	key.toastrelid = toast.va_toastrelid;
+	key.valueid = toast.va_valueid;
+	key.rawsize = toast.va_rawsize;
+	if (own_summaries == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (own_summaries_cxt == NULL)
+			own_summaries_cxt = AllocSetContextCreate(TopMemoryContext, "ch_table_engines own summaries",
+													  ALLOCSET_DEFAULT_SIZES);
+		ctl.keysize = sizeof(OwnSummaryKey);
+		ctl.entrysize = sizeof(OwnSummary);
+		ctl.hcxt = own_summaries_cxt;
+		own_summaries = hash_create("ch_table_engines own summaries", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	entry = hash_search(own_summaries, &key, HASH_FIND, NULL);
+	if (entry == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(own_summaries_cxt);
+		bytea	   *plain = (bytea *) detoast_attr((struct varlena *) part->summary);
+
+		MemoryContextSwitchTo(old);
+		entry = hash_search(own_summaries, &key, HASH_ENTER, NULL);
+		entry->summary = plain;
+		own_summaries_bytes += VARSIZE_ANY(plain);
+	}
+	return entry->summary;
+}
+
+/*
  * A listing of a table of its own files (§2.18): the files of the parts
  * given -- a snapshot's, of the catalog -- each part's attached to it
  * (part->listing, part->file) for the readers of external tables to read.
- * Its units are the part's marks, as the part was written.
+ * Its units are the part's marks, as the part was written.  A part of a
+ * summary (VC25) is listed from it, its file opened by none but the readers
+ * of its units.
  */
 ChListing *
 ch_own_listing(ChTable *t, List *parts)
@@ -354,15 +429,42 @@ ch_own_listing(ChTable *t, List *parts)
 	const ChEngine *eng = ch_engine();
 	chte_external_listing *handle;
 	const char **paths;
+	const void **summaries = NULL;
+	size_t	   *sizes = NULL;
 	ChListing  *l;
 	ListCell   *lc;
 	int			i = 0;
 
 	Assert(t->own);
 	paths = palloc(sizeof(char *) * Max(list_length(parts), 1));
+	if (eng->own_list_summaries != NULL && ch_enable_part_summaries)
+	{
+		summaries = palloc0(sizeof(void *) * Max(list_length(parts), 1));
+		sizes = palloc0(sizeof(size_t) * Max(list_length(parts), 1));
+		if (own_summaries_bytes >= OWN_SUMMARIES_MAX)
+		{
+			MemoryContextReset(own_summaries_cxt);
+			own_summaries = NULL;
+			own_summaries_bytes = 0;
+		}
+	}
 	foreach(lc, parts)
-		paths[i++] = ch_own_part_file(t, ((ChPart *) lfirst(lc))->name);
-	CH_CALL("listing a table's files", eng->own_list(t->handle, paths, (size_t) i, &handle, CH_ERR));
+	{
+		ChPart	   *p = lfirst(lc);
+		bytea	   *summary = summaries != NULL ? own_summary(p) : NULL;
+
+		if (summary != NULL)
+		{
+			summaries[i] = VARDATA_ANY(summary);
+			sizes[i] = VARSIZE_ANY_EXHDR(summary);
+		}
+		paths[i++] = ch_own_part_file(t, p->name);
+	}
+	if (summaries != NULL)
+		CH_CALL("listing a table's files",
+				eng->own_list_summaries(t->handle, paths, summaries, sizes, (size_t) i, &handle, CH_ERR));
+	else
+		CH_CALL("listing a table's files", eng->own_list(t->handle, paths, (size_t) i, &handle, CH_ERR));
 	l = listing_make(handle);
 	i = 0;
 	foreach(lc, parts)
@@ -380,6 +482,11 @@ ch_own_listing(ChTable *t, List *parts)
 		p->file = i++;
 	}
 	pfree(paths);
+	if (summaries != NULL)
+	{
+		pfree(summaries);
+		pfree(sizes);
+	}
 	return l;
 }
 

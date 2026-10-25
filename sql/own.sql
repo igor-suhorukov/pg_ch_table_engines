@@ -44,6 +44,47 @@ SELECT file LIKE '%/ch_' || pg_relation_filenode('p') || '/all_1_1_0/data.parque
 	   bytes = (pg_stat_file(file)).size AS bytes_its_file
 FROM ch.own_files('p');
 
+-- a part's summary (VC25), of its file -- its units' rows, its columns, their bytes and statistics, each unit's
+-- range of each column's values -- kept in its catalog row as the part is written, merged or folded, and the part
+-- listed from it, its file opened by its units' readers alone.  What a filter keeps of its row groups is what the
+-- file's footer keeps, as are its statistics (the suite's servers check each against the footer, CHTE_SPEC_CHECK),
+-- and so without the summaries, the footers read (ch.enable_part_summaries off)
+SELECT relname, count(*) AS parts, count(summary) AS summarized
+FROM ch.parts JOIN pg_class ON relfilenode = relfilenumber WHERE relname IN ('p', 'a') GROUP BY 1 ORDER BY 1;
+-- planned with no file's footer read: a fresh backend's plans of filters over both tables, their units pruned,
+-- read none (ch.footers_read()); without the summaries, another fresh backend's read the files' footers
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+DO $$ BEGIN
+	EXECUTE 'EXPLAIN SELECT count(*), sum(i4) FROM p WHERE id BETWEEN 140000 AND 150000';
+	EXECUTE 'EXPLAIN SELECT count(*), sum(id) FROM a WHERE id BETWEEN 140000 AND 150000';
+	EXECUTE 'EXPLAIN SELECT min(d), max(t) FROM p';
+END $$;
+SELECT ch.footers_read() AS footers_read;
+\c
+SET extra_float_digits = 0;
+SET vexec.mode = off;
+SET ch.enable_part_summaries = off;
+DO $$ BEGIN
+	EXECUTE 'EXPLAIN SELECT count(*), sum(i4) FROM p WHERE id BETWEEN 140000 AND 150000';
+	EXECUTE 'EXPLAIN SELECT count(*), sum(id) FROM a WHERE id BETWEEN 140000 AND 150000';
+END $$;
+SELECT ch.footers_read() > 0 AS footers_read;
+RESET ch.enable_part_summaries;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*), sum(i4) FROM p WHERE id BETWEEN 140000 AND 150000;
+SELECT count(*), sum(i4), min(d), max(t), count(u) FROM p WHERE id BETWEEN 140000 AND 150000;
+SELECT count(*), sum(id) FROM p WHERE t = 'own 7' OR ts < TIMESTAMP '1960-01-02';
+SELECT count(*), sum(id) FROM a WHERE id BETWEEN 140000 AND 150000;
+SET ch.enable_part_summaries = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*), sum(i4) FROM p WHERE id BETWEEN 140000 AND 150000;
+SELECT count(*), sum(i4), min(d), max(t), count(u) FROM p WHERE id BETWEEN 140000 AND 150000;
+SELECT count(*), sum(id) FROM p WHERE t = 'own 7' OR ts < TIMESTAMP '1960-01-02';
+SELECT count(*), sum(id) FROM a WHERE id BETWEEN 140000 AND 150000;
+RESET ch.enable_part_summaries;
+
 -- the codecs: zstd and none, and lz4 frames for Arrow; a codec changed for the next parts
 CREATE TABLE pz (id int, t text) USING parquet WITH (codec = 'zstd');
 CREATE TABLE pn (id int, t text) USING parquet WITH (codec = 'none');
@@ -182,6 +223,8 @@ SELECT ch.fold('p') AS folded;
 SELECT part, rows, units FROM ch.own_files('p');
 SELECT count(*) AS tombstones FROM ch.tombstones WHERE relfilenumber = pg_relation_filenode('p');
 SELECT rows_digest('p') = rows_digest('src') AS same;
+-- a merged and a folded part summarized too (VC25)
+SELECT count(*) AS parts, count(summary) AS summarized FROM ch.parts WHERE relfilenumber = pg_relation_filenode('p');
 
 -- Arrow: the same DML and merges
 DELETE FROM a WHERE id % 3 = 0;

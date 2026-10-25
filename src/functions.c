@@ -127,6 +127,22 @@ ch_engine_info(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The Parquet and Arrow footers the session's process has read from their
+ * files (VC25), for the tests that check a plan reads none; NULL where the
+ * engine library predates the count.
+ */
+PG_FUNCTION_INFO_V1(ch_footers_read);
+Datum
+ch_footers_read(PG_FUNCTION_ARGS)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (eng->footers_read == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) eng->footers_read());
+}
+
+/*
  * Folds the deletions every snapshot sees into their parts (vacuum.c): the
  * parts written again without their rows, the tombstones gone.  Under
  * ShareUpdateExclusiveLock, as VACUUM's: DML goes on beside it, a second

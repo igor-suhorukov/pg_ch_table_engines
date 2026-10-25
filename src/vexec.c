@@ -1390,23 +1390,50 @@ typedef struct SrcMtUnit
 	chte_page_file *pages;		/* and, the pages store's, the file's pages; path NULL: the library's read */
 } SrcMtUnit;
 
-/* The spec's columns as the part names them, "c1, c3" */
-static char *
-mergetree_names(SrcState *st)
+/*
+ * The library's description of a part's columns over granules [begin, end)
+ * for the device, kept for every process (streams.c, VC29): false where it
+ * refuses them.  Asked of the library, the part attached first, where they
+ * are not kept; valid until the next call.
+ */
+static bool
+mergetree_streams(SrcState *st, uint32 begin, uint32 end, int ncols, const AttrNumber *attnums,
+				  chte_part_streams *ps, chte_part_stream **kept)
 {
-	StringInfoData b;
+	ChTable    *t = ch_scan_table(st->scan);
+	const ChPart *part = st->mt_unit.part;
+	size_t		nfound;
+	uint64		rows;
+	StringInfoData list;
 
-	initStringInfo(&b);
-	for (int i = 0; i < st->ncols; i++)
-		appendStringInfo(&b, "%sc%d", i > 0 ? ", " : "", st->cols[i].attnum);
-	return b.data;
+	memset(ps, 0, sizeof(*ps));
+	*kept = NULL;
+	if (ch_streams_find(t, part, begin, end, ncols, attnums, &rows, kept, &nfound))
+	{
+		ps->rows = rows;
+		ps->nstreams = nfound;
+		ps->streams = *kept;
+		return true;
+	}
+	initStringInfo(&list);
+	for (int i = 0; i < ncols; i++)
+		appendStringInfo(&list, "%sc%d", i > 0 ? ", " : "", attnums[i]);
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, part);
+	CH_CALL("describing a part's columns for the device",
+			ch_engine()->part_streams_of(t->handle, part->name, list.data, begin, end, ps, CH_ERR));
+	pfree(list.data);
+	ch_streams_described();
+	if (ps->refusal != NULL)
+		return false;
+	ch_streams_keep(t, part, begin, end, ncols, attnums, ps);
+	return true;
 }
 
 /* The claimed unit's next run of granules for the device; false, nothing set, where its part's columns are not read so. */
 static bool
 mergetree_unit(SrcState *st, VexecSourceUnit *u)
 {
-	ChTable    *t = ch_scan_table(st->scan);
 	uint32		begin = st->mt_next;
 	uint32		end = Min(begin + CH_DEVICE_UNIT_MARKS, st->mt_end);
 	chte_part_streams ps;
@@ -1415,7 +1442,8 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	VexecSourceStream *streams;
 	const char **names;
 	uint8	   *flags;
-	char	   *list;
+	AttrNumber *attnums;
+	chte_part_stream *kept;
 	uint64		first_offset = 0;
 
 	/*
@@ -1426,21 +1454,22 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	if (st->tids && begin > 0)
 	{
 		chte_part_streams before;
-		char	   *one = psprintf("c%d", st->cols[0].attnum);
 
-		CH_CALL("describing a part's columns for the device",
-				ch_engine()->part_streams_of(t->handle, st->mt_unit.part->name, one, 0, begin, &before, CH_ERR));
-		pfree(one);
-		if (before.refusal != NULL)
+		if (!mergetree_streams(st, 0, begin, 1, &st->cols[0].attnum, &before, &kept))
 			return false;
 		first_offset = before.rows;
+		if (kept)
+			pfree(kept);
 	}
-	list = mergetree_names(st);
-	CH_CALL("describing a part's columns for the device",
-			ch_engine()->part_streams_of(t->handle, st->mt_unit.part->name, list, begin, end, &ps, CH_ERR));
-	pfree(list);
-	if (ps.refusal != NULL)
+	attnums = palloc(sizeof(AttrNumber) * st->ncols);
+	for (int i = 0; i < st->ncols; i++)
+		attnums[i] = st->cols[i].attnum;
+	if (!mergetree_streams(st, begin, end, st->ncols, attnums, &ps, &kept))
+	{
+		pfree(attnums);
 		return false;
+	}
+	pfree(attnums);
 	old = MemoryContextSwitchTo(st->cxt);
 	keep = palloc0(sizeof(SrcMtUnit));
 	keep->unit.part = st->mt_unit.part;
@@ -1478,6 +1507,8 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 		streams[i].length = x->to - x->from;
 		streams[i].skip = x->skip;
 	}
+	if (kept)
+		pfree(kept);
 	names = palloc(sizeof(char *) * st->ncols);
 	flags = palloc0(sizeof(uint8) * st->ncols);
 	for (int i = 0; i < st->ncols; i++)
@@ -1539,11 +1570,15 @@ mergetree_begin(SrcState *st, const ChScanUnit *unit)
 	(void) ch_scan_unit_parts(st->scan, &parts, &ranges, &nranges);
 	if (nranges == 0)
 		return false;
+	/*
+	 * The pages store's manifest of the part, its streams' pages, which
+	 * read_unit_bytes() reads; the part attached to the library only where it
+	 * is asked about the part (VC29)
+	 */
 	if (t->options.storage == CH_STORAGE_PAGES)
 	{
 		MemoryContext old = MemoryContextSwitchTo(st->cxt);
 
-		ch_pages_attach(t, unit->part);
 		if (st->mt_files != NULL)
 		{
 			for (size_t f = 0; f < st->mt_nfiles; f++)
@@ -1651,6 +1686,8 @@ src_read_unit_bytes(void *arg, const VexecSourceUnit *u, int stream, uint64 offs
 		ch_pages_read_file(t, &keep->pages[stream], keep->from[stream] + offset, length, dest);
 		return;
 	}
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, keep->unit.part);
 	CH_CALL("reading a part's file for the device",
 			ch_engine()->part_file_read(t->handle, keep->unit.part->name, keep->files[stream],
 										keep->from[stream] + offset, length, dest, CH_ERR));
@@ -1711,6 +1748,8 @@ src_unit_tids(void *arg, const VexecSourceUnit *u, int n, const uint64 *rows, It
 		for (int i = 0; i < n; i++)
 			if (m == 0 || offsets[m - 1] != offsets[i])
 				offsets[m++] = offsets[i];
+		if (t->options.storage == CH_STORAGE_PAGES)
+			ch_pages_attach(t, keep->unit.part);
 		owner = ch_handle_reserve();
 		CH_CALL("reading rows' ids for their TIDs",
 				eng->read_rows(t->handle, keep->unit.part->name, CH_ROWID_COLUMN, offsets, (size_t) m, &reader,

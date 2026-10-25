@@ -98,6 +98,13 @@ CHTE_API int			chte_register_all_functions(chte_error *error);
 CHTE_API int			chte_function_count(void);
 
 /*
+ * VC29: the parts the process has loaded so far -- each a committed part's metadata read
+ * through ClickHouse, a part at its first use in the process -- for the tests that check a
+ * call needs no part.  Optional: a library built before it lacks it.
+ */
+CHTE_API uint64_t	chte_parts_loaded(void);
+
+/*
  * A table is a CREATE TABLE statement in ClickHouse's syntax — columns with codecs,
  * indexes and projections, then ENGINE = <MergeTree family>(...) with PARTITION BY,
  * ORDER BY, PRIMARY KEY, SAMPLE BY and SETTINGS — so the same text also works in
@@ -136,6 +143,54 @@ typedef struct chte_table_def
 
 CHTE_API int			chte_table_open(const chte_table_def *def, chte_table **table, chte_error *error);
 CHTE_API void		chte_table_close(chte_table *table);
+
+/*
+ * VC21: the same table opened from its definition's parts, without ClickHouse's parser of the
+ * whole statement and its analysis of every column for each key: each column's name, its type as
+ * a definition names it and its codec's arguments, as CODEC() takes them -- a process reads each
+ * type and codec once, a table's columns naming few -- the engine's name and its arguments, the
+ * columns of its sorting key (none: tuple()) and of its primary key (none: the sorting key's),
+ * the extension's settings by value and the table's own as SETTINGS' text, and its projections'
+ * declarations, "name (SELECT ...)", read where a search by row id, an insert, a merge or a
+ * rewrite first needs them.  def->create_query is the same table, as chte_table_open() takes it.
+ * Optional: a library built before it lacks it.
+ */
+typedef struct chte_table_column
+{
+	const char *name;
+	const char *type;			/* "Nullable(Int32)", "LowCardinality(Nullable(String))" */
+	const char *codec;			/* "LZ4", "T64, LZ4" */
+} chte_table_column;
+
+typedef struct chte_table_setting
+{
+	const char *name;
+	const char *string;			/* a string's value; NULL for a number's, below */
+	uint64_t	number;
+} chte_table_setting;
+
+typedef struct chte_table_spec
+{
+	size_t		size;			/* sizeof as the caller was built */
+	const chte_table_def *def;
+	const chte_table_column *columns;
+	size_t		ncolumns;
+	const char *engine;			/* "MergeTree", "ReplacingMergeTree", ... */
+	const char *const *engine_args;	/* the engine's arguments, columns' names */
+	size_t		nengine_args;
+	int			engine_tuple;	/* nonzero: the arguments one tuple, as SummingMergeTree((a, b)) */
+	const char *const *order_by;
+	size_t		norder_by;
+	const char *const *primary_key;
+	size_t		nprimary_key;
+	const chte_table_setting *settings;
+	size_t		nsettings;
+	const char *user_settings;	/* "name = value, ...", after settings; NULL: none */
+	const char *const *projections;
+	size_t		nprojections;
+} chte_table_spec;
+
+CHTE_API int			chte_table_open_spec(const chte_table_spec *spec, chte_table **table, chte_error *error);
 
 /*
  * One column of a batch, in table-definition order.  Fixed-width values are packed
@@ -723,6 +778,31 @@ CHTE_API int			chte_own_list(chte_table *table, const char *const *paths, size_t
 CHTE_API int			chte_own_write_begin(const char *format, const char *path, const chte_file_column *columns,
 									 size_t ncolumns, const char *settings, chte_file_writer **writer,
 									 chte_error *error);
+
+/*
+ * VC25: a listed file's summary, the library's bytes, which the caller keeps with its part and lists it
+ * by: its units' rows, its columns as the readers infer them, their bytes, and a Parquet file's
+ * statistics of each column, the file's and each unit's, as a filter's pruning and the answers from
+ * statistics read them of its footer.  *bytes valid until the next call on the table.
+ *
+ * chte_own_list_summaries lists the files as chte_own_list, each one's footer taken from its part's
+ * summary where summaries[i] (sizes[i] bytes) is one of the file's, the file not read; a reader of
+ * the file reads its footer as it first needs it.  Without a summary, or of a format or a size other
+ * than the file's, a file's footer is read.  Both optional: a library built before them lacks them.
+ */
+CHTE_API int			chte_own_summary(chte_table *table, chte_external_listing *listing, size_t file,
+								 const void **bytes, size_t *size, chte_error *error);
+CHTE_API int			chte_own_list_summaries(chte_table *table, const char *const *paths,
+										const void *const *summaries, const size_t *sizes, size_t npaths,
+										chte_external_listing **listing, chte_error *error);
+
+/*
+ * VC25: the footers of Parquet and Arrow files the process has read from the files so far -- of
+ * external tables and of tables of their own files, each a file's at its first use in the process,
+ * but those CHTE_SPEC_CHECK's comparisons with a summary read -- for the tests that check a plan
+ * reads none.  Optional: a library built before it lacks it.
+ */
+CHTE_API uint64_t	chte_footers_read(void);
 
 /*
  * The places in a listed file of the rows of ids: offsets[i] the place of ids[i], UINT64_MAX

@@ -63,9 +63,11 @@
 #include <QueryPipeline/QueryPipeline.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 
+#include <base/scope_guard.h>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <re2/re2.h>
 
+#include <atomic>
 #include <filesystem>
 #include <set>
 #include <sys/stat.h>
@@ -84,6 +86,7 @@ namespace DB::ErrorCodes
     extern const int CANNOT_STAT;
     extern const int FILE_CHANGED_DURING_READ;
     extern const int FILE_DOESNT_EXIST;
+    extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int THERE_IS_NO_COLUMN;
@@ -187,9 +190,9 @@ FormatParserSharedResourcesPtr singleThreadedResources(const ContextPtr & contex
     return resources;
 }
 
-std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 size, Int64 mtime)
+std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 size, Int64 mtime, size_t buffer_size)
 {
-    auto buf = std::make_unique<ReadBufferFromFilePRead>(path, DBMS_DEFAULT_BUFFER_SIZE, -1, nullptr, 0, size);
+    auto buf = std::make_unique<ReadBufferFromFilePRead>(path, buffer_size, -1, nullptr, 0, size);
     struct stat st;
     if (fstat(buf->getFD(), &st) != 0)
         throw ErrnoException(ErrorCodes::CANNOT_FSTAT, "Cannot fstat {}", path);
@@ -224,19 +227,57 @@ std::shared_ptr<ExternalFooter> readParquetFooter(const ExternalTable & table, c
 /// Footers kept in the process (MAX_FOOTERS), by format and path
 std::map<std::pair<int, String>, std::shared_ptr<const ExternalFooter>> footers;
 
+/// VC25: the footers read from their files in the process (chte_footers_read), but those a check of a summary reads
+std::atomic<uint64_t> footers_read{0};
+thread_local int checking = 0;
+
+/// A summary's answer checked against its file's footer (CHTE_SPEC_CHECK): its reads not counted
+struct CheckingReads
+{
+    CheckingReads() { ++checking; }
+    ~CheckingReads() { --checking; }
+};
+
 }
 
-std::shared_ptr<const ExternalFooter> footerOf(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
+namespace
+{
+
+/// A file's footer read, or found kept, of a known identity: an Arrow file's units' rows, where given, not read again
+std::shared_ptr<const ExternalFooter> footerKept(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime,
+                                                 const std::vector<UInt64> * unit_rows)
 {
     auto key = std::make_pair(table.format, path);
     auto it = footers.find(key);
     if (it != footers.end() && it->second->size == size && it->second->mtime == mtime)
         return it->second;
-    std::shared_ptr<const ExternalFooter> footer = table.format == CHTE_EXTERNAL_ARROW ? readArrowFooter(table, path, size, mtime)
-                                                                                       : readParquetFooter(table, path, size, mtime);
+    std::shared_ptr<const ExternalFooter> footer = table.format == CHTE_EXTERNAL_ARROW
+        ? readArrowFooter(table, path, size, mtime, unit_rows)
+        : readParquetFooter(table, path, size, mtime);
+    if (!checking)
+        footers_read.fetch_add(1, std::memory_order_relaxed);
     if (footers.size() >= MAX_FOOTERS)
         footers.clear();
     footers[key] = footer;
+    return footer;
+}
+
+}
+
+std::shared_ptr<const ExternalFooter> footerOf(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
+{
+    return footerKept(table, path, size, mtime, nullptr);
+}
+
+std::shared_ptr<const ExternalFooter> fullFooter(const ExternalTable & table, const ListedFile & listed)
+{
+    const auto & listed_footer = listed.resolved->footer;
+    if (listed_footer->parquet || listed_footer->arrow)
+        return listed_footer;
+    auto footer = footerKept(table, listed.path, listed.size, listed.mtime, &listed_footer->unit_rows);
+    if (footer->unit_rows != listed_footer->unit_rows)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "file {} holds {} rows in {} units, where its part's summary has {} in {}",
+                        listed.path, footer->rows, footer->unit_rows.size(), listed_footer->rows, listed_footer->unit_rows.size());
     return footer;
 }
 
@@ -611,6 +652,31 @@ Block filterKeys(const chte_filter & filter, const ExternalTable & table, const 
     return fileHeader(table, file, names);
 }
 
+/// The row groups the reader's pruning keeps of a file's footer, kept[] of the file's units set
+void keptByFooter(const ExternalTable & table, const ListedFile & file, const ExternalFooter & footer, const Block & keys,
+                  const FormatFilterInfoPtr & info, std::vector<uint8_t> & kept)
+{
+    auto buf = openListed(file.path, file.size, file.mtime);
+    Parquet::Reader reader;
+    reader.prefetcher.init(buf.get(), table.read_options, /* parser_shared_resources_= */ nullptr);
+    /// the footer's metadata lent to the reader, and taken back once its pruning is done, where a copy of it each
+    /// statement took a fifth of a fresh plan of ClickBench's 105 columns, and 2.8 ms of a warm one (VC25): the
+    /// reader's row groups point into its row groups, which the move keeps where they are
+    auto & metadata = const_cast<parquet::format::FileMetaData &>(*footer.parquet);
+    reader.file_metadata = std::move(metadata);
+    SCOPE_EXIT({ metadata = std::move(reader.file_metadata); });
+    reader.init(table.read_options, keys, info);
+    reader.prefilterAndInitRowGroups(std::nullopt);
+    std::fill(kept.begin(), kept.end(), 0);
+    for (const auto & row_group : reader.row_groups)
+        kept.at(row_group.row_group_idx) = 1;
+}
+
+}
+
+namespace
+{
+
 /// The row groups of a file the filter keeps by their statistics, as the reader keeps them
 /// (Parquet::Reader::prefilterAndInitRowGroups()), worked out once a filter and a file
 const std::vector<uint8_t> & keptUnits(chte_filter & filter, const ExternalTable & table, const ListedFile & file,
@@ -625,18 +691,43 @@ const std::vector<uint8_t> & keptUnits(chte_filter & filter, const ExternalTable
     std::vector<uint8_t> kept(footer.unit_rows.size(), 1);
     Block keys = filterKeys(filter, table, resolved);
     auto info = keys.columns() > 0 ? formatFilter(filter, table, resolved, keys) : nullptr;
-    if (info && info->key_condition)
+    if (info && info->key_condition && footer.summary)
     {
-        auto buf = openListed(file.path, file.size, file.mtime);
-        Parquet::Reader reader;
-        reader.prefetcher.init(buf.get(), table.read_options, /* parser_shared_resources_= */ nullptr);
-        reader.file_metadata = *footer.parquet;
-        reader.init(table.read_options, keys, info);
-        reader.prefilterAndInitRowGroups(std::nullopt);
-        std::fill(kept.begin(), kept.end(), 0);
-        for (const auto & row_group : reader.row_groups)
-            kept.at(row_group.row_group_idx) = 1;
+        /// VC25: each unit's ranges of the keys' columns from its part's summary, as the reader's pruning reads its row
+        /// group's statistics, the file not read -- a column of a type other than the summary's, or of no statistics,
+        /// unbounded
+        if (table.read_options.format.parquet.filter_push_down)
+        {
+            DataTypes types = keys.getDataTypes();
+            std::vector<const OwnSummaryColumn *> columns;
+            for (size_t c = 0; c < keys.columns(); ++c)
+            {
+                const auto & k = keys.getByPosition(c);
+                auto it_column = footer.summary->columns.find(k.name);
+                columns.push_back(it_column != footer.summary->columns.end() && it_column->second.type == k.type->getName()
+                                  ? &it_column->second : nullptr);
+            }
+            for (size_t u = 0; u < kept.size(); ++u)
+            {
+                Hyperrectangle hyperrectangle(keys.columns(), Range::createWholeUniverse());
+                for (size_t c = 0; c < columns.size(); ++c)
+                    if (columns[c] && u < columns[c]->ranges.size() && columns[c]->ranges[u])
+                        hyperrectangle[c] = *columns[c]->ranges[u];
+                kept[u] = info->key_condition->checkInHyperrectangle(hyperrectangle, types).can_be_true ? 1 : 0;
+            }
+        }
+        if (specCheck())
+        {
+            CheckingReads checking_reads;
+            std::vector<uint8_t> again(kept.size(), 1);
+            keptByFooter(table, file, *fullFooter(table, file), keys, info, again);
+            if (again != kept)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: the units its summary keeps of a filter are not those its footer keeps",
+                                file.path);
+        }
     }
+    else if (info && info->key_condition)
+        keptByFooter(table, file, footer, keys, info, kept);
     return filter.kept_units.emplace(std::move(key), std::move(kept)).first->second;
 }
 
@@ -882,22 +973,31 @@ std::unique_ptr<chte_reader> pipelineReader(chte_table & table, std::shared_ptr<
     return r;
 }
 
-/// From its footer: the column's chunk in each row group, decoded as the reader decodes them
-/// (Parquet::Reader::getHyperrectangleForRowGroup()) into the type it reads the column as
-void parquetStats(chte_table & table, const ExternalTable & ext, const ListedFile & file, const ResolvedFile & resolved,
-                  const String & name, chte_column_stats * stats)
+namespace
 {
-    *stats = {};
-    table.scratch.clear();
-    size_t i = ext.columnIndex(name);
-    const auto & column = ext.columns[i];
-    const auto & metadata = *resolved.footer->parquet;
 
-    Block sample = fileHeader(ext, resolved, {name});
+/// A file's column statistics from its Parquet footer: its rows and NULLs where every row group counts them, its least
+/// and greatest values where every one has them exact -- the column's chunk in each row group decoded as the reader
+/// decodes them (Parquet::Reader::getHyperrectangleForRowGroup()) into the type it reads the column as
+struct FileColumnStats
+{
+    bool counted = false;
+    UInt64 rows = 0;
+    UInt64 nulls = 0;
+    bool bounded = false;
+    Field min;
+    Field max;
+};
+
+FileColumnStats parquetFileStats(const ExternalTable & ext, const ResolvedFile & resolved,
+                                 const parquet::format::FileMetaData & metadata, size_t i)
+{
+    FileColumnStats s;
+    Block sample = fileHeader(ext, resolved, {ext.columns[i].name});
     Parquet::SchemaConverter schemer(metadata, ext.read_options, &sample);
     schemer.prepareForReading();
     if (schemer.primitive_columns.size() != 1)
-        return;
+        return s;
     const auto & primitive = schemer.primitive_columns.front();
     const IDataType & output_type = *sample.getByPosition(0).type;
     bool nullable = resolved.nullable[i];
@@ -949,14 +1049,70 @@ void parquetStats(chte_table & table, const ExternalTable & ext, const ListedFil
         if (max.isNull() || accurateLess(max, group_max))
             max = group_max;
     }
-    if (!counted)
+    s.counted = counted;
+    s.rows = rows;
+    s.nulls = nulls;
+    s.bounded = bounded && !min.isNull() && !max.isNull();
+    s.min = std::move(min);
+    s.max = std::move(max);
+    return s;
+}
+
+/// VC25: a table column's own in its file's part's summary, where the summary has it of the type the table reads it as
+const OwnSummaryColumn * summaryColumn(const ExternalTable & ext, const ResolvedFile & resolved, size_t i)
+{
+    const auto & summary = resolved.footer->summary;
+    if (!summary || resolved.isAbsent(i))
+        return nullptr;
+    auto it = summary->columns.find(resolved.names[i]);
+    if (it == summary->columns.end() || it->second.type != fileReadType(ext, resolved, i)->getName())
+        return nullptr;
+    return &it->second;
+}
+
+}
+
+/// From its part's summary (VC25), or its footer
+void parquetStats(chte_table & table, const ExternalTable & ext, const ListedFile & file, const ResolvedFile & resolved,
+                  const String & name, chte_column_stats * stats)
+{
+    *stats = {};
+    table.scratch.clear();
+    size_t i = ext.columnIndex(name);
+    const auto & column = ext.columns[i];
+    if (resolved.isAbsent(i))
+        return;
+    FileColumnStats s;
+    if (const auto * kept = summaryColumn(ext, resolved, i))
+    {
+        s.counted = kept->counted;
+        s.rows = kept->rows;
+        s.nulls = kept->nulls;
+        s.bounded = kept->bounded;
+        s.min = kept->min;
+        s.max = kept->max;
+        if (specCheck())
+        {
+            CheckingReads checking_reads;
+            auto again = parquetFileStats(ext, resolved, *fullFooter(ext, file)->parquet, i);
+            if (again.counted != s.counted || again.rows != s.rows || again.nulls != s.nulls || again.bounded != s.bounded
+                || again.min != s.min || again.max != s.max)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: column {}'s statistics in its summary are not its footer's",
+                                file.path, name);
+        }
+    }
+    else
+        s = parquetFileStats(ext, resolved, *fullFooter(ext, file)->parquet, i);
+    if (!s.counted)
         return;
     stats->has_stats = 1;
     stats->has_null_count = 1;
-    stats->rows = rows;
-    stats->null_count = nulls;
-    if (!bounded || min.isNull() || max.isNull())
+    stats->rows = s.rows;
+    stats->null_count = s.nulls;
+    if (!s.bounded)
         return;
+    const Field & min = s.min;
+    const Field & max = s.max;
     auto bound = [&](const Field & value) -> ColumnPtr
     {
         auto read = column.read_type->createColumn();
@@ -1057,7 +1213,7 @@ void openExternal(const chte_external_def * def, bool own, chte_table ** table)
         ExternalColumn column;
         column.name = c.name;
         column.file_name = c.file_name && *c.file_name ? c.file_name : c.name;
-        column.type = DataTypeFactory::instance().get(c.type);
+        column.type = typeNamed(c.type);
         column.convert = c.convert;
         column.not_null = c.not_null != 0;
         column.check_utf8 = c.check_utf8 != 0;
@@ -1327,20 +1483,49 @@ extern "C" int chte_external_column_bytes(chte_table * table, chte_external_list
         for (const auto & name : columnNames(columns))
             if (name != ROWID)
                 paths.insert(resolved->names[ext.columnIndex(name)]);
-        if (ext.format == CHTE_EXTERNAL_ARROW)
+        auto of_footer = [&](const ExternalFooter & footer, uint64_t * c, uint64_t * u)
         {
-            arrowColumnBytes(*resolved->footer, paths.size(), compressed, uncompressed);
+            *c = *u = 0;
+            if (ext.format == CHTE_EXTERNAL_ARROW)
+            {
+                arrowColumnBytes(footer, paths.size(), c, u);
+                return;
+            }
+            for (const auto & row_group : footer.parquet->row_groups)
+                for (const auto & chunk : row_group.columns)
+                {
+                    const auto & path = chunk.meta_data.path_in_schema;
+                    if (path.empty() || !paths.contains(path.front()))
+                        continue;
+                    *c += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_compressed_size, 0));
+                    *u += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_uncompressed_size, 0));
+                }
+        };
+        /// VC25: a part's from its summary, as from its footer
+        if (const auto & summary = resolved->footer->summary)
+        {
+            if (ext.format == CHTE_EXTERNAL_ARROW)
+                *compressed = *uncompressed = summary->arrow_body * paths.size() / std::max<UInt64>(summary->arrow_fields, 1);
+            else
+                for (const auto & path : paths)
+                    if (auto it = summary->columns.find(path); it != summary->columns.end())
+                    {
+                        *compressed += it->second.compressed;
+                        *uncompressed += it->second.uncompressed;
+                    }
+            if (specCheck())
+            {
+                CheckingReads checking_reads;
+                uint64_t c;
+                uint64_t u;
+                of_footer(*fullFooter(ext, f), &c, &u);
+                if (c != *compressed || u != *uncompressed)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: its summary's bytes of columns {} are not its footer's",
+                                    f.path, columns);
+            }
             return;
         }
-        for (const auto & row_group : resolved->footer->parquet->row_groups)
-            for (const auto & chunk : row_group.columns)
-            {
-                const auto & path = chunk.meta_data.path_in_schema;
-                if (path.empty() || !paths.contains(path.front()))
-                    continue;
-                *compressed += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_compressed_size, 0));
-                *uncompressed += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_uncompressed_size, 0));
-            }
+        of_footer(*resolved->footer, compressed, uncompressed);
     });
 }
 
@@ -1753,6 +1938,333 @@ ColumnPtr asMergeColumn(const ExternalColumn & column, ColumnPtr col)
     return makeNullable(col);
 }
 
+/*
+ * VC25: a part's summary, which the caller keeps in its catalog row (chte_own_summary) and lists the part by
+ * (chte_own_list_summaries), its file not opened to plan: a format byte -- the mergetree summaries' is 1 -- the
+ * file's format and size, its units' rows, its schema as the readers infer it, an Arrow file's batches' bodies and
+ * fields, and per column of the table the file has, by the file's name of it: the type it is read as, its bytes,
+ * its file's statistics and each unit's range of its values, a Parquet file's, as parquetStats() and the reader's
+ * pruning read them.
+ */
+constexpr UInt8 OWN_SUMMARY_FORMAT = 2;
+
+/// A range's end: a value, or one of the infinities a Range takes NULL as, which readFieldBinary() loses
+void writeRangeEnd(const Field & value, bool included, WriteBuffer & out)
+{
+    UInt8 kind = value.isNegativeInfinity() ? 1 : value.isPositiveInfinity() ? 2 : value.isNull() ? 3 : 0;
+    writeBinary(kind, out);
+    if (kind == 0)
+        writeFieldBinary(value, out);
+    writeBinary(UInt8(included ? 1 : 0), out);
+}
+
+void readRangeEnd(ReadBuffer & in, Field & value, bool & included)
+{
+    UInt8 kind;
+    readBinary(kind, in);
+    switch (kind)
+    {
+        case 0: value = readFieldBinary(in); break;
+        case 1: value = NEGATIVE_INFINITY; break;
+        case 2: value = POSITIVE_INFINITY; break;
+        case 3: value = Field(); break;
+        default: throw Exception(ErrorCodes::INCORRECT_DATA, "a summary's range end of kind {}", static_cast<int>(kind));
+    }
+    UInt8 flag;
+    readBinary(flag, in);
+    included = flag != 0;
+}
+
+/// Each unit's range of each column of sample, as Parquet::Reader::getHyperrectangleForRowGroup() and
+/// adjustRangeFromIndexIfNeeded() at the tag make it of the row group's statistics for the reader's pruning -- every
+/// column as one a filter uses -- none where the reader takes none: no statistics, a type whose statistics it does not
+/// decode, a column of several primitive columns, or statistics it would refuse
+std::vector<std::vector<std::optional<Range>>> parquetRanges(const ExternalTable & ext, const parquet::format::FileMetaData & metadata,
+                                                              const Block & sample)
+{
+    std::vector<std::vector<std::optional<Range>>> out(sample.columns(),
+                                                        std::vector<std::optional<Range>>(metadata.row_groups.size()));
+    Parquet::SchemaConverter schemer(metadata, ext.read_options, &sample);
+    schemer.prepareForReading();
+    std::vector<size_t> primitives(sample.columns(), 0);
+    for (const auto & column_info : schemer.primitive_columns)
+        if (column_info.idx_in_output_block < sample.columns())
+            ++primitives[column_info.idx_in_output_block];
+    for (const auto & column_info : schemer.primitive_columns)
+    {
+        size_t idx = column_info.idx_in_output_block;
+        if (idx >= sample.columns() || primitives[idx] != 1 || !column_info.decoder.allow_stats)
+            continue;
+        const IDataType & output_block_type = *sample.getByPosition(idx).type;
+        bool nullable = column_info.levels.back().def > 0;
+        bool null_as_default = ext.read_options.format.null_as_default && !column_info.output_nullable;
+        for (size_t u = 0; u < metadata.row_groups.size(); ++u)
+        {
+            const auto & column_meta = metadata.row_groups[u].columns.at(column_info.column_idx).meta_data;
+            if (!column_meta.__isset.statistics)
+                continue;
+            Range range = Range::createWholeUniverse();
+            bool always_null = column_meta.statistics.__isset.null_count && column_meta.statistics.null_count == column_meta.num_values;
+            bool can_be_null = !column_meta.statistics.__isset.null_count || column_meta.statistics.null_count != 0;
+            if (nullable && always_null)
+            {
+                if (null_as_default)
+                    range.right = range.left = output_block_type.getDefault();
+                else
+                    range.right = range.left;
+                out[idx][u] = range;
+                continue;
+            }
+            try
+            {
+                if (column_meta.statistics.__isset.min_value)
+                    column_info.decoder.decodeField(column_meta.statistics.min_value, /* is_max= */ false, *column_info.decoded_type,
+                                                    output_block_type, range.left);
+                if (column_meta.statistics.__isset.max_value)
+                    column_info.decoder.decodeField(column_meta.statistics.max_value, /* is_max= */ true, *column_info.decoded_type,
+                                                    output_block_type, range.right);
+            }
+            catch (const Exception &)
+            {
+                continue;
+            }
+            if (accurateLess(range.right, range.left))
+                continue;
+            if (nullable && can_be_null)
+            {
+                if (null_as_default)
+                {
+                    Field default_value = output_block_type.getDefault();
+                    if (!range.left.isNull() && accurateLess(default_value, range.left))
+                        range.left = default_value;
+                    if (!range.right.isNull() && accurateLess(range.right, default_value))
+                        range.right = default_value;
+                }
+                else if (!range.left.isNull() && !range.right.isNull())
+                    range.left = NEGATIVE_INFINITY;
+            }
+            else
+            {
+                if (range.left.isNull())
+                    range.left_included = false;
+                if (range.right.isNull())
+                    range.right_included = false;
+            }
+            out[idx][u] = range;
+        }
+    }
+    return out;
+}
+
+/// A listed file's summary, of its footer as read from the file
+String ownSummaryBytes(const ExternalTable & ext, const ListedFile & listed)
+{
+    auto footer = fullFooter(ext, listed);
+    const auto & resolved = *listed.resolved;
+    WriteBufferFromOwnString out;
+    writeBinary(OWN_SUMMARY_FORMAT, out);
+    writeBinary(static_cast<UInt8>(ext.format), out);
+    writeVarUInt(listed.size, out);
+    writeVarUInt(footer->unit_rows.size(), out);
+    for (UInt64 rows : footer->unit_rows)
+        writeVarUInt(rows, out);
+    writeVarUInt(resolved.schema.size(), out);
+    for (const auto & column : resolved.schema)
+    {
+        writeStringBinary(column.name, out);
+        writeStringBinary(column.type->getName(), out);
+    }
+    UInt64 body = 0;
+    UInt64 fields = 0;
+    if (footer->arrow)
+    {
+        for (const auto & block : footer->arrow->record_batch_blocks)
+            body += static_cast<UInt64>(std::max<Int64>(block.body_length, 0));
+        fields = footer->arrow->schema.fields.size();
+    }
+    writeVarUInt(body, out);
+    writeVarUInt(fields, out);
+
+    std::vector<size_t> present;
+    Names names;
+    for (size_t i = 0; i < ext.columns.size(); ++i)
+        if (!resolved.isAbsent(i))
+        {
+            present.push_back(i);
+            names.push_back(ext.columns[i].name);
+        }
+    std::vector<std::vector<std::optional<Range>>> ranges;
+    if (footer->parquet)
+        ranges = parquetRanges(ext, *footer->parquet, fileHeader(ext, resolved, names));
+    writeVarUInt(present.size(), out);
+    for (size_t k = 0; k < present.size(); ++k)
+    {
+        size_t i = present[k];
+        const String & file_name = resolved.names[i];
+        writeStringBinary(file_name, out);
+        writeStringBinary(fileReadType(ext, resolved, i)->getName(), out);
+        UInt64 compressed = 0;
+        UInt64 uncompressed = 0;
+        FileColumnStats s;
+        if (footer->parquet)
+        {
+            for (const auto & row_group : footer->parquet->row_groups)
+                for (const auto & chunk : row_group.columns)
+                {
+                    const auto & path = chunk.meta_data.path_in_schema;
+                    if (path.empty() || path.front() != file_name)
+                        continue;
+                    compressed += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_compressed_size, 0));
+                    uncompressed += static_cast<uint64_t>(std::max<Int64>(chunk.meta_data.total_uncompressed_size, 0));
+                }
+            s = parquetFileStats(ext, resolved, *footer->parquet, i);
+        }
+        writeVarUInt(compressed, out);
+        writeVarUInt(uncompressed, out);
+        writeBinary(UInt8((s.counted ? 1 : 0) | (s.bounded ? 2 : 0)), out);
+        if (s.counted)
+        {
+            writeVarUInt(s.rows, out);
+            writeVarUInt(s.nulls, out);
+        }
+        if (s.bounded)
+        {
+            writeFieldBinary(s.min, out);
+            writeFieldBinary(s.max, out);
+        }
+        size_t n = 0;
+        if (!ranges.empty())
+            for (const auto & range : ranges[k])
+                n += range.has_value();
+        writeVarUInt(n, out);
+        for (size_t u = 0; n > 0 && u < ranges[k].size(); ++u)
+            if (const auto & range = ranges[k][u])
+            {
+                writeVarUInt(u, out);
+                writeRangeEnd(range->left, range->left_included, out);
+                writeRangeEnd(range->right, range->right_included, out);
+            }
+    }
+    out.finalize();
+    return std::move(out.str());
+}
+
+/// A summary's bytes read; none where they are of another format, or do not read
+std::shared_ptr<const OwnSummary> parseOwnSummary(const void * data, size_t size)
+{
+    if (!data || size == 0)
+        return nullptr;
+    try
+    {
+        ReadBufferFromMemory in(static_cast<const char *>(data), size);
+        UInt8 byte;
+        readBinary(byte, in);
+        if (byte != OWN_SUMMARY_FORMAT)
+            return nullptr;
+        auto s = std::make_shared<OwnSummary>();
+        readBinary(byte, in);
+        s->format = byte;
+        readVarUInt(s->file_size, in);
+        UInt64 n;
+        readVarUInt(n, in);
+        s->unit_rows.resize(n);
+        for (auto & rows : s->unit_rows)
+            readVarUInt(rows, in);
+        readVarUInt(n, in);
+        for (UInt64 k = 0; k < n; ++k)
+        {
+            String name;
+            String type;
+            readStringBinary(name, in);
+            readStringBinary(type, in);
+            s->schema.emplace_back(name, typeNamed(type));
+        }
+        readVarUInt(s->arrow_body, in);
+        readVarUInt(s->arrow_fields, in);
+        readVarUInt(n, in);
+        for (UInt64 k = 0; k < n; ++k)
+        {
+            String name;
+            readStringBinary(name, in);
+            auto & c = s->columns[name];
+            readStringBinary(c.type, in);
+            readVarUInt(c.compressed, in);
+            readVarUInt(c.uncompressed, in);
+            readBinary(byte, in);
+            c.counted = (byte & 1) != 0;
+            c.bounded = (byte & 2) != 0;
+            if (c.counted)
+            {
+                readVarUInt(c.rows, in);
+                readVarUInt(c.nulls, in);
+            }
+            if (c.bounded)
+            {
+                c.min = readFieldBinary(in);
+                c.max = readFieldBinary(in);
+            }
+            UInt64 nranges;
+            readVarUInt(nranges, in);
+            if (nranges > 0)
+                c.ranges.resize(s->unit_rows.size());
+            for (UInt64 r = 0; r < nranges; ++r)
+            {
+                UInt64 u;
+                readVarUInt(u, in);
+                Range range = Range::createWholeUniverse();
+                Field left;
+                Field right;
+                readRangeEnd(in, left, range.left_included);
+                readRangeEnd(in, right, range.right_included);
+                range.left = left;
+                range.right = right;
+                if (u < c.ranges.size())
+                    c.ranges[u] = std::move(range);
+            }
+        }
+        return s;
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+/// A part's summary read once a table: by its file's path, which its part's name makes unique
+std::shared_ptr<const OwnSummary> summaryOf(ExternalTable & table, const String & path, const void * data, size_t size)
+{
+    auto it = table.summaries.find(path);
+    if (it != table.summaries.end() && it->second.first == size)
+        return it->second.second;
+    auto summary = parseOwnSummary(data, size);
+    if (table.summaries.size() >= MAX_FOOTERS)
+        table.summaries.clear();
+    table.summaries[path] = {size, summary};
+    return summary;
+}
+
+/// A file as the table reads it, from its part's summary: its schema the summary's, its footer read where a reader needs it
+std::shared_ptr<const ResolvedFile> resolveSummary(ExternalTable & table, const String & path, UInt64 size, Int64 mtime,
+                                                   std::shared_ptr<const OwnSummary> summary)
+{
+    auto it = table.resolved.find(path);
+    if (it != table.resolved.end() && it->second->footer->size == size && it->second->footer->mtime == mtime)
+        return it->second;
+    auto footer = std::make_shared<ExternalFooter>();
+    footer->size = size;
+    footer->mtime = mtime;
+    footer->unit_rows = summary->unit_rows;
+    for (UInt64 rows : footer->unit_rows)
+        footer->rows += rows;
+    auto file = std::make_shared<ResolvedFile>();
+    file->schema = summary->schema;
+    footer->summary = std::move(summary);
+    file->footer = std::move(footer);
+    resolveColumns(table, *file, "file " + path);
+    table.resolved[path] = file;
+    return file;
+}
+
 }
 
 }
@@ -1776,6 +2288,73 @@ extern "C" int chte_own_list(chte_table * table, const char * const * paths, siz
         l->table = table->external;
         listFiles(*l, files);
         *listing = l.release();
+    });
+}
+
+extern "C" int chte_own_list_summaries(chte_table * table, const char * const * paths, const void * const * summaries,
+                                       const size_t * sizes, size_t npaths, chte_external_listing ** listing, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = ownOf(table);
+        auto l = std::make_unique<chte_external_listing>();
+        l->table = table->external;
+        UInt64 first_row = 0;
+        for (size_t i = 0; i < npaths; ++i)
+        {
+            struct stat st;
+            if (stat(paths[i], &st) != 0)
+                throw ErrnoException(ErrorCodes::CANNOT_STAT, "Cannot stat {}", paths[i]);
+            auto [size, mtime] = statIdentity(st);
+            ListedFile file;
+            file.path = paths[i];
+            file.size = size;
+            file.mtime = mtime;
+            file.first_row = first_row;
+            /// a summary of another file's, or unreadable, as none: the footer read
+            auto summary = summaries && summaries[i] ? summaryOf(ext, file.path, summaries[i], sizes[i]) : nullptr;
+            if (summary && summary->file_size == size && summary->format == ext.format)
+            {
+                if (specCheck())
+                {
+                    CheckingReads checking_reads;
+                    auto footer = footerOf(ext, file.path, size, mtime);
+                    auto schema = fileSchema(ext, *footer);
+                    bool same = footer->unit_rows == summary->unit_rows && schema.size() == summary->schema.size();
+                    auto b = summary->schema.begin();
+                    for (auto a = schema.begin(); same && a != schema.end(); ++a, ++b)
+                        same = a->name == b->name && a->type->getName() == b->type->getName();
+                    if (!same)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: its summary's units or columns are not its footer's",
+                                        file.path);
+                }
+                file.resolved = resolveSummary(ext, file.path, size, mtime, std::move(summary));
+            }
+            else
+                file.resolved = resolve(ext, file.path, size, mtime);
+            file.rows = file.resolved->footer->rows;
+            file.units = file.resolved->footer->unit_rows.size();
+            first_row += file.rows;
+            l->files.push_back(std::move(file));
+        }
+        *listing = l.release();
+    });
+}
+
+extern "C" uint64_t chte_footers_read(void)
+{
+    return footers_read.load(std::memory_order_relaxed);
+}
+
+extern "C" int chte_own_summary(chte_table * table, chte_external_listing * listing, size_t file, const void ** bytes,
+                                size_t * size, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto & ext = ownOf(table);
+        ext.summary_bytes = ownSummaryBytes(ext, listedFile(*listing, file));
+        *bytes = ext.summary_bytes.data();
+        *size = ext.summary_bytes.size();
     });
 }
 
@@ -1991,7 +2570,8 @@ extern "C" int chte_own_file_layout(chte_table * table, chte_external_listing * 
     {
         auto & ext = ownOf(table);
         const auto & listed = listedFile(*listing, file);
-        const auto & footer = *listed.resolved->footer;
+        auto full = fullFooter(ext, listed);
+        const auto & footer = *full;
         *layout = {};
         layout->units = static_cast<uint32_t>(footer.unit_rows.size());
         layout->rows = footer.rows;

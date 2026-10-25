@@ -8,6 +8,7 @@
 
 #include "internal.h"
 
+#include <Core/Range.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatSettings.h>
 #include <IO/ReadBufferFromFile.h>
@@ -49,7 +50,39 @@ struct ExternalColumn
     bool check_utf8 = false;
 };
 
-/// A file's footer, as read once in the process for a format, a path, a size and a modification time
+/// VC25: a column of a table of its own files' part's summary: the type its statistics are of -- the one the table
+/// reads it as -- its bytes, its file's statistics as parquetStats() reads them, and each unit's range of its values
+/// as the Parquet reader's pruning reads its row group's statistics (none: no statistics of it)
+struct OwnSummaryColumn
+{
+    String type;
+    UInt64 compressed = 0;
+    UInt64 uncompressed = 0;
+    bool counted = false;    /// rows and NULLs known
+    UInt64 rows = 0;
+    UInt64 nulls = 0;
+    bool bounded = false;    /// the least and greatest values exact
+    Field min;
+    Field max;
+    std::vector<std::optional<Range>> ranges;
+};
+
+/// VC25: a table of its own files' part's summary (chte_own_summary), which the caller keeps in the part's catalog row
+/// and lists the part by, its file not read: the file's format and size, its units' rows, its columns as the readers
+/// infer them, an Arrow file's batches' bodies, and each column's own (by the file's name of it)
+struct OwnSummary
+{
+    int format = 0;
+    UInt64 file_size = 0;
+    std::vector<UInt64> unit_rows;
+    NamesAndTypesList schema;
+    UInt64 arrow_body = 0;
+    UInt64 arrow_fields = 0;
+    std::map<String, OwnSummaryColumn> columns;
+};
+
+/// A file's footer, as read once in the process for a format, a path, a size and a modification time -- or, a table
+/// of its own files' part listed from its summary (VC25), the summary alone, the footer read where a reader needs it
 struct ExternalFooter
 {
     UInt64 size = 0;
@@ -59,6 +92,7 @@ struct ExternalFooter
     /// each unit's rows, and their sum
     std::vector<UInt64> unit_rows;
     UInt64 rows = 0;
+    std::shared_ptr<const OwnSummary> summary;
 };
 
 /// A file as a table reads it: its footer, and each of the table's columns resolved in it
@@ -130,19 +164,28 @@ public:
     std::map<String, std::shared_ptr<const OwnRowIds>> row_ids;
     /// chte_own_file_layout's codec, until the next call
     String layout_codec;
+    /// VC25: the parts' summaries read so far, by path, with the bytes' size each was read from; and
+    /// chte_own_summary's bytes, until the next call
+    std::map<String, std::pair<size_t, std::shared_ptr<const OwnSummary>>> summaries;
+    String summary_bytes;
 
     const ExternalColumn & column(const String & caller_name) const { return columns[columnIndex(caller_name)]; }
     size_t columnIndex(const String & caller_name) const;
 };
 
 /// A listed file opened for reading, its identity checked against the listing's
-std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 size, Int64 mtime);
+std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 size, Int64 mtime,
+                                                    size_t buffer_size = DBMS_DEFAULT_BUFFER_SIZE);
 
 /// Shared resources of one reader that start no thread
 FormatParserSharedResourcesPtr singleThreadedResources(const ContextPtr & context);
 
 /// A file's footer of the table's format -- Parquet's for an Iceberg table's data file -- read once for its identity
 std::shared_ptr<const ExternalFooter> footerOf(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime);
+
+/// A listed file's footer as read from the file: the listing's, or, a part listed from its summary (VC25), read now
+/// (or found kept), its units' rows the summary's
+std::shared_ptr<const ExternalFooter> fullFooter(const ExternalTable & table, const ListedFile & listed);
 
 /// The table's columns found in file->schema, a file's or an Iceberg table's (where, for the errors), each
 /// checked to take its values: file->names, file_types and nullable
@@ -176,7 +219,8 @@ DataTypePtr fileReadType(const ExternalTable & table, const ResolvedFile & file,
 /// arrow.cpp: an Arrow IPC file's footer -- its schema, its record batches and each one's rows -- and its
 /// columns as ClickHouse infers them; a reader of its record batches, or of its rows at offsets; the bytes of
 /// the asked columns, from the batches' bodies; ClickHouse's Arrow IPC writer, for the tests' files
-std::shared_ptr<ExternalFooter> readArrowFooter(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime);
+std::shared_ptr<ExternalFooter> readArrowFooter(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime,
+                                                const std::vector<UInt64> * unit_rows = nullptr);
 NamesAndTypesList arrowFileSchema(const ExternalTable & table, const ExternalFooter & footer);
 std::unique_ptr<chte_reader> openArrowReader(chte_table & table, std::shared_ptr<const ResolvedFile> resolved,
                                              const ListedFile & listed, const Names & names,

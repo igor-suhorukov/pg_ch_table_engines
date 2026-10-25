@@ -465,6 +465,15 @@ extern double ch_fetch_price(Relation rel, int ncols);
 /* vexec.c: vexec's batch source and sink (§3) */
 extern void ch_vexec_register(void);
 
+/* streams.c: MergeTree parts' streams by granule run, kept in shared memory for a GPU's units (VC29) */
+extern int	ch_device_streams;
+extern void ch_streams_init(void);
+extern bool ch_streams_find(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, int ncols,
+							const AttrNumber *attnums, uint64 *rows, chte_part_stream **streams, size_t *nstreams);
+extern void ch_streams_keep(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, int ncols,
+							const AttrNumber *attnums, const chte_part_streams *ps);
+extern void ch_streams_described(void);
+
 /* own.c: tables of their own files (§2.18, CH8) */
 extern void ch_own_table_setup(Relation rel, TupleDesc desc, ChTable *t);
 extern void ch_own_write_part(Relation rel, ChTable *t, const ChStorageId *id, ChVectorBuilder *builder,

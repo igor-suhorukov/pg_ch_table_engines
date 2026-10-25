@@ -186,6 +186,22 @@ CREATE FUNCTION ch.fetch_stats(OUT fetches bigint, OUT columns bigint, OUT whole
 							   OUT kept bigint, OUT located bigint)
 	AS 'MODULE_PATHNAME', 'ch_fetch_stats' LANGUAGE C STRICT VOLATILE;
 
+-- MergeTree parts' streams kept in shared memory for a GPU's units (ch_table_engines.md
+-- §3, VC29): the entries kept now, NULL where none can be -- the extension not
+-- preloaded, or ch.device_streams 0 -- this session's runs of granules found
+-- among them and described by the engine library, and the parts the library
+-- has loaded in the session's process.
+CREATE FUNCTION ch.device_streams(OUT kept integer, OUT found bigint, OUT described bigint,
+								  OUT parts_loaded bigint)
+	AS 'MODULE_PATHNAME', 'ch_device_streams_info' LANGUAGE C STRICT VOLATILE;
+
+-- The footers of Parquet and Arrow files the session's process has read from
+-- them (ch_table_engines.md §3, VC25), each file's at its first use in the
+-- process: a table of its own files is planned from its parts' summaries, its
+-- files' footers read by its units' readers alone.
+CREATE FUNCTION ch.footers_read() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_footers_read' LANGUAGE C VOLATILE;
+
 -- The deletions every snapshot sees, folded into their parts (§2.10): each
 -- part holding their rows written again without them, their tombstones
 -- gone.  Returns the rows folded.

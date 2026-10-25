@@ -790,7 +790,8 @@ ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys)
 /*
  * A part's statistics of a column: its summary's (VC20's B6) where it has
  * one, else the part's, loaded.  The part's summary is read into it once
- * (ch_part_summary()), its list's own copy of the part's row.
+ * (ch_part_summary()), its list's own copy of the part's row.  A table of its
+ * own files' part, whose summary is its file's (VC25), the listing's.
  */
 static bool
 part_stats(ChTable *t, const ChPart *part, AttrNumber attnum, chte_column_stats *st)
@@ -800,7 +801,7 @@ part_stats(ChTable *t, const ChPart *part, AttrNumber attnum, chte_column_stats 
 	int			found = 0;
 
 	snprintf(name, sizeof(name), "c%d", attnum);
-	if (ch_enable_part_summaries && eng->summary_stats != NULL && part->summary != NULL)
+	if (ch_enable_part_summaries && eng->summary_stats != NULL && part->summary != NULL && part->listing == NULL)
 	{
 		bytea	   *summary = ch_part_summary((ChPart *) part);
 

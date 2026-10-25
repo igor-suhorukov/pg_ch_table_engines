@@ -233,6 +233,9 @@ _PG_init(void)
 								 true,
 								 PGC_POSTMASTER, 0,
 								 NULL, NULL, NULL);
+	/* the parts' streams for a GPU's units, in the postmaster's shared memory (VC29) */
+	if (process_shared_preload_libraries_in_progress)
+		ch_streams_init();
 	DefineCustomEnumVariable("ch.engine_functions",
 							 "Which of ClickHouse's functions a process registers as it first loads the engine library.",
 							 "used: those the filters use, the others as a table's definition, a write, a merge "
@@ -297,9 +300,9 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 	DefineCustomBoolVariable("ch.enable_part_summaries",
 							 "Whether the planner and a scan take a part's columns' sizes and statistics from "
-							 "its summary in ch.parts.",
+							 "its summary in ch.parts, and a table of its own files' part its file's footer.",
 							 "Off, a part is loaded through ClickHouse, in each process, the first time they are "
-							 "asked of it; its summary is written either way.",
+							 "asked of it, and a part's file's footer read; its summary is written either way.",
 							 &ch_enable_part_summaries,
 							 true,
 							 PGC_USERSET, 0,

@@ -76,6 +76,11 @@
 #                discards every cache wherever an invalidation may be taken
 #   CHTE_PRELOAD the suite's preloaded libraries, on the port's single node
 #                with the port's modules: ch_table_engines,gp_core,gp_orca
+#   CHTE_SPEC_CHECK  set, and not 0: each table the servers open from its
+#                definition's parts (VC21) is opened from its CREATE TABLE too
+#                and the two compared, and what a part's summary answers
+#                (VC25) compared with its file's footer, a difference the
+#                statement's error; the suite's servers check unless it is 0
 #   PG_SRC      the checkout of PostgreSQL the images take PostgreSQL's TAP
 #                modules from: ~/.cache/pg_accel/postgres
 #   CHTE_PORT_COMMIT  the port's commit its images were built from:

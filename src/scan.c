@@ -503,12 +503,13 @@ claim_one_unit(ChScanDesc scan)
 }
 
 /*
- * Whether the filter rules the claimed unit's part out by the part's summary
- * (VC20's B7), as chte_part_select() would by its statistics -- the part
- * then neither attached nor loaded.
+ * What the filter keeps of the claimed unit's part by the part's summary
+ * (VC20's B7), as chte_part_select() would by its statistics and its key:
+ * CHTE_SELECT_NONE or CHTE_SELECT_ALL, the part then neither attached nor
+ * loaded, or CHTE_SELECT_RANGES, chte_part_select()'s to tell.
  */
-static bool
-summary_rules_out(ChScanDesc scan)
+static int
+summary_verdict(ChScanDesc scan)
 {
 	const ChEngine *eng = ch_engine();
 	bytea	   *summary = NULL;
@@ -516,24 +517,31 @@ summary_rules_out(ChScanDesc scan)
 
 	if (scan->filter == NULL || !ch_enable_summary_pruning || eng->filter_summary_select == NULL ||
 		scan->part->listing != NULL)
-		return false;
+		return CHTE_SELECT_RANGES;
 	if (ch_enable_part_summaries)
 		summary = ch_part_summary(scan->part);
 	CH_CALL("analyzing a part",
 			eng->filter_summary_select(scan->filter, scan->part->name, summary ? VARDATA_ANY(summary) : NULL,
 									   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
-	return verdict == CHTE_SELECT_NONE;
+	return verdict;
 }
 
 /* The claimed unit's granules the filter keeps, and their rows */
 static void
 select_unit(ChScanDesc scan)
 {
+	int			verdict;
+
 	if (scan->selected)
 		return;
-	if (scan->filter == NULL && scan->unit_whole)
+	verdict = scan->filter == NULL ? CHTE_SELECT_ALL : summary_verdict(scan);
+	/*
+	 * The whole part: no call -- where the filter keeps every granule by its
+	 * summary too (VC29, pg_accel's §3.28 W16), so that a GPU's unit, whose
+	 * streams are kept in shared memory, needs no load of the part here
+	 */
+	if (scan->unit_whole && verdict == CHTE_SELECT_ALL)
 	{
-		/* the whole part: no call */
 		scan->nranges = 0;
 		scan->unit_rows = scan->part->rows;
 		scan->counts.marks += scan->part->marks;
@@ -541,7 +549,7 @@ select_unit(ChScanDesc scan)
 		scan->selected = true;
 		return;
 	}
-	if (summary_rules_out(scan))
+	if (verdict == CHTE_SELECT_NONE)
 	{
 		/* none of its granules, counted as chte_part_select()'s none would be below */
 		scan->nranges = 0;

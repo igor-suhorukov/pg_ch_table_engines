@@ -236,19 +236,35 @@ struct ArrowRead
 
 }
 
-std::shared_ptr<ExternalFooter> readArrowFooter(const ExternalTable &, const String & path, UInt64 size, Int64 mtime)
+std::shared_ptr<ExternalFooter> readArrowFooter(const ExternalTable &, const String & path, UInt64 size, Int64 mtime,
+                                                const std::vector<UInt64> * unit_rows)
 {
     auto buf = openListed(path, size, mtime);
     auto footer = std::make_shared<ExternalFooter>();
     footer->size = size;
     footer->mtime = mtime;
     auto arrow = std::make_shared<ArrowIPC::ArrowFileFooter>(ArrowIPC::readArrowFileFooter(*buf, size));
-    /// each record batch's rows, from its message's metadata alone, as ClickHouse's schema reader counts them
-    ArrowIPC::MessageReader reader(*buf);
+    if (unit_rows && unit_rows->size() == arrow->record_batch_blocks.size())
+    {
+        /// VC25: a part's units' rows its summary's, its batches' messages not read for them
+        footer->unit_rows = *unit_rows;
+        for (UInt64 rows : footer->unit_rows)
+            footer->rows += rows;
+        footer->arrow = std::move(arrow);
+        return footer;
+    }
+    /// each record batch's rows, from its message's metadata alone, as ClickHouse's schema reader counts them:
+    /// read through a buffer of the largest message's metadata (VC25), where the footer's of a megabyte read one
+    /// a batch -- 154 MB a fresh backend's planning of ClickBench's two files
+    size_t metadata = 4096;
+    for (const auto & block : arrow->record_batch_blocks)
+        metadata = std::max<size_t>(metadata, static_cast<size_t>(std::max<Int64>(block.metadata_length, 0)));
+    auto messages = openListed(path, size, mtime, std::min<size_t>((metadata + 4095) / 4096 * 4096, DBMS_DEFAULT_BUFFER_SIZE));
+    ArrowIPC::MessageReader reader(*messages);
     for (const auto & block : arrow->record_batch_blocks)
     {
         ArrowIPC::MessageReader::Message msg;
-        const auto & batch = recordBatchAt(*buf, reader, block, msg, path);
+        const auto & batch = recordBatchAt(*messages, reader, block, msg, path);
         footer->unit_rows.push_back(static_cast<UInt64>(batch.length()));
         footer->rows += footer->unit_rows.back();
     }
@@ -287,6 +303,13 @@ std::unique_ptr<chte_reader> openArrowReader(chte_table & table, std::shared_ptr
                                              std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read)
 {
     auto & ext = *table.external;
+    /// VC25: a part listed from its summary read with its footer, which a reader alone needs
+    if (!resolved->footer->arrow)
+    {
+        auto full = std::make_shared<ResolvedFile>(*resolved);
+        full->footer = fullFooter(ext, listed);
+        resolved = std::move(full);
+    }
     auto state = std::make_shared<ArrowRead>();
     state->table = table.external;
     state->resolved = std::move(resolved);

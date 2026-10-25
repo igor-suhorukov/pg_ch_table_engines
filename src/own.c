@@ -165,17 +165,24 @@ tmp_part_dir(const ChStorageId *id, const char *tmp)
 	return path;
 }
 
-/* A file's rows, units and bytes, its footer read (and kept, for the scans that read it next) */
+/*
+ * A file's rows, units and bytes, its footer read (and kept, for the scans
+ * that read it next), and its summary (VC25) for its part's row, by which the
+ * part is listed without its file read; NULL where the library makes none
+ */
 static void
-file_info(ChTable *t, const char *path, int64 *rows, int32 *units, int64 *bytes)
+file_info(ChTable *t, const char *path, int64 *rows, int32 *units, int64 *bytes, bytea **summary)
 {
 	const ChEngine *eng = ch_engine();
 	chte_external_listing *handle;
 	chte_external_file info;
 	chte_error	err;
+	const void *data = NULL;
+	size_t		size = 0;
 
 	CH_CALL("reading a part's file", eng->own_list(t->handle, &path, 1, &handle, CH_ERR));
-	if (eng->external_file_info(handle, 0, &info, &err) != 0)
+	if (eng->external_file_info(handle, 0, &info, &err) != 0 ||
+		(eng->own_summary != NULL && eng->own_summary(t->handle, handle, 0, &data, &size, &err) != 0))
 	{
 		eng->external_listing_free(handle);
 		ch_engine_raise(&err, "reading a part's file");
@@ -183,6 +190,13 @@ file_info(ChTable *t, const char *path, int64 *rows, int32 *units, int64 *bytes)
 	*rows = (int64) info.rows;
 	*units = (int32) info.units;
 	*bytes = (int64) info.size;
+	*summary = NULL;
+	if (data != NULL && size > 0)
+	{
+		*summary = palloc(VARHDRSZ + size);
+		SET_VARSIZE(*summary, VARHDRSZ + size);
+		memcpy(VARDATA(*summary), data, size);
+	}
 	eng->external_listing_free(handle);
 }
 
@@ -202,7 +216,7 @@ store_own_part(Relation rel, ChTable *t, const char *tmp, ChPart *part, CommandI
 	struct stat st;
 
 	fsync_fname(from, true);
-	file_info(t, file, &part->rows, &part->marks, &part->bytes);
+	file_info(t, file, &part->rows, &part->marks, &part->bytes, &part->summary);
 	/* the files store logs a part's files before they get the part's name (§2.9) */
 	ch_store_part_written(rel, &t->storage, tmp, part->name);
 	if (stat(to, &st) == 0)

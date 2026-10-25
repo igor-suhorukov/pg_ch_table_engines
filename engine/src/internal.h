@@ -159,6 +159,16 @@ bool functionsRegistered(const Names & names);
 /// VC21: the table's projections described in its metadata, where they are not yet (table.cpp)
 void describeProjections(chte_table & table);
 
+/// VC29: the parts PgMergeTree::loadPart() has loaded in the process (chte_parts_loaded)
+uint64_t partsLoaded();
+
+/// VC21: a type by its name as DataTypeFactory reads it, read once a process (table.cpp)
+DataTypePtr typeNamed(const String & name);
+
+/// Whether CHTE_SPEC_CHECK in the environment, the tests', names a check -- set, neither empty nor 0 -- of what
+/// VC21's and VC25's parts make against what a definition's query and a file's footer make, a difference an error
+bool specCheck();
+
 void setError(chte_error * error, int code, const std::string & message) noexcept;
 
 /// Runs f; an exception becomes *error and a nonzero result.
@@ -540,4 +550,7 @@ struct chte_table
     /// VC21: the definition's projections, described in the metadata where a search by row id, an
     /// insert, a merge or a rewrite first needs them (chte::describeProjections); none: described
     DB::ASTPtr projections;
+    /// VC21: a table opened from its definition's parts (chte_table_open_spec): its projections'
+    /// declarations, read into projections as they are first described
+    std::vector<std::string> projection_texts;
 };

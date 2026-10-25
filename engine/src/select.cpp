@@ -468,7 +468,8 @@ namespace
 /// The summary a caller hands with a part's name; nullptr where there is none of this format.
 std::shared_ptr<const PartSummary> summaryOf(chte_table & table, const char * part_name, const void * summary, size_t size)
 {
-    if (!part_name || !summary || size == 0)
+    /// an external table's, or one of its own files' -- whose parts' summaries are their files' (VC25) -- none
+    if (!part_name || !summary || size == 0 || !table.storage)
         return nullptr;
     return table.storage->partSummary(part_name, summary, size);
 }

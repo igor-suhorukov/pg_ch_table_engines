@@ -267,6 +267,18 @@ ch_engine(void)
 	/* optional: a library built before VC12 registers every function in chte_init */
 	*(void **) &engine.register_all_functions = dlsym(handle, "chte_register_all_functions");
 	*(void **) &engine.function_count = dlsym(handle, "chte_function_count");
+	/* optional: a library built before VC21 opens a table from its CREATE TABLE alone */
+	*(void **) &engine.table_open_spec = dlsym(handle, "chte_table_open_spec");
+	*(void **) &engine.parts_loaded = dlsym(handle, "chte_parts_loaded");
+	/* optional: a library built before VC25 reads a table of its own files' footers at each listing */
+	*(void **) &engine.own_summary = dlsym(handle, "chte_own_summary");
+	*(void **) &engine.own_list_summaries = dlsym(handle, "chte_own_list_summaries");
+	if (engine.own_summary == NULL || engine.own_list_summaries == NULL)
+	{
+		engine.own_summary = NULL;
+		engine.own_list_summaries = NULL;
+	}
+	*(void **) &engine.footers_read = dlsym(handle, "chte_footers_read");
 	/* optional: a library built before VC2 reads no step, its columns all at once */
 	*(void **) &engine.read_begin_steps = dlsym(handle, "chte_read_begin_steps");
 	*(void **) &engine.read_step = dlsym(handle, "chte_read_step");

@@ -228,23 +228,21 @@ column_name(int attnum)
 	return psprintf("c%d", attnum);
 }
 
-/* A column list option's PostgreSQL names as ClickHouse's */
-static char *
-translate_columns(Relation rel, const char *option, const char *list, bool tuple)
+/* A column list option's PostgreSQL names as ClickHouse's: *n of them, palloc'd */
+static const char **
+translated_columns(Relation rel, const char *option, const char *list, size_t *n)
 {
 	char	   *copy = pstrdup(list);
 	List	   *names;
 	ListCell   *lc;
-	StringInfoData buf;
-	bool		first = true;
+	const char **out;
 
 	if (!SplitIdentifierString(copy, ',', &names))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid value for option \"%s\": \"%s\"", option, list)));
-	initStringInfo(&buf);
-	if (tuple)
-		appendStringInfoChar(&buf, '(');
+	out = palloc(sizeof(char *) * Max(list_length(names), 1));
+	*n = 0;
 	foreach(lc, names)
 	{
 		char	   *name = lfirst(lc);
@@ -270,14 +268,35 @@ translate_columns(Relation rel, const char *option, const char *list, bool tuple
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("column \"%s\" named in option \"%s\" does not exist", name, option)));
-		if (!first)
-			appendStringInfoString(&buf, ", ");
-		appendStringInfoString(&buf, column_name(attnum));
-		first = false;
+		out[(*n)++] = column_name(attnum);
 	}
+	return out;
+}
+
+/* Names joined by ", ", and in parentheses where tuple */
+static char *
+joined(const char *const *names, size_t n, bool tuple)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	if (tuple)
+		appendStringInfoChar(&buf, '(');
+	for (size_t i = 0; i < n; i++)
+		appendStringInfo(&buf, "%s%s", i > 0 ? ", " : "", names[i]);
 	if (tuple)
 		appendStringInfoChar(&buf, ')');
 	return buf.data;
+}
+
+/* A column list option's PostgreSQL names as ClickHouse's, "c1, c3" or "(c1, c3)" */
+static char *
+translate_columns(Relation rel, const char *option, const char *list, bool tuple)
+{
+	size_t		n;
+	const char **names = translated_columns(rel, option, list, &n);
+
+	return joined(names, n, tuple);
 }
 
 static bool
@@ -372,22 +391,23 @@ ch_is_engine_column(Relation rel, const ChOptions *opts, const char *name)
 	return false;
 }
 
+/* The compression option as CODEC()'s arguments */
 static const char *
 codec(const char *compression)
 {
 	int			level;
 
 	if (pg_strcasecmp(compression, "none") == 0)
-		return "CODEC(NONE)";
+		return "NONE";
 	if (pg_strcasecmp(compression, "zstd") == 0)
-		return "CODEC(ZSTD(1))";
+		return "ZSTD(1)";
 	if (pg_strcasecmp(compression, "lz4hc") == 0)
-		return "CODEC(LZ4HC(9))";
+		return "LZ4HC(9)";
 	if (sscanf(compression, "zstd(%d)", &level) == 1)
-		return psprintf("CODEC(ZSTD(%d))", level);
+		return psprintf("ZSTD(%d)", level);
 	if (sscanf(compression, "lz4hc(%d)", &level) == 1)
-		return psprintf("CODEC(LZ4HC(%d))", level);
-	return "CODEC(LZ4)";
+		return psprintf("LZ4HC(%d)", level);
+	return "LZ4";
 }
 
 /* Whether settings, "name = value, ...", name a setting, as a word of its own */
@@ -511,23 +531,44 @@ ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind)
 	return ch_table_definition_for(rel, RelationGetDescr(rel), opts, kind, ch_table_row_plain(&id));
 }
 
-char *
-ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind,
-						const Bitmapset *plain)
-{
-	StringInfoData buf;
-	const char *c = codec(opts->compression);
+/*
+ * A relation's ClickHouse table as its definition's parts (VC21), from which
+ * the engine library builds it without ClickHouse's parser
+ * (chte_table_open_spec()), and its CREATE TABLE, the same table, which
+ * ch.definition() shows and a library built before VC21 compiles.  Its
+ * members point into memory of the current context.
+ */
+#define CH_SPEC_SETTINGS 5
 
-	initStringInfo(&buf);
-	appendStringInfoString(&buf, "CREATE TABLE t (");
+typedef struct ChTableSpec
+{
+	chte_table_spec spec;
+	chte_table_setting settings[CH_SPEC_SETTINGS];
+	const char *projections[1];
+} ChTableSpec;
+
+static void
+table_spec_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind, const Bitmapset *plain,
+			   ChTableSpec *ts)
+{
+	const char *c = codec(opts->compression);
+	chte_table_column *columns = palloc0(sizeof(chte_table_column) * (desc->natts + 1));
+	size_t		n = 0;
+	int			nsettings = 0;
+
+	memset(ts, 0, sizeof(*ts));
+	ts->spec.size = sizeof(chte_table_spec);
 	for (int i = 0; i < desc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 		ChColumn	col;
+		chte_table_column *out = &columns[n];
 
 		ch_column_for_table(rel, opts, att, &col);
 		if (col.kind == CH_COL_DROPPED)
 			continue;
+		out->name = column_name(att->attnum);
+		out->codec = c;
 		if (ch_is_engine_column(rel, opts, NameStr(att->attname)))
 		{
 			/* ClickHouse's engines take no Nullable version, sign or is_deleted column */
@@ -536,29 +577,45 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("column \"%s\" named by an option of %s must be NOT NULL",
 								NameStr(att->attname), ch_engine_name(kind))));
-			appendStringInfo(&buf, "%s %s %s, ", column_name(att->attnum), col.chtype, c);
+			out->type = pstrdup(col.chtype);
 		}
 		else if (col.low_cardinality)
-			appendStringInfo(&buf, "%s LowCardinality(Nullable(%s)) %s, ", column_name(att->attnum), col.chtype, c);
+			out->type = psprintf("LowCardinality(Nullable(%s))", col.chtype);
 		else if (stored_plain(opts, plain, desc, i, &col))
-			appendStringInfo(&buf, "%s %s %s, ", column_name(att->attnum), col.chtype, c);
+			out->type = pstrdup(col.chtype);
 		else
-			appendStringInfo(&buf, "%s Nullable(%s) %s, ", column_name(att->attnum), col.chtype, c);
+			out->type = psprintf("Nullable(%s)", col.chtype);
+		n++;
 	}
 	/* the row id, and the projection that finds a row by it (Appendix E) */
-	appendStringInfoString(&buf, CH_ROWID_COLUMN " UInt64 CODEC(T64, LZ4), ");
-	appendStringInfoString(&buf, "PROJECTION " CH_ROWID_PROJECTION " (SELECT " CH_ROWID_COLUMN ", _part_offset ORDER BY " CH_ROWID_COLUMN ")");
-	appendStringInfoString(&buf, ") ENGINE = ");
-	appendStringInfoString(&buf, ch_engine_name(kind));
+	columns[n].name = CH_ROWID_COLUMN;
+	columns[n].type = "UInt64";
+	columns[n].codec = "T64, LZ4";
+	n++;
+	ts->spec.columns = columns;
+	ts->spec.ncolumns = n;
+	ts->projections[0] = CH_ROWID_PROJECTION " (SELECT " CH_ROWID_COLUMN ", _part_offset ORDER BY " CH_ROWID_COLUMN ")";
+	ts->spec.projections = ts->projections;
+	ts->spec.nprojections = 1;
+
+	ts->spec.engine = ch_engine_name(kind);
 	switch (kind)
 	{
 		case CH_ENGINE_REPLACING:
 			if (opts->ver)
 			{
-				appendStringInfo(&buf, "(%s", translate_columns(rel, "ver", opts->ver, false));
-				if (opts->is_deleted)
-					appendStringInfo(&buf, ", %s", translate_columns(rel, "is_deleted", opts->is_deleted, false));
-				appendStringInfoChar(&buf, ')');
+				size_t		nver;
+				size_t		ndeleted = 0;
+				const char **ver = translated_columns(rel, "ver", opts->ver, &nver);
+				const char **deleted = opts->is_deleted ?
+					translated_columns(rel, "is_deleted", opts->is_deleted, &ndeleted) : NULL;
+				const char **args = palloc(sizeof(char *) * (nver + ndeleted));
+
+				memcpy(args, ver, sizeof(char *) * nver);
+				if (ndeleted > 0)
+					memcpy(args + nver, deleted, sizeof(char *) * ndeleted);
+				ts->spec.engine_args = args;
+				ts->spec.nengine_args = nver + ndeleted;
 			}
 			else if (opts->is_deleted)
 				ereport(ERROR,
@@ -568,34 +625,49 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 		case CH_ENGINE_SUMMING:
 		case CH_ENGINE_COALESCING:
 			if (opts->sum_columns)
-				appendStringInfo(&buf, "(%s)", translate_columns(rel, "sum_columns", opts->sum_columns, true));
+			{
+				ts->spec.engine_args = translated_columns(rel, "sum_columns", opts->sum_columns, &ts->spec.nengine_args);
+				ts->spec.engine_tuple = 1;
+			}
 			break;
 		case CH_ENGINE_COLLAPSING:
 			if (!opts->sign)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("%s needs option \"sign\"", ch_engine_name(kind))));
-			appendStringInfo(&buf, "(%s)", translate_columns(rel, "sign", opts->sign, false));
+			ts->spec.engine_args = translated_columns(rel, "sign", opts->sign, &ts->spec.nengine_args);
 			break;
 		case CH_ENGINE_VERSIONED_COLLAPSING:
 			if (!opts->sign || !opts->ver)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("%s needs options \"sign\" and \"ver\"", ch_engine_name(kind))));
-			appendStringInfo(&buf, "(%s, %s)", translate_columns(rel, "sign", opts->sign, false),
-							 translate_columns(rel, "ver", opts->ver, false));
+			{
+				size_t		nsign;
+				size_t		nver;
+				const char **sign = translated_columns(rel, "sign", opts->sign, &nsign);
+				const char **ver = translated_columns(rel, "ver", opts->ver, &nver);
+				const char **args = palloc(sizeof(char *) * (nsign + nver));
+
+				memcpy(args, sign, sizeof(char *) * nsign);
+				memcpy(args + nsign, ver, sizeof(char *) * nver);
+				ts->spec.engine_args = args;
+				ts->spec.nengine_args = nsign + nver;
+			}
 			break;
 		default:
 			break;
 	}
-	appendStringInfo(&buf, " ORDER BY %s",
-					 opts->order_by ? translate_columns(rel, "order_by", opts->order_by, true) : "tuple()");
+	if (opts->order_by)
+		ts->spec.order_by = translated_columns(rel, "order_by", opts->order_by, &ts->spec.norder_by);
 	if (opts->primary_key)
-		appendStringInfo(&buf, " PRIMARY KEY %s", translate_columns(rel, "primary_key", opts->primary_key, true));
-	appendStringInfo(&buf, " SETTINGS index_granularity = %d, allow_nullable_key = 1", opts->index_granularity);
+		ts->spec.primary_key = translated_columns(rel, "primary_key", opts->primary_key, &ts->spec.nprimary_key);
+
+	ts->settings[nsettings++] = (chte_table_setting) {"index_granularity", NULL, (uint64) opts->index_granularity};
+	ts->settings[nsettings++] = (chte_table_setting) {"allow_nullable_key", NULL, 1};
 	/* the parts are synced before their catalog rows commit, as PostgreSQL syncs */
-	appendStringInfo(&buf, ", fsync_after_insert = %d, fsync_part_directory = %d",
-					 enableFsync ? 1 : 0, enableFsync ? 1 : 0);
+	ts->settings[nsettings++] = (chte_table_setting) {"fsync_after_insert", NULL, enableFsync ? 1 : 0};
+	ts->settings[nsettings++] = (chte_table_setting) {"fsync_part_directory", NULL, enableFsync ? 1 : 0};
 	/*
 	 * ClickHouse's statistics of every column, "basic" alone: exact least and
 	 * greatest values and NULLs of each part, which part pruning and the
@@ -603,13 +675,59 @@ ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChE
 	 * which nothing of the extension's reads.
 	 */
 	if (!opts->settings || !mentions_setting(opts->settings, "auto_statistics_types"))
-		appendStringInfoString(&buf, ", auto_statistics_types = 'basic'");
+		ts->settings[nsettings++] = (chte_table_setting) {"auto_statistics_types", "basic", 0};
+	Assert(nsettings <= CH_SPEC_SETTINGS);
+	ts->spec.settings = ts->settings;
+	ts->spec.nsettings = nsettings;
 	if (opts->settings && opts->settings[0])
 	{
 		check_user_settings(opts->settings);
-		appendStringInfo(&buf, ", %s", opts->settings);
+		ts->spec.user_settings = opts->settings;
 	}
+}
+
+/* The CREATE TABLE of a table's definition's parts */
+static char *
+table_spec_sql(const ChTableSpec *ts)
+{
+	const chte_table_spec *s = &ts->spec;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "CREATE TABLE t (");
+	for (size_t i = 0; i < s->ncolumns; i++)
+		appendStringInfo(&buf, "%s %s CODEC(%s), ", s->columns[i].name, s->columns[i].type, s->columns[i].codec);
+	for (size_t i = 0; i < s->nprojections; i++)
+		appendStringInfo(&buf, "%sPROJECTION %s", i > 0 ? ", " : "", s->projections[i]);
+	appendStringInfo(&buf, ") ENGINE = %s", s->engine);
+	if (s->nengine_args > 0)
+		appendStringInfo(&buf, "(%s)", joined(s->engine_args, s->nengine_args, s->engine_tuple != 0));
+	appendStringInfo(&buf, " ORDER BY %s", s->norder_by > 0 ? joined(s->order_by, s->norder_by, true) : "tuple()");
+	if (s->nprimary_key > 0)
+		appendStringInfo(&buf, " PRIMARY KEY %s", joined(s->primary_key, s->nprimary_key, true));
+	for (size_t i = 0; i < s->nsettings; i++)
+	{
+		const chte_table_setting *x = &s->settings[i];
+
+		appendStringInfoString(&buf, i == 0 ? " SETTINGS " : ", ");
+		if (x->string)
+			appendStringInfo(&buf, "%s = '%s'", x->name, x->string);
+		else
+			appendStringInfo(&buf, "%s = " UINT64_FORMAT, x->name, x->number);
+	}
+	if (s->user_settings)
+		appendStringInfo(&buf, ", %s", s->user_settings);
 	return buf.data;
+}
+
+char *
+ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind,
+						const Bitmapset *plain)
+{
+	ChTableSpec ts;
+
+	table_spec_for(rel, desc, opts, kind, plain, &ts);
+	return table_spec_sql(&ts);
 }
 
 /*
@@ -695,6 +813,8 @@ open_table(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cx
 	chte_table_def def;
 	StringInfoData cols;
 	ChExternalKind ext_kind;
+	ChTableSpec ts;
+	const ChEngine *eng;
 
 	if (ch_is_external_rel(rel, &ext_kind))
 		return open_external(rel, id, desc, cxt, ext_kind);
@@ -706,7 +826,11 @@ open_table(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cx
 	(void) ch_is_engine_rel(rel, &t->kind);
 	ch_relation_options(rel, &t->options);
 	t->relative_path = ch_storage_path(id, true);
-	t->definition = ch_table_definition_for(rel, desc, &t->options, t->kind, ch_table_row_plain(id));
+	/* the definition's parts in the caller's memory, the library's for the call alone */
+	MemoryContextSwitchTo(old);
+	table_spec_for(rel, desc, &t->options, t->kind, ch_table_row_plain(id), &ts);
+	MemoryContextSwitchTo(cxt);
+	t->definition = table_spec_sql(&ts);
 	t->natts = desc->natts;
 	t->columns = palloc0(sizeof(ChColumn) * Max(desc->natts, 1));
 	initStringInfo(&cols);
@@ -729,7 +853,15 @@ open_table(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cx
 		ch_pages_ops(t, &t->pages_ops);
 		def.pages = &t->pages_ops;
 	}
-	CH_CALL("opening the table in the engine library", ch_engine()->table_open(&def, &t->handle, CH_ERR));
+	/* VC21: its parts, where the library builds a table of them, without ClickHouse's parser */
+	eng = ch_engine();
+	if (eng->table_open_spec)
+	{
+		ts.spec.def = &def;
+		CH_CALL("opening the table in the engine library", eng->table_open_spec(&ts.spec, &t->handle, CH_ERR));
+	}
+	else
+		CH_CALL("opening the table in the engine library", eng->table_open(&def, &t->handle, CH_ERR));
 	return t;
 }
 
