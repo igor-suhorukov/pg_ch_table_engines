@@ -53,6 +53,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "common/hashfn.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "utils/array.h"
@@ -719,24 +720,74 @@ ch_filter_quals(ChTable *t, List *quals)
 }
 
 chte_filter *
-ch_filter_make(ChTable *t, List *quals)
+ch_filter_make(ChTable *t, List *quals, ChFilterKey *key)
 {
-	return ch_filter_make_keys(t, quals, 0, NULL);
+	return ch_filter_make_keys(t, quals, 0, NULL, key);
 }
 
-/* The quals' filter, ANDed with a hash join's keys (VC3) */
+/*
+ * VC31: the key of a filter of the nodes in prefix order -- its operators,
+ * columns and values, the table's definition the library compiled and the
+ * process's engine settings, what else a part's selection under it depends
+ * on -- two hashes of them
+ */
+static void
+filter_key(ChTable *t, List *nodes, ChFilterKey *key)
+{
+	StringInfoData k;
+	ListCell   *lc;
+
+	initStringInfo(&k);
+	foreach(lc, nodes)
+	{
+		Leaf	   *leaf = lfirst(lc);
+		int32		head[3] = {leaf->node.op, (int32) leaf->node.nargs, (int32) leaf->node.nvalues};
+
+		appendBinaryStringInfo(&k, head, sizeof(head));
+		if (leaf->node.column)
+			appendBinaryStringInfo(&k, leaf->node.column, strlen(leaf->node.column) + 1);
+		else
+			appendStringInfoChar(&k, '\0');
+		if (leaf->node.nvalues > 0)
+		{
+			appendBinaryStringInfo(&k, &leaf->values.len, sizeof(leaf->values.len));
+			appendBinaryStringInfo(&k, leaf->values.data, leaf->values.len);
+			if (leaf->offsets)
+				appendBinaryStringInfo(&k, leaf->offsets, sizeof(uint64) * (leaf->node.nvalues + 1));
+		}
+	}
+	if (t->definition)
+		appendBinaryStringInfo(&k, t->definition, strlen(t->definition) + 1);
+	if (ch_engine_settings)
+		appendBinaryStringInfo(&k, ch_engine_settings, strlen(ch_engine_settings) + 1);
+	key->h1 = hash_bytes_extended((const unsigned char *) k.data, k.len, UINT64CONST(0x9e3779b97f4a7c15));
+	key->h2 = hash_bytes_extended((const unsigned char *) k.data, k.len, UINT64CONST(0x632be59bd9b4e019));
+	if (key->h1 == 0 && key->h2 == 0)
+		key->h2 = 1;
+	pfree(k.data);
+}
+
+/*
+ * The quals' filter, ANDed with a hash join's keys (VC3); its key into *key
+ * where key is not NULL (VC31), none -- both hashes 0 -- where a join's keys
+ * are among its nodes, whose values change with each batch of the join's
+ * inner side
+ */
 chte_filter *
-ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys)
+ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys, ChFilterKey *key)
 {
 	MemoryContext cxt;
 	MemoryContext old;
 	List	   *nodes = NIL;
 	int			nquals = 0;
+	bool		joined = false;
 	ListCell   *lc;
 	chte_filter_node *array;
 	chte_filter *filter = NULL;
 	int			i = 0;
 
+	if (key)
+		key->h1 = key->h2 = 0;
 	if (!prunable(t))
 		return NULL;
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "ch filter", ALLOCSET_SMALL_SIZES);
@@ -759,10 +810,13 @@ ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys)
 		{
 			nodes = list_concat(nodes, q);
 			nquals++;
+			joined = true;
 		}
 	}
 	if (nquals > 1)
 		nodes = lcons(make_bool_node(CHTE_FILTER_AND, nquals), nodes);
+	if (nodes != NIL && key != NULL && !joined)
+		filter_key(t, nodes, key);
 	if (nodes != NIL)
 	{
 		array = palloc(sizeof(chte_filter_node) * list_length(nodes));

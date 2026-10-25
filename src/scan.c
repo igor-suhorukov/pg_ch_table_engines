@@ -71,6 +71,7 @@
 #include "storage/procarray.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -111,6 +112,7 @@ typedef struct ChScanDescData
 	uint32		unit_marks;		/* parallel: the granules of a unit */
 	uint32		nunits;
 	uint32		next_unit;		/* serial */
+	bool		claim_alone;	/* VC35: parallel, its participant the only one claiming: a part's units at once */
 
 	/* what is read: the columns, in the order set, the row id last when read */
 	int			ncols;
@@ -127,6 +129,7 @@ typedef struct ChScanDescData
 	uint8	   *step_read;		/* per step: read of the current batch */
 	bool		all_columns;	/* every column and the row id, as getnextslot reads */
 	chte_filter *filter;		/* NULL: every granule */
+	ChFilterKey filter_key;		/* VC31: its parts' selections' key */
 	ResourceOwner filter_owner;
 	List	   *filter_quals;	/* the quals it was made of */
 	int			njoin_keys;		/* VC3: a hash join's keys, ANDed with them */
@@ -482,6 +485,7 @@ claim_one_unit(ChScanDesc scan)
 		int			hi = scan->nparts - 1;
 		ChPart	   *part;
 		uint32		k;
+		uint32		last;
 
 		/* the part whose units hold u: the last one starting at u or before */
 		while (lo < hi)
@@ -496,10 +500,26 @@ claim_one_unit(ChScanDesc scan)
 		p = lo;
 		part = list_nth(scan->parts, p);
 		k = u - scan->unit_start[p];
-		scan->unit_whole = scan->unit_start[p + 1] - scan->unit_start[p] == 1;
+		/*
+		 * VC35 (pg_accel's §3.29 W32): the only participant claiming, a
+		 * device's owner, takes the rest of the part's units with u -- where
+		 * no other participant has claimed one since u, else u alone -- so
+		 * that its device units are cut as a serial scan's
+		 */
+		last = u + 1;
+		if (scan->claim_alone && scan->unit_start[p + 1] > last)
+		{
+			ChParallelScan *ps = (ChParallelScan *) scan->base.rs_parallel;
+			uint32		next = last;
+
+			if (pg_atomic_compare_exchange_u32(&ps->next_unit, &next, scan->unit_start[p + 1]))
+				last = scan->unit_start[p + 1];
+		}
+		scan->unit_whole = k == 0 && last == scan->unit_start[p + 1];
 		scan->unit_begin = scan->unit_whole ? 0 : k * scan->unit_marks;
-		scan->unit_end = scan->unit_whole || (k + 1) * scan->unit_marks >= (uint32) part->marks ?
-			0 : (k + 1) * scan->unit_marks;
+		scan->unit_end = scan->unit_whole || last == scan->unit_start[p + 1] ||
+			(last - scan->unit_start[p]) * scan->unit_marks >= (uint32) part->marks ?
+			0 : (last - scan->unit_start[p]) * scan->unit_marks;
 	}
 	scan->part = list_nth(scan->parts, p);
 	scan->selected = false;
@@ -566,14 +586,13 @@ select_unit(ChScanDesc scan)
 		scan->selected = true;
 		return;
 	}
-	if (scan->table->options.storage == CH_STORAGE_PAGES)
-		ch_pages_attach(scan->table, scan->part);
+	/* VC31: the part attached only where the library selects its granules, none kept */
 	for (;;)
 	{
 		size_t		n;
 
-		(void) ch_unit_select(scan->table, scan->part, scan->filter, scan->unit_begin, scan->unit_end,
-							  scan->ranges, scan->ranges_cap, &n, &scan->unit_rows);
+		(void) ch_unit_select(scan->table, scan->part, scan->filter, &scan->filter_key, scan->unit_begin,
+							  scan->unit_end, scan->ranges, scan->ranges_cap, &n, &scan->unit_rows);
 		if (n <= scan->ranges_cap)
 		{
 			scan->nranges = n;
@@ -603,7 +622,7 @@ select_unit(ChScanDesc scan)
 		size_t		n;
 		uint64		rows;
 
-		if (!ch_unit_select(scan->table, scan->part, scan->filter, 0, 0, NULL, 0, &n, &rows))
+		if (!ch_unit_select(scan->table, scan->part, scan->filter, &scan->filter_key, 0, 0, NULL, 0, &n, &rows))
 			scan->counts.parts_pruned++;
 	}
 	scan->selected = true;
@@ -629,7 +648,8 @@ refresh_filter(ChScanDesc scan)
 	}
 	old = MemoryContextSwitchTo(scan->scan_cxt);
 	scan->filter_owner = ch_handle_reserve();
-	scan->filter = ch_filter_make_keys(scan->table, scan->filter_quals, scan->njoin_keys, scan->join_keys);
+	scan->filter = ch_filter_make_keys(scan->table, scan->filter_quals, scan->njoin_keys, scan->join_keys,
+									   &scan->filter_key);
 	if (scan->filter)
 		ch_handle_opened(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
 	MemoryContextSwitchTo(old);
@@ -1249,7 +1269,7 @@ ch_scan_set_filter(TableScanDesc sscan, List *quals)
 	Assert(scan->part == NULL && scan->filter == NULL);
 	scan->filter_quals = list_copy(quals);
 	scan->filter_owner = ch_handle_reserve();
-	scan->filter = ch_filter_make(scan->table, quals);
+	scan->filter = ch_filter_make(scan->table, quals, &scan->filter_key);
 	if (scan->filter)
 		ch_handle_opened(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
 	return scan->filter != NULL;
@@ -1434,6 +1454,14 @@ ch_scan_set_unit_check(TableScanDesc sscan, ChUnitCheck check, void *arg)
 
 	scan->unit_check = check;
 	scan->unit_check_arg = arg;
+}
+
+void
+ch_scan_claim_alone(TableScanDesc sscan)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	scan->claim_alone = sscan->rs_parallel != NULL;
 }
 
 void
@@ -1890,15 +1918,100 @@ count_fetch(const FetchCols *cols, int rows)
 		ch_fetch_counts.whole += rows;
 }
 
+/* VC34: whether a part's rows may be read where they lie: a mergetree part's, the library able to */
+static bool
+point_reads_take(const ChTable *t, const ChPart *part)
+{
+	const ChEngine *eng = ch_engine();
+
+	return ch_enable_point_reads && eng->read_granule_rows != NULL && eng->part_streams_of != NULL &&
+		part->listing == NULL && !t->external && t->kind == CH_ENGINE_MERGETREE;
+}
+
+/*
+ * VC34: a mergetree part's rows of one granule read where they lie, into
+ * scan->reader -- each column's streams from the granule's marks, which
+ * chte_part_streams_of() gives over [g, g + 1) and streams.c keeps in shared
+ * memory for every process, as VC29 keeps the device's runs; the row id's
+ * under no attribute's number -- by the library's chte_read_granule_rows():
+ * false where it does not take them, the rows then read by chte_read_rows()
+ */
+static bool
+point_reader(ChTable *t, ChPart *part, const uint64 *offsets, int n, ChScanDescData *scan)
+{
+	const ChEngine *eng = ch_engine();
+	int			gran = t->options.index_granularity;
+	AttrNumber *attnums;
+	chte_part_stream *kept = NULL;
+	const chte_part_stream *streams;
+	size_t		nstreams = 0;
+	uint64		rows = 0;
+	uint32	   *granule_rows = NULL;
+	uint32		g;
+
+	if (!point_reads_take(t, part) || n <= 0)
+		return false;
+	/* the rows' granule: of index_granularity rows each, or the library's, where the part's are not */
+	if (gran > 0 && (int64) part->marks == (part->rows + gran - 1) / gran)
+	{
+		g = (uint32) (offsets[0] / (uint64) gran);
+		if (offsets[n - 1] / (uint64) gran != g)
+			return false;
+	}
+	else
+	{
+		uint64		first;
+		uint64		grows;
+
+		if (t->options.storage == CH_STORAGE_PAGES)
+			ch_pages_attach(t, part);
+		CH_CALL("finding a row's granule", eng->part_granule_of(t->handle, part->name, offsets[0], &g, &first, &grows, CH_ERR));
+		if (offsets[n - 1] >= first + grows)
+			return false;
+	}
+	attnums = palloc(sizeof(AttrNumber) * scan->ncols);
+	for (int c = 0; c < scan->ncols; c++)
+		attnums[c] = scan->attnos[c] < 0 ? 0 : (AttrNumber) (scan->attnos[c] + 1);
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, part);
+	if (ch_streams_find(t, part, g, g + 1, scan->ncols, attnums, &rows, &kept, &nstreams, &granule_rows))
+		streams = kept;
+	else
+	{
+		chte_part_streams ps;
+
+		CH_CALL("describing a part's columns for a fetch",
+				eng->part_streams_of(t->handle, part->name, scan->columns, g, g + 1, &ps, CH_ERR));
+		if (ps.refusal != NULL)
+		{
+			pfree(attnums);
+			return false;
+		}
+		ch_streams_keep(t, part, g, g + 1, scan->ncols, attnums, &ps);
+		streams = ps.streams;
+		nstreams = ps.nstreams;
+	}
+	CH_CALL("reading rows by their TIDs",
+			eng->read_granule_rows(t->handle, part->name, scan->columns, g, offsets, (size_t) n, streams, nstreams,
+								   &scan->reader, CH_ERR));
+	if (kept != NULL)
+		pfree(kept);
+	if (granule_rows != NULL)
+		pfree(granule_rows);
+	pfree(attnums);
+	return scan->reader != NULL;
+}
+
 /*
  * The rows of a part at the given offsets (ascending), those it holds, the
- * granules holding them read: each row materialized into rows[] in its
- * offset's order, of the columns cols names, the others NULL, its row id
- * into ids[].  Returns how many.
+ * granules holding them read -- or, point and VC34's, the rows where they lie
+ * (point_reader(), *pointed then set): each row materialized into rows[] in its
+ * offset's order, of the columns cols names, the others NULL, its row id into
+ * ids[].  Returns how many.
  */
 static int
-read_rows_at(Relation rel, ChTable *t, ChPart *part, const uint64 *offsets, int n, TupleDesc desc,
-			 const FetchCols *cols, HeapTuple *rows, uint64 *ids)
+read_rows_by(Relation rel, ChTable *t, ChPart *part, const uint64 *offsets, int n, TupleDesc desc,
+			 const FetchCols *cols, HeapTuple *rows, uint64 *ids, bool point, bool *pointed)
 {
 	const ChEngine *eng = ch_engine();
 	ChScanDescData scan;
@@ -1916,10 +2029,13 @@ read_rows_at(Relation rel, ChTable *t, ChPart *part, const uint64 *offsets, int 
 	scan.part = part;
 	scan.rowid_col = scan.asked_rowid;
 	owner = ch_handle_reserve();
+	*pointed = false;
 	if (part->listing)
 		CH_CALL("reading rows by their TIDs",
 				eng->external_read_rows(t->handle, part->listing->handle, (size_t) part->file, scan.columns, offsets,
 										n, &scan.reader, CH_ERR));
+	else if (point && point_reader(t, part, offsets, n, &scan))
+		*pointed = true;
 	else
 		CH_CALL("reading rows by their TIDs",
 				eng->read_rows(t->handle, part->name, scan.columns, offsets, n, &scan.reader, CH_ERR));
@@ -1955,6 +2071,71 @@ read_rows_at(Relation rel, ChTable *t, ChPart *part, const uint64 *offsets, int 
 	pfree(scan.missing);
 	pfree(scan.columns);
 	pfree(scan.columns_rowid);
+	return out;
+}
+
+/* CHTE_SPEC_CHECK: a row read where it lies that is not ClickHouse's reader's, its first column of another value */
+static void
+spec_row_differs(TupleDesc desc, HeapTuple got, HeapTuple want, uint64 offset, const ChPart *part)
+{
+	for (int a = 0; a < desc->natts; a++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, a);
+		bool		got_null;
+		bool		want_null;
+		Datum		g = heap_getattr(got, a + 1, desc, &got_null);
+		Datum		w = heap_getattr(want, a + 1, desc, &want_null);
+		Oid			out;
+		bool		varlena;
+
+		if (att->attisdropped || (got_null && want_null) ||
+			(got_null == want_null && datumIsEqual(g, w, att->attbyval, att->attlen)))
+			continue;
+		getTypeOutputInfo(att->atttypid, &out, &varlena);
+		elog(WARNING, "ch_table_engines: the row at offset " UINT64_FORMAT " of part %s read where it lies differs "
+			 "from ClickHouse's reader's in column %s: %s, where it is %s", offset, part->name, NameStr(att->attname),
+			 got_null ? "NULL" : OidOutputFunctionCall(out, g), want_null ? "NULL" : OidOutputFunctionCall(out, w));
+	}
+	elog(ERROR, "ch_table_engines: the row at offset " UINT64_FORMAT " of part %s read where it lies differs from "
+		 "ClickHouse's reader's", offset, part->name);
+}
+
+/*
+ * read_rows_by()'s rows, read where they lie where they may be (VC34), and
+ * whether they were.  CHTE_SPEC_CHECK: those read so read again by
+ * ClickHouse's reader, each the same tuple.
+ */
+static int
+read_rows_at(Relation rel, ChTable *t, ChPart *part, const uint64 *offsets, int n, TupleDesc desc,
+			 const FetchCols *cols, HeapTuple *rows, uint64 *ids, bool *pointed)
+{
+	bool		point = false;
+	int			out = read_rows_by(rel, t, part, offsets, n, desc, cols, rows, ids, true, &point);
+
+	if (point && ch_spec_check())
+	{
+		HeapTuple  *again = palloc(sizeof(HeapTuple) * Max(n, 1));
+		uint64	   *again_ids = palloc(sizeof(uint64) * Max(n, 1));
+		bool		none;
+		int			got = read_rows_by(rel, t, part, offsets, n, desc, cols, again, again_ids, false, &none);
+
+		if (got != out)
+			elog(ERROR, "ch_table_engines: %d rows of part %s read where they lie, %d by ClickHouse's reader",
+				 out, part->name, got);
+		for (int i = 0; i < out; i++)
+		{
+			if (ids[i] != again_ids[i] || rows[i]->t_len != again[i]->t_len ||
+				memcmp(rows[i]->t_data, again[i]->t_data, rows[i]->t_len) != 0)
+				spec_row_differs(desc, rows[i], again[i], offsets[i], part);
+			heap_freetuple(again[i]);
+		}
+		pfree(again);
+		pfree(again_ids);
+	}
+	if (pointed != NULL)
+		*pointed = point;
+	if (point)
+		ch_fetch_counts.pointed += out;
 	count_fetch(cols, out);
 	return out;
 }
@@ -1993,7 +2174,7 @@ read_rows_by_id(Relation rel, ChTable *t, ChPart *part, const uint64 *rowids, in
 	}
 	/* the offsets ascending, as the reader wants them */
 	qsort(found, nfound, sizeof(uint64), ch_compare_uint64);
-	out = read_rows_at(rel, t, part, found, nfound, desc, cols, rows, ids);
+	out = read_rows_at(rel, t, part, found, nfound, desc, cols, rows, ids, NULL);
 	pfree(offsets);
 	pfree(found);
 	return out;
@@ -2138,7 +2319,7 @@ fetch_uncached(Relation rel, ItemPointer tid, uint64 rowid, Snapshot snapshot, T
 				if ((int64) rowid < p->min_rowid || (int64) rowid > p->max_rowid)
 					continue;
 				if (external ?
-					read_rows_at(rel, t, p, &offset, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1 :
+					read_rows_at(rel, t, p, &offset, 1, slot->tts_tupleDescriptor, cols, &row, &id, NULL) == 1 :
 					read_rows_by_id(rel, t, p, &rowid, 1, slot->tts_tupleDescriptor, cols, &row, &id) == 1)
 				{
 					if (cols->whole)
@@ -2272,6 +2453,9 @@ typedef struct FetchPart
 	int			kept_cap;
 	KeptBatch  *kept;
 	bool	   *missing;		/* per column read: the part has none */
+	/* VC34: the granule whose first row was read alone last, its first offset + 1 (0: none) */
+	uint64		point_lo;
+	bool		point_refused;	/* its rows are not read where they lie */
 } FetchPart;
 
 struct ChFetchCache
@@ -2606,6 +2790,7 @@ fetch_at(Relation rel, ChTable *t, ChFetchCache *c, FetchPart *fp, uint64 rowid,
 	int			g = t->options.index_granularity;
 	HeapTuple	row;
 	uint64		id;
+	bool		pointed;
 
 	if (fp->win_hi > 0 && offset >= fp->win_lo && offset < fp->win_hi)
 	{
@@ -2620,14 +2805,24 @@ fetch_at(Relation rel, ChTable *t, ChFetchCache *c, FetchPart *fp, uint64 rowid,
 		uint64		lo = offset - offset % g;
 		uint64		hi = Min(lo + g, (uint64) part->rows);
 
-		if (keep_window(t, c, fp, lo, hi))
+		/*
+		 * VC34: a granule's first row fetched read alone where it lies, the
+		 * granule kept whole at a second -- a bounded sort's late columns
+		 * are a row of each of a few granules (M4), an index's rows of a key
+		 * many of one -- where the part's rows are read so
+		 */
+		if (!fp->point_refused && point_reads_take(t, part) && fp->point_lo != lo + 1)
+			fp->point_lo = lo + 1;
+		else if (keep_window(t, c, fp, lo, hi))
 		{
 			fill_from_kept(rel, t, c, fp, offset, slot);
 			return true;
 		}
 	}
-	if (read_rows_at(rel, t, part, &offset, 1, slot->tts_tupleDescriptor, &c->cols, &row, &id) != 1)
+	if (read_rows_at(rel, t, part, &offset, 1, slot->tts_tupleDescriptor, &c->cols, &row, &id, &pointed) != 1)
 		return false;
+	if (!pointed)
+		fp->point_refused = true;
 	if (c->cols.whole)
 		remember_fetch(rel, rowid, slot->tts_tupleDescriptor, row);
 	ExecForceStoreHeapTuple(row, slot, true);
@@ -2848,6 +3043,7 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 	ListCell   *lc;
 	StringInfoData names;
 	chte_filter *filter = NULL;
+	ChFilterKey filter_key = {0, 0};
 	ResourceOwner owner = NULL;
 	ChListing  *own_listing = NULL;
 
@@ -2881,14 +3077,15 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 	if (quals != NIL)
 	{
 		owner = ch_handle_reserve();
-		filter = ch_filter_make(t, quals);
+		filter = ch_filter_make(t, quals, &filter_key);
 		if (filter)
 			ch_handle_opened(owner, CH_HANDLE_FILTER, filter);
 	}
 	/*
 	 * Each part's rows the quals keep and its needed columns' bytes, from its
 	 * summary where it has one (VC20's B6, B7), else from the part itself,
-	 * loaded -- and, in the pages store, attached -- only then.
+	 * loaded -- and, in the pages store, attached -- only then: where no
+	 * process kept the granules the quals keep of it (VC31, ch_unit_select()).
 	 */
 	foreach(lc, parts)
 	{
@@ -2912,9 +3109,7 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 			{
 				size_t		nranges;
 
-				if (t->options.storage == CH_STORAGE_PAGES)
-					ch_pages_attach(t, p);
-				(void) ch_unit_select(t, p, filter, 0, 0, NULL, 0, &nranges, &kept);
+				(void) ch_unit_select(t, p, filter, &filter_key, 0, 0, NULL, 0, &nranges, &kept);
 			}
 		}
 		*rows += kept;

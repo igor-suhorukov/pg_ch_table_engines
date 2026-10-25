@@ -52,6 +52,11 @@ typedef struct ChEngine
 									chte_part_streams *, chte_error *);
 	int			(*part_file_read) (chte_table *, const char *, const char *, uint64_t, uint64_t, void *,
 								   chte_error *);
+	/* VC34, optional: rows of a granule read where they lie, from its streams' marks */
+	int			(*read_granule_rows) (chte_table *, const char *, const char *, uint32_t, const uint64_t *, size_t,
+									  const chte_part_stream *, size_t, chte_reader **, chte_error *);
+	int			(*part_granule_of) (chte_table *, const char *, uint64_t, uint32_t *, uint64_t *, uint64_t *,
+									chte_error *);
 	int			(*part_stats) (chte_table *, const char *, const char *, chte_column_stats *, chte_error *);
 	chte_batch *(*read_retain) (chte_reader *);
 	void		(*batch_release) (chte_batch *);

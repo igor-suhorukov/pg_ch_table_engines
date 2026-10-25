@@ -32,6 +32,7 @@ bool		ch_enable_fetch_columns = true;
 bool		ch_enable_sink_columns = true;
 bool		ch_enable_memory_parts = true;
 bool		ch_enable_fetch_cache = true;
+bool		ch_enable_point_reads = true;
 bool		ch_enable_part_summaries = true;
 bool		ch_enable_summary_pruning = true;
 double		ch_fetch_cost = 55.0;
@@ -237,6 +238,17 @@ _PG_init(void)
 	/* the parts' streams for a GPU's units, in the postmaster's shared memory (VC29) */
 	if (process_shared_preload_libraries_in_progress)
 		ch_streams_init();
+	/* the parts' granules filters keep, in the postmaster's shared memory (VC31) */
+	if (process_shared_preload_libraries_in_progress)
+		ch_selections_init();
+	DefineCustomBoolVariable("ch.enable_part_selections",
+							 "Whether the granules a filter keeps of a MergeTree part are kept in shared memory.",
+							 "Kept, a process plans and claims the part under the same filter without loading it; "
+							 "off, every part is asked of the engine library, and nothing is kept.",
+							 &ch_enable_part_selections,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 	/* the exits' counts, in the postmaster's shared memory (VC23) */
 	if (process_shared_preload_libraries_in_progress)
 		ch_engine_shmem_init();
@@ -317,6 +329,20 @@ _PG_init(void)
 							 "located row ids and the last granule read.",
 							 NULL,
 							 &ch_enable_fetch_cache,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	/*
+	 * VC34 (pg_accel's §3.29): a fetch's rows of a granule decoded where they
+	 * lie, where ClickHouse's reader made a whole granule of every column --
+	 * ClickBench's Q23 fetched each of its ten rows' 104 late columns so
+	 */
+	DefineCustomBoolVariable("ch.enable_point_reads",
+							 "Whether a fetch by TID reads a mergetree part's rows of a granule where they lie.",
+							 "On, each column's value is decoded from the granule's streams, their marks kept in "
+							 "shared memory for every process, a granule read whole only for a second row of it; "
+							 "off, ClickHouse's reader makes the row's granule of every column.",
+							 &ch_enable_point_reads,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

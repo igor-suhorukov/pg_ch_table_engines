@@ -580,6 +580,34 @@ std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData:
     return r;
 }
 
+void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
+               AlterConversionsPtr alter_conversions)
+{
+    auto mark_cache = table.context->getMarkCache();
+    if (!mark_cache || !isWidePart(part))
+        return;
+    auto info = std::make_shared<LoadedMergeTreeDataPartInfoForReader>(part, std::move(alter_conversions));
+    auto settings = table.storage->getSettings();
+    for (const auto & name : names)
+    {
+        auto column = part->getColumns().tryGetByName(name);
+        if (!column)
+            continue;
+        part->getSerialization(name)->enumerateStreams([&](const ISerialization::SubstreamPath & path)
+        {
+            if (ISerialization::isEphemeralSubcolumn(path, path.size()))
+                return;
+            auto stream = IMergeTreeDataPart::getStreamNameForColumn(*column, path, ".bin", part->checksums, settings);
+            if (!stream)
+                return;
+            MergeTreeMarksLoader loader(info, mark_cache.get(), part->index_granularity_info.getMarksFilePath(*stream),
+                                        part->getMarksCount(), part->index_granularity_info, /* save_marks_in_cache= */ true,
+                                        ReadSettings{}, nullptr, 1, false);
+            (void) loader.loadMarks();
+        });
+    }
+}
+
 }
 
 /// F7: the granule a block of `rows` rows of the current run is of, as MergeTreeSequentialSource reads a

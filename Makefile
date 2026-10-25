@@ -22,6 +22,7 @@ OBJS = \
 	src/own.o \
 	src/pages.o \
 	src/scan.o \
+	src/selections.o \
 	src/store.o \
 	src/streams.o \
 	src/table.o \

@@ -774,8 +774,8 @@ Datum
 ch_fetch_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	desc;
-	Datum		values[5];
-	bool		nulls[5] = {false};
+	Datum		values[6];
+	bool		nulls[6] = {false};
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -784,6 +784,7 @@ ch_fetch_stats(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum(ch_fetch_counts.whole);
 	values[3] = Int64GetDatum(ch_fetch_counts.kept);
 	values[4] = Int64GetDatum(ch_fetch_counts.located);
+	values[5] = Int64GetDatum(ch_fetch_counts.pointed);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
 

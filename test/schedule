@@ -11,6 +11,7 @@ test: notnull
 test: scans
 test: chscan
 test: summaries
+test: selections
 test: dictionaries
 test: dml
 test: indexes

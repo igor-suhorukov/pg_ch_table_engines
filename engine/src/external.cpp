@@ -58,6 +58,8 @@
 #include <Processors/Formats/Impl/Parquet/Prefetcher.h>
 #include <Processors/Formats/Impl/Parquet/Reader.h>
 #include <Processors/Formats/Impl/Parquet/SchemaConverter.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <Processors/Formats/Impl/ParquetMetadataCache.h>
 #include <Processors/Formats/Impl/ParquetV3BlockInputFormat.h>
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipeline.h>
@@ -206,6 +208,20 @@ std::unique_ptr<ReadBufferFromFilePRead> openListed(const String & path, UInt64 
 namespace
 {
 
+/// VC27: Parquet files' footers as ClickHouse's readers parse them, kept in the process by path, size and modification
+/// time -- a fetch's reader of a table of its own files parsed its file's footer again for each row, and a fresh
+/// worker parsed it twice, its row located first (ownLocateByUnits()); a 256 MB of them at most
+ParquetMetadataCachePtr parquetMetadataCache()
+{
+    static ParquetMetadataCachePtr cache = std::make_shared<ParquetMetadataCache>("LRU", 256ULL << 20, 4096, 0.5);
+    return cache;
+}
+
+String parquetFileAttr(UInt64 size, Int64 mtime)
+{
+    return fmt::format("{}:{}", size, mtime);
+}
+
 std::shared_ptr<ExternalFooter> readParquetFooter(const ExternalTable & table, const String & path, UInt64 size, Int64 mtime)
 {
     auto buf = openListed(path, size, mtime);
@@ -214,7 +230,10 @@ std::shared_ptr<ExternalFooter> readParquetFooter(const ExternalTable & table, c
     auto footer = std::make_shared<ExternalFooter>();
     footer->size = size;
     footer->mtime = mtime;
-    auto metadata = std::make_shared<parquet::format::FileMetaData>(Parquet::Reader::readFileMetaData(prefetcher));
+    /// VC27: through the process's metadata cache, which a reader of the file then finds (parquetMetadataCache())
+    auto metadata = std::make_shared<parquet::format::FileMetaData>(parquetMetadataCache()->getOrSetMetadata(
+        ParquetMetadataCache::createKey(path, parquetFileAttr(size, mtime)),
+        [&] { return Parquet::Reader::readFileMetaData(prefetcher); }));
     for (const auto & row_group : metadata->row_groups)
     {
         footer->unit_rows.push_back(static_cast<UInt64>(std::max<Int64>(row_group.num_rows, 0)));
@@ -912,9 +931,14 @@ std::unique_ptr<chte_reader> openExternalReader(chte_table & table, const chte_e
     }
 
     std::shared_ptr<ReadBufferFromFilePRead> buf = openListed(listed.path, listed.size, listed.mtime);
+    /// VC27: the file's footer from the process's metadata cache, parsed once
+    ObjectMetadata object;
+    object.size_bytes = listed.size;
+    object.etag = parquetFileAttr(listed.size, listed.mtime);
     auto format = std::make_shared<ParquetV3BlockInputFormat>(
         *buf, header, ext.format_settings, singleThreadedResources(ext.context), info,
-        ext.format_settings.parquet.local_read_min_bytes_for_seek);
+        ext.format_settings.parquet.local_read_min_bytes_for_seek, parquetMetadataCache(),
+        RelativePathWithMetadata(listed.path, object));
     if (units)
         format->setBucketsToRead(std::make_shared<ParquetFileBucketInfo>(*units));
     return pipelineReader(table, std::move(resolved), listed, names, QueryPipeline(Pipe(format)), /* cast= */ false, std::move(buf));
@@ -2080,6 +2104,173 @@ std::shared_ptr<const OwnRowIds> ownRowIds(chte_table & table, const chte_extern
     return ids;
 }
 
+/// VC27: a listed file's unit u's row ids -- a Parquet row group's, an Arrow record batch's -- its rows of them, read once
+/// in the process, checked ascending
+std::shared_ptr<const OwnRowIds> ownUnitRowIds(chte_table & table, const chte_external_listing & listing, size_t file, size_t u,
+                                               UInt64 rows)
+{
+    auto & ext = *table.external;
+    const auto & listed = listedFile(listing, file);
+    auto key = std::make_pair(listed.path, u);
+    auto it = ext.unit_row_ids.find(key);
+    if (it != ext.unit_row_ids.end() && it->second->size == listed.size && it->second->mtime == listed.mtime)
+        return it->second;
+
+    auto ids = std::make_shared<OwnRowIds>();
+    ids->size = listed.size;
+    ids->mtime = listed.mtime;
+    ids->ids.reserve(rows);
+    auto reader = openExternalReader(table, listing, file, nullptr, {ROWID}, std::vector<size_t>{u}, nullptr);
+    Block block;
+    while (reader->next_block(block))
+    {
+        const auto & data = assert_cast<const ColumnUInt64 &>(*block.getByPosition(0).column).getData();
+        ids->ids.insert(data.begin(), data.end());
+    }
+    if (ids->ids.size() != rows)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "file {}: {} row ids read of row group {}'s {} rows", listed.path,
+                        ids->ids.size(), u, rows);
+    for (size_t i = 1; i < ids->ids.size(); ++i)
+        if (ids->ids[i] <= ids->ids[i - 1])
+            throw Exception(ErrorCodes::INCORRECT_DATA, "file {}: row id {} after {}, not ascending", listed.path, ids->ids[i],
+                            ids->ids[i - 1]);
+    if (ext.unit_row_ids.size() >= MAX_ROW_ID_FILES * 16)
+        ext.unit_row_ids.clear();
+    ext.unit_row_ids[key] = ids;
+    return ids;
+}
+
+/// VC27: a listed Arrow file's record batches' first and last rows' ids, read alone (F6's), once in the process: two a
+/// batch, one of a batch of one row; none where a batch has no row
+std::shared_ptr<const OwnRowIds> ownBatchBounds(chte_table & table, const chte_external_listing & listing, size_t file)
+{
+    auto & ext = *table.external;
+    const auto & listed = listedFile(listing, file);
+    auto key = std::make_pair(listed.path, SIZE_MAX);
+    auto it = ext.unit_row_ids.find(key);
+    if (it != ext.unit_row_ids.end() && it->second->size == listed.size && it->second->mtime == listed.mtime)
+        return it->second;
+
+    const auto & unit_rows = listed.resolved->footer->unit_rows;
+    auto wanted = std::make_shared<PaddedPODArray<UInt64>>();
+    UInt64 at = 0;
+    for (UInt64 rows : unit_rows)
+    {
+        if (rows == 0)
+            return nullptr;
+        wanted->push_back(at);
+        if (rows > 1)
+            wanted->push_back(at + rows - 1);
+        at += rows;
+    }
+    auto ids = std::make_shared<OwnRowIds>();
+    ids->size = listed.size;
+    ids->mtime = listed.mtime;
+    size_t asked = wanted->size();
+    auto reader = openExternalReader(table, listing, file, nullptr, {ROWID}, std::nullopt, std::move(wanted));
+    Block block;
+    while (reader->next_block(block))
+    {
+        const auto & data = assert_cast<const ColumnUInt64 &>(*block.getByPosition(0).column).getData();
+        ids->ids.insert(data.begin(), data.end());
+    }
+    if (ids->ids.size() != asked)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "file {}: {} row ids read of its batches' {} first and last rows", listed.path,
+                        ids->ids.size(), asked);
+    if (ext.unit_row_ids.size() >= MAX_ROW_ID_FILES * 16)
+        ext.unit_row_ids.clear();
+    ext.unit_row_ids[key] = ids;
+    return ids;
+}
+
+/// VC27 (ch_table_engines.md; pg_accel's §3.29): a listed file's rows by their ids without every id of the file read
+/// (ownRowIds(), whose 5M ids of ClickBench's file each worker of Q23's fetches read for its one row) -- each id's
+/// unit by its _pg_rowid's least and greatest, the ids ascending through the file: a Parquet row group's by the
+/// footer's statistics, an Arrow record batch's by its first and last row's ids (ownBatchBounds()); its place there
+/// theirs where the unit's ids are as many as its rows, so every one between, else found among that unit's ids alone
+/// (ownUnitRowIds()).  False where they are not known so.
+bool ownLocateByUnits(chte_table & table, const chte_external_listing & listing, size_t file, const uint64_t * ids, size_t n,
+                      uint64_t * offsets)
+{
+    auto & ext = *table.external;
+    const auto & listed = listedFile(listing, file);
+    std::vector<UInt64> least;
+    std::vector<UInt64> greatest;
+    std::vector<UInt64> unit_rows;
+    if (ext.format == CHTE_EXTERNAL_PARQUET)
+    {
+        auto footer = fullFooter(ext, listed);
+        if (!footer->parquet)
+            return false;
+        for (const auto & row_group : footer->parquet->row_groups)
+        {
+            const parquet::format::ColumnChunk * chunk = nullptr;
+            for (const auto & column : row_group.columns)
+                if (column.meta_data.path_in_schema.size() == 1 && column.meta_data.path_in_schema[0] == ROWID)
+                    chunk = &column;
+            if (!chunk || chunk->meta_data.type != parquet::format::Type::INT64 || !chunk->meta_data.__isset.statistics ||
+                row_group.num_rows <= 0)
+                return false;
+            const auto & stats = chunk->meta_data.statistics;
+            const std::string * min = stats.__isset.min_value ? &stats.min_value : stats.__isset.min ? &stats.min : nullptr;
+            const std::string * max = stats.__isset.max_value ? &stats.max_value : stats.__isset.max ? &stats.max : nullptr;
+            if (!min || !max || min->size() != sizeof(UInt64) || max->size() != sizeof(UInt64))
+                return false;
+            UInt64 lo;
+            UInt64 hi;
+            memcpy(&lo, min->data(), sizeof(UInt64));
+            memcpy(&hi, max->data(), sizeof(UInt64));
+            least.push_back(lo);
+            greatest.push_back(hi);
+            unit_rows.push_back(static_cast<UInt64>(row_group.num_rows));
+        }
+    }
+    else if (ext.format == CHTE_EXTERNAL_ARROW)
+    {
+        auto bounds = ownBatchBounds(table, listing, file);
+        if (!bounds)
+            return false;
+        size_t k = 0;
+        for (UInt64 rows : listed.resolved->footer->unit_rows)
+        {
+            least.push_back(bounds->ids[k++]);
+            greatest.push_back(rows > 1 ? bounds->ids[k++] : least.back());
+            unit_rows.push_back(rows);
+        }
+    }
+    else
+        return false;
+    size_t nunits = least.size();
+    std::vector<UInt64> first(nunits);
+    UInt64 at = 0;
+    for (size_t u = 0; u < nunits; ++u)
+    {
+        if (greatest[u] < least[u] || (u > 0 && least[u] <= greatest[u - 1]) || greatest[u] - least[u] + 1 < unit_rows[u])
+            return false;
+        first[u] = at;
+        at += unit_rows[u];
+    }
+    for (size_t i = 0; i < n; ++i)
+    {
+        offsets[i] = UINT64_MAX;
+        const auto * it = std::lower_bound(greatest.data(), greatest.data() + nunits, ids[i]);
+        size_t u = static_cast<size_t>(it - greatest.data());
+        if (u >= nunits || ids[i] < least[u])
+            continue;
+        UInt64 rows = unit_rows[u];
+        if (greatest[u] - least[u] + 1 == rows)
+        {
+            offsets[i] = first[u] + (ids[i] - least[u]);
+            continue;
+        }
+        auto unit_ids = ownUnitRowIds(table, listing, file, u, rows);
+        const auto * found = std::lower_bound(unit_ids->ids.begin(), unit_ids->ids.end(), ids[i]);
+        if (found != unit_ids->ids.end() && *found == ids[i])
+            offsets[i] = first[u] + static_cast<UInt64>(found - unit_ids->ids.begin());
+    }
+    return true;
+}
+
 /// A Parquet column chunk's codec, by its number in parquet::format::CompressionCodec
 const char * parquetCodecName(int codec)
 {
@@ -2531,12 +2722,21 @@ extern "C" int chte_own_locate(chte_table * table, chte_external_listing * listi
     return guarded(error, [&]
     {
         ownOf(table);
+        /// VC27: by the row groups' statistics; CHTE_SPEC_CHECK, the tests', checked against every id of the file
+        bool by_units = ownLocateByUnits(*table, *listing, file, ids, n, offsets);
+        const char * check = getenv("CHTE_SPEC_CHECK");
+        if (by_units && !(check && *check && strcmp(check, "0") != 0))
+            return;
         auto row_ids = ownRowIds(*table, *listing, file);
         const auto & data = row_ids->ids;
         for (size_t i = 0; i < n; ++i)
         {
             const auto * at = std::lower_bound(data.begin(), data.end(), ids[i]);
-            offsets[i] = at != data.end() && *at == ids[i] ? static_cast<uint64_t>(at - data.begin()) : UINT64_MAX;
+            uint64_t offset = at != data.end() && *at == ids[i] ? static_cast<uint64_t>(at - data.begin()) : UINT64_MAX;
+            if (by_units && offsets[i] != offset)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: row id {} located at {} by its row groups, at {} among its ids",
+                                listedFile(*listing, file).path, ids[i], offsets[i], offset);
+            offsets[i] = offset;
         }
     });
 }

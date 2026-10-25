@@ -121,7 +121,9 @@ typedef struct ChRunsShared
 } ChRunsShared;
 
 int			ch_device_streams = 8192;
-int			ch_device_skip_granules = 32;
+int			ch_device_skip_granules = 4;
+bool		ch_device_unit_ranges = true;
+bool		ch_device_claim_alone = true;
 
 static ChStreamsShared *shared = NULL;
 static ChRunsShared *runs = NULL;
@@ -222,16 +224,45 @@ ch_streams_init(void)
 	 * cached columns about 6 us, so a cut at every granule made 152 units of Q20's
 	 * three parts and the device 2.5 times slower than reading everything; at 4, 16,
 	 * 32 and 64 the four took 30.4, 18.9, 18.7 and 19.6 ms by ClickBench's mean, 21.6
-	 * with the cache off
+	 * with the cache off.  W26: the unit goes on past such a run in ranges
+	 * (ch.device_unit_ranges), a range costing the device far less than a unit: at 1,
+	 * 2, 4, 8 and 32 the four took 15.0, 14.8, 15.0, 16.3 and 17.2 ms, 20.9 cut in
+	 * units at 32
 	 */
 	DefineCustomIntVariable("ch.device_skip_granules",
 							"The least run of granules passed over by vexec's condition cache at which a GPU's unit is cut.",
 							"A shorter run is read with the unit, its rows dropped by the device's filter; a run at the "
 							"start or the end of a part is always left out. 1 cuts at every granule.",
 							&ch_device_skip_granules,
-							32, 1, 1 << 20,
+							4, 1, 1 << 20,
 							PGC_USERSET, 0,
 							NULL, NULL, NULL);
+	/*
+	 * W26 (pg_accel's §3.28): a GPU's unit not cut at those runs but read in
+	 * ranges past them, up to its granules' most, where vexec takes a unit of
+	 * several ranges
+	 */
+	DefineCustomBoolVariable("ch.device_unit_ranges",
+							 "Whether a GPU's unit of a MergeTree part goes on past a run of granules passed over, in ranges.",
+							 "On, the unit leaves such a run out of its ranges and goes on to its most granules; off, "
+							 "the unit ends before the run, which then costs the device a unit more.",
+							 &ch_device_unit_ranges,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	/*
+	 * VC35 (pg_accel's §3.29 W32): the device owner of a parallel plan, the
+	 * only participant claiming, takes a part's units at once
+	 */
+	DefineCustomBoolVariable("ch.device_claim_alone",
+							 "Whether a parallel plan's device owner claims a part's units at once.",
+							 "On, the participant that reads every unit on the device takes the rest of a part's "
+							 "units with the first it claims, cut as a serial scan's; off, each of the parallel "
+							 "scan's units is a device unit of its own.",
+							 &ch_device_claim_alone,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = streams_shmem_request;
 	prev_shmem_startup_hook = shmem_startup_hook;

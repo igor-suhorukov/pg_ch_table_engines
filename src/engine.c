@@ -485,6 +485,11 @@ ch_engine(void)
 		engine.part_streams_of = NULL;
 		engine.part_file_read = NULL;
 	}
+	/* VC34's, optional too: a fetch's rows then read through chte_read_rows alone */
+	*(void **) &engine.read_granule_rows = dlsym(handle, "chte_read_granule_rows");
+	*(void **) &engine.part_granule_of = dlsym(handle, "chte_part_granule_of");
+	if (engine.part_streams_of == NULL || engine.part_granule_of == NULL)
+		engine.read_granule_rows = NULL;
 	*(void **) &engine.own_open = dlsym(handle, "chte_own_open");
 	*(void **) &engine.own_list = dlsym(handle, "chte_own_list");
 	*(void **) &engine.own_write_begin = dlsym(handle, "chte_own_write_begin");

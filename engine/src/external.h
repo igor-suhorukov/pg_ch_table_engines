@@ -162,6 +162,9 @@ public:
     /// row ids read so far, by path
     bool own = false;
     std::map<String, std::shared_ptr<const OwnRowIds>> row_ids;
+    /// VC27: a Parquet file's row groups' row ids read so far, by path and row group, where a fetch's row id is
+    /// located among them alone
+    std::map<std::pair<String, size_t>, std::shared_ptr<const OwnRowIds>> unit_row_ids;
     /// chte_own_file_layout's codec, until the next call
     String layout_codec;
     /// VC25: the parts' summaries read so far, by path, with the bytes' size each was read from; and

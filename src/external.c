@@ -556,20 +556,74 @@ ch_external_totals(Relation rel, double *rows, uint64 *bytes)
 
 /* ---- a unit of a part, or of a file ---- */
 
-/* The units of a part or a file a filter keeps, as chte_part_select() selects them; true where any */
+/* CHTE_SPEC_CHECK in the environment, the tests': set, neither empty nor 0 */
 bool
-ch_unit_select(ChTable *t, ChPart *p, chte_filter *filter, uint32 begin, uint32 end, chte_mark_range *ranges,
-			   size_t cap, size_t *nranges, uint64 *rows)
+ch_spec_check(void)
+{
+	static int	check = -1;
+
+	if (check < 0)
+	{
+		const char *v = getenv("CHTE_SPEC_CHECK");
+
+		check = v != NULL && *v != '\0' && strcmp(v, "0") != 0;
+	}
+	return check;
+}
+
+/*
+ * The units of a part or a file a filter keeps, as chte_part_select() selects
+ * them; true where any.  VC31: a part's, under a filter of a key, from those
+ * kept in shared memory (selections.c), the part neither attached nor
+ * loaded; else the library's, kept there.
+ */
+bool
+ch_unit_select(ChTable *t, ChPart *p, chte_filter *filter, const ChFilterKey *key, uint32 begin, uint32 end,
+			   chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows)
 {
 	const ChEngine *eng = ch_engine();
+	chte_mark_range kept[CH_SELECTION_RANGES];
+	chte_mark_range made[CH_SELECTION_RANGES];
+	chte_mark_range *into = ranges;
+	size_t		room = cap;
+	size_t		found_n = 0;
+	uint64		found_rows = 0;
+	bool		found;
 
 	if (p->listing)
+	{
 		CH_CALL("analyzing a file",
 				eng->external_select(t->handle, p->listing->handle, (size_t) p->file, filter, begin, end, ranges,
 									 cap, nranges, rows, CH_ERR));
-	else
-		CH_CALL("analyzing a part",
-				eng->part_select(t->handle, p->name, filter, begin, end, ranges, cap, nranges, rows, CH_ERR));
+		return *nranges > 0;
+	}
+	found = filter != NULL &&
+		ch_selections_find(t, p, key, begin, end, kept, CH_SELECTION_RANGES, &found_n, &found_rows);
+	if (found && !ch_spec_check())
+	{
+		*nranges = found_n;
+		*rows = found_rows;
+		if (ranges != NULL)
+			memcpy(ranges, kept, sizeof(chte_mark_range) * Min(found_n, cap));
+		return found_n > 0;
+	}
+	/* the library's answer, into ranges an entry keeps it from where the caller's are fewer */
+	if (filter != NULL && (cap < CH_SELECTION_RANGES || ranges == NULL))
+	{
+		into = made;
+		room = CH_SELECTION_RANGES;
+	}
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, p);
+	CH_CALL("analyzing a part",
+			eng->part_select(t->handle, p->name, filter, begin, end, into, room, nranges, rows, CH_ERR));
+	if (found)
+		/* CHTE_SPEC_CHECK: the answer found, as the library's */
+		ch_selections_check(p, begin, end, kept, found_n, found_rows, into, *nranges, *rows);
+	else if (filter != NULL && *nranges <= room)
+		ch_selections_keep(t, p, key, begin, end, into, *nranges, *rows);
+	if (into != ranges && ranges != NULL)
+		memcpy(ranges, into, sizeof(chte_mark_range) * Min(*nranges, cap));
 	return *nranges > 0;
 }
 

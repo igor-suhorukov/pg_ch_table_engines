@@ -90,6 +90,13 @@ typedef bool (*ChUnitCheck) (void *arg, const ChScanUnit *unit);
 extern void ch_scan_set_unit_check(TableScanDesc scan, ChUnitCheck check, void *arg);
 
 /*
+ * VC35: a parallel scan's participant that alone claims its units from now
+ * on: a part's units it claims at once, where no other participant claimed
+ * one between.  Nothing for a serial scan, whose units are whole parts.
+ */
+extern void ch_scan_claim_alone(TableScanDesc scan);
+
+/*
  * F7 (VC30): asked as a unit's granules are selected, of a part of a table of
  * an engine whose storage is not temporary, by its identity (ch_part_unit_id())
  * and its granules' count: NULL passes none over, else a bit a granule, set
@@ -136,8 +143,9 @@ extern void ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber
 						List *quals, double *rows, double *bytes, double *raw);
 
 /* filter.c: ANDed quals over a table's Vars as a filter of the library's, or NULL */
-extern chte_filter *ch_filter_make(ChTable *t, List *quals);
-extern chte_filter *ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys);
+extern chte_filter *ch_filter_make(ChTable *t, List *quals, ChFilterKey *key);
+extern chte_filter *ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys,
+										ChFilterKey *key);
 extern List *ch_filter_quals(ChTable *t, List *quals);
 
 /*
@@ -185,6 +193,7 @@ typedef struct ChFetchStats
 	int64		whole;			/* those rows read of every column */
 	int64		kept;			/* rows taken from a granule kept from a fetch before */
 	int64		located;		/* row ids found among offsets located before */
+	int64		pointed;		/* VC34: rows read where they lie */
 } ChFetchStats;
 extern ChFetchStats ch_fetch_counts;
 

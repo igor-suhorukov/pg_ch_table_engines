@@ -211,6 +211,8 @@ typedef struct SrcState
 	const uint64 *(*granules_passed) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
 									  uint32 end);
 	void	   *granules_arg;
+	/* W26 (minor 12): vexec takes a MergeTree unit of several ranges of granules */
+	bool		unit_ranges;
 } SrcState;
 
 static uint64 null_row = 0;		/* a constant's validity: its one value NULL */
@@ -431,6 +433,9 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 		st->granules_arg = spec->granules_arg;
 		ch_scan_set_granule_skip(scan, granules_skip, st);
 	}
+	/* W26 (minor 12): a device's MergeTree units of several ranges, where vexec takes them */
+	st->unit_ranges = ch_device_unit_ranges &&
+		spec->size >= offsetof(VexecSourceSpec, unit_ranges) + sizeof(spec->unit_ranges) && spec->unit_ranges;
 	if (spec->nkeys > 0)
 	{
 		st->nspec_keys = spec->nkeys;
@@ -1446,6 +1451,8 @@ typedef struct SrcMtUnit
 	SrcUnit		unit;			/* read_unit()'s: the part and the run, first */
 	chte_mark_range range;
 	uint64		first_offset;	/* W13: the run's first row's offset in its part */
+	uint64	   *range_offset;	/* W26: of a unit of several ranges, each range's, */
+	uint64	   *range_first;	/* and its first row's place among the unit's; NULL, one range */
 	int			nfiles;
 	char	  (*files)[128];	/* per stream: its file, */
 	uint64	   *from;			/* its first block's offset there, */
@@ -1571,12 +1578,25 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	chte_part_streams ps;
 	MemoryContext old;
 	SrcMtUnit  *keep;
-	VexecSourceStream *streams;
+	VexecSourceStream *streams = NULL;
 	const char **names;
 	uint8	   *flags;
 	AttrNumber *attnums;
 	chte_part_stream *kept;
 	uint64		first_offset = 0;
+	chte_mark_range *ranges;
+	int			nranges = 0;
+	uint64	   *range_offset = NULL;
+	uint64	   *range_first = NULL;
+	uint64		rows = 0;
+	int			nstreams = 0;
+	uint32	   *stream_rows = NULL;
+	uint32	   *all_granule_rows = NULL;
+	bool		granules_given = true;
+	uint32		ngranules = 0;
+	StringInfoData path;
+
+	ranges = MemoryContextAlloc(st->cxt, sizeof(chte_mark_range) * CH_DEVICE_UNIT_MARKS);
 
 	/*
 	 * W21: the granules the condition cache passes over -- none of their rows
@@ -1597,11 +1617,17 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 			return MT_UNIT_NONE;
 		limit = Min(begin + CH_DEVICE_UNIT_MARKS, st->mt_end);
 		end = limit;
+		ranges[0].begin = begin;
+		nranges = 1;
 		/*
-		 * The run cut before a run of granules passed over of ch.device_skip_granules
-		 * or more, or one reaching the part's end; a shorter one is read with the
-		 * unit -- the device drops its rows, none of them true -- a unit costing
-		 * the device more than a few granules' rows do
+		 * A range ends before a run of granules passed over of
+		 * ch.device_skip_granules or more, or one reaching the part's end; a
+		 * shorter one is read with the range -- the device drops its rows, none
+		 * of them true.  W26: the unit goes on past the run, in a range of its
+		 * own, up to CH_DEVICE_UNIT_MARKS granules read, where vexec takes a
+		 * unit of several ranges (the spec's unit_ranges); else the unit ends
+		 * there, a unit costing the device far more than a few granules' rows
+		 * do
 		 */
 		for (uint32 m = begin + 1; m < limit; m++)
 		{
@@ -1614,82 +1640,157 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 				run_end++;
 			if (run_end - m >= (uint32) ch_device_skip_granules || run_end >= st->mt_end)
 			{
-				end = m;
-				break;
+				ranges[nranges - 1].end = m;
+				if (!st->unit_ranges || run_end >= st->mt_end || nranges == CH_DEVICE_UNIT_MARKS)
+				{
+					end = m;
+					break;
+				}
+				/* the run passed over, counted; the next range from its end */
+				ch_scan_note_skipped(st->scan, run_end - m);
+				ranges[nranges].begin = run_end;
+				nranges++;
+				limit = Min(limit + (run_end - m), st->mt_end);
+				end = limit;
 			}
 			m = run_end - 1;
 		}
+		ranges[nranges - 1].end = end;
 #undef MT_SKIPPED
 	}
 	else
+	{
 		end = Min(begin + CH_DEVICE_UNIT_MARKS, st->mt_end);
+		ranges[0].begin = begin;
+		ranges[0].end = end;
+		nranges = 1;
+	}
 
 	/*
-	 * W13: a scan of TIDs: the run's first row's place in its part, the rows
-	 * of the granules before it -- asked first: a call's streams are the
+	 * W13: a scan of TIDs: each range's first row's place in its part, the
+	 * rows of the granules before it -- asked first: a call's streams are the
 	 * library's until the next
 	 */
-	if (st->tids && begin > 0)
+	if (st->tids)
 	{
-		chte_part_streams before;
-		uint32	   *before_rows;
+		uint64	   *at = MemoryContextAlloc(st->cxt, sizeof(uint64) * nranges);
 
-		if (!mergetree_streams(st, 0, begin, 1, &st->cols[0].attnum, &before, &kept, &before_rows))
-			return MT_UNIT_REFUSED;
-		first_offset = before.rows;
-		if (kept)
-			pfree(kept);
-		if (before_rows)
-			pfree(before_rows);
+		for (int q = 0; q < nranges; q++)
+		{
+			chte_part_streams before;
+			uint32	   *before_rows;
+
+			at[q] = 0;
+			if (ranges[q].begin == 0)
+				continue;
+			if (!mergetree_streams(st, 0, ranges[q].begin, 1, &st->cols[0].attnum, &before, &kept, &before_rows))
+				return MT_UNIT_REFUSED;
+			at[q] = before.rows;
+			if (kept)
+				pfree(kept);
+			if (before_rows)
+				pfree(before_rows);
+		}
+		first_offset = at[0];
+		if (nranges > 1)
+			range_offset = at;
 	}
 	attnums = palloc(sizeof(AttrNumber) * st->ncols);
 	for (int i = 0; i < st->ncols; i++)
 		attnums[i] = st->cols[i].attnum;
-	if (!mergetree_streams(st, begin, end, st->ncols, attnums, &ps, &kept, &granule_rows))
-	{
-		pfree(attnums);
-		return MT_UNIT_REFUSED;
-	}
-	pfree(attnums);
 	old = MemoryContextSwitchTo(st->cxt);
 	keep = palloc0(sizeof(SrcMtUnit));
 	keep->unit.part = st->mt_unit.part;
-	keep->range.begin = begin;
-	keep->range.end = end;
-	keep->unit.ranges = &keep->range;
-	keep->unit.nranges = 1;
-	keep->unit.rows = ps.rows;
+	keep->range = ranges[0];
+	keep->unit.ranges = ranges;
+	keep->unit.nranges = nranges;
 	keep->first_offset = first_offset;
-	keep->nfiles = (int) ps.nstreams;
-	keep->files = palloc(sizeof(*keep->files) * Max(ps.nstreams, 1));
-	keep->from = palloc(sizeof(uint64) * Max(ps.nstreams, 1));
-	keep->pages = palloc0(sizeof(chte_page_file) * Max(ps.nstreams, 1));
-	streams = palloc0(sizeof(VexecSourceStream) * Max(ps.nstreams, 1));
-	for (size_t i = 0; i < ps.nstreams; i++)
+	MemoryContextSwitchTo(old);
+	for (int q = 0; q < nranges; q++)
+		ngranules += ranges[q].end - ranges[q].begin;
+	initStringInfo(&path);
+	/* each range's streams, the library's or kept for every process, one range's after another's */
+	for (int q = 0; q < nranges; q++)
 	{
-		const chte_part_stream *x = &ps.streams[i];
+		uint32		rb = ranges[q].begin;
+		uint32		re = ranges[q].end;
 
-		memcpy(keep->files[i], x->file, sizeof(keep->files[i]));
-		keep->from[i] = x->from;
-		/* the file's pages, as the part's manifest has them, its name the stream's */
-		for (size_t f = 0; f < st->mt_nfiles; f++)
-			if (strcmp(st->mt_files[f].path, x->file) == 0)
-			{
-				keep->pages[i] = st->mt_files[f];
-				keep->pages[i].path = keep->files[i];
-				break;
-			}
-		streams[i].column = x->column;
-		streams[i].kind = x->kind == CHTE_STREAM_SIZES ? VEXEC_STREAM_SIZES :
-			x->kind == CHTE_STREAM_NULLS ? VEXEC_STREAM_NULLS :
-			x->kind == CHTE_STREAM_SPARSE ? VEXEC_STREAM_SPARSE :
-			x->kind == CHTE_STREAM_SPARSE_NULLS ? VEXEC_STREAM_SPARSE_NULLS : VEXEC_STREAM_VALUES;
-		streams[i].width = x->width;
-		streams[i].length = x->to - x->from;
-		streams[i].skip = x->skip;
+		if (!mergetree_streams(st, rb, re, st->ncols, attnums, &ps, &kept, &granule_rows))
+		{
+			pfree(attnums);
+			pfree(path.data);
+			return MT_UNIT_REFUSED;
+		}
+		old = MemoryContextSwitchTo(st->cxt);
+		if (q == 0)
+		{
+			int			cap = (int) Max(ps.nstreams, 1) * nranges;
+
+			keep->files = palloc(sizeof(*keep->files) * cap);
+			keep->from = palloc(sizeof(uint64) * cap);
+			keep->pages = palloc0(sizeof(chte_page_file) * cap);
+			streams = palloc0(sizeof(VexecSourceStream) * cap);
+			if (nranges > 1)
+				stream_rows = palloc(sizeof(uint32) * cap);
+			all_granule_rows = palloc(sizeof(uint32) * Max(ngranules, 1));
+		}
+		else if ((size_t) nstreams + ps.nstreams > (size_t) Max(ps.nstreams, 1) * nranges)
+			elog(ERROR, "a unit's ranges of another number of streams each");
+		for (size_t i = 0; i < ps.nstreams; i++)
+		{
+			const chte_part_stream *x = &ps.streams[i];
+			int			k = nstreams++;
+
+			memcpy(keep->files[k], x->file, sizeof(keep->files[k]));
+			keep->from[k] = x->from;
+			/* the file's pages, as the part's manifest has them, its name the stream's */
+			for (size_t f = 0; f < st->mt_nfiles; f++)
+				if (strcmp(st->mt_files[f].path, x->file) == 0)
+				{
+					keep->pages[k] = st->mt_files[f];
+					keep->pages[k].path = keep->files[k];
+					break;
+				}
+			streams[k].column = x->column;
+			streams[k].kind = x->kind == CHTE_STREAM_SIZES ? VEXEC_STREAM_SIZES :
+				x->kind == CHTE_STREAM_NULLS ? VEXEC_STREAM_NULLS :
+				x->kind == CHTE_STREAM_SPARSE ? VEXEC_STREAM_SPARSE :
+				x->kind == CHTE_STREAM_SPARSE_NULLS ? VEXEC_STREAM_SPARSE_NULLS : VEXEC_STREAM_VALUES;
+			streams[k].width = x->width;
+			streams[k].length = x->to - x->from;
+			streams[k].skip = x->skip;
+			if (stream_rows)
+				stream_rows[k] = (uint32) ps.rows;
+		}
+		MemoryContextSwitchTo(old);
+		/* W21: the range's granules' rows after those of the ranges before it */
+		{
+			uint32		at = 0;
+
+			for (int r = 0; r < q; r++)
+				at += ranges[r].end - ranges[r].begin;
+			if (granule_rows != NULL && granules_given)
+				memcpy(all_granule_rows + at, granule_rows, sizeof(uint32) * (re - rb));
+			else
+				granules_given = false;
+		}
+		if (range_offset != NULL)
+		{
+			if (range_first == NULL)
+				range_first = MemoryContextAlloc(st->cxt, sizeof(uint64) * nranges);
+			range_first[q] = rows;
+		}
+		rows += ps.rows;
+		appendStringInfo(&path, "%s%u-%u", q > 0 ? "," : "", rb, re);
+		if (kept)
+			pfree(kept);
 	}
-	if (kept)
-		pfree(kept);
+	pfree(attnums);
+	old = MemoryContextSwitchTo(st->cxt);
+	keep->unit.rows = rows;
+	keep->range_offset = range_offset;
+	keep->range_first = range_first;
+	keep->nfiles = nstreams;
 	names = palloc(sizeof(char *) * st->ncols);
 	flags = palloc0(sizeof(uint8) * st->ncols);
 	for (int i = 0; i < st->ncols; i++)
@@ -1704,34 +1805,42 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 			flags[i] |= VEXEC_UNIT_CHECK_UTF8;
 	}
 	u->format = VEXEC_UNIT_MERGETREE;
-	/* what names the run as long as its part is: the database, the relation's storage, the part, the run */
-	u->path = psprintf("mergetree/%u/%u/%s/%u-%u", MyDatabaseId, st->rel->rd_locator.relNumber,
-					   st->mt_unit.part->name, begin, end);
+	/* what names the unit as long as its part is: the database, the relation's storage, the part, its ranges */
+	u->path = psprintf("mergetree/%u/%u/%s/%s", MyDatabaseId, st->rel->rd_locator.relNumber,
+					   st->mt_unit.part->name, path.data);
+	pfree(path.data);
 	u->file_size = 0;
 	u->file_mtime = 0;
-	u->nparts = (int) (end - begin);
+	u->nparts = (int) ngranules;
 	{
-		int32	   *parts = palloc(sizeof(int32) * (end - begin));
+		int32	   *parts = palloc(sizeof(int32) * Max(ngranules, 1));
+		int			n = 0;
 
-		for (uint32 m = begin; m < end; m++)
-			parts[m - begin] = (int32) m;
+		for (int q = 0; q < nranges; q++)
+			for (uint32 m = ranges[q].begin; m < ranges[q].end; m++)
+				parts[n++] = (int32) m;
 		u->parts = parts;
 	}
-	u->rows = ps.rows;
+	u->rows = rows;
 	u->names = names;
 	u->column_flags = flags;
 	u->deleted = NULL;
 	u->token = keep;
-	u->nstreams = (int) ps.nstreams;
+	u->nstreams = nstreams;
 	u->streams = streams;
-	/* W21 (minor 11): the part's identity and the run's granules' rows, for vexec's condition cache */
+	/* W21 (minor 11): the part's identity and the unit's granules' rows, for vexec's condition cache */
 	if (u->size >= offsetof(VexecSourceUnit, granule_rows) + sizeof(u->granule_rows))
 	{
 		u->unit_id[0] = st->mt_id[0];
 		u->unit_id[1] = st->mt_id[1];
 		u->ngranules = (uint32) st->mt_unit.part->marks;
-		u->granule_rows = granule_rows;
+		u->granule_rows = granules_given ? all_granule_rows : NULL;
 	}
+	/* W26 (minor 12): each stream's range's rows, a unit of several ranges' */
+	if (u->size >= offsetof(VexecSourceUnit, stream_rows) + sizeof(u->stream_rows))
+		u->stream_rows = stream_rows;
+	else if (nranges > 1)
+		elog(ERROR, "a unit of several ranges for a vexec that takes none");
 	MemoryContextSwitchTo(old);
 	st->mt_next = end;
 	return MT_UNIT_OK;
@@ -1958,6 +2067,28 @@ src_row_tids(Relation rel, int n, const uint64 *ids, ItemPointerData *tids)
 		ItemPointerSet(&tids[i], CH_ROWID_TO_BLOCK(ids[i]), CH_ROWID_TO_OFFSET(ids[i]));
 }
 
+/* A MergeTree unit's row's offset in its part: W26, of a unit of several ranges, in its range */
+static uint64
+mt_row_offset(const SrcMtUnit *keep, uint64 row)
+{
+	int			lo = 0,
+				hi = keep->unit.nranges - 1;
+
+	if (keep->range_offset == NULL)
+		return keep->first_offset + row;
+	/* the row's range: the last one starting at it or before */
+	while (lo < hi)
+	{
+		int			mid = (lo + hi + 1) / 2;
+
+		if (keep->range_first[mid] <= row)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	return keep->range_offset[lo] + (row - keep->range_first[lo]);
+}
+
 static void
 src_unit_tids(void *arg, const VexecSourceUnit *u, int n, const uint64 *rows, ItemPointerData *tids)
 {
@@ -1982,7 +2113,7 @@ src_unit_tids(void *arg, const VexecSourceUnit *u, int n, const uint64 *rows, It
 
 		/* the offsets ascending, each once */
 		for (int i = 0; i < n; i++)
-			offsets[i] = keep->first_offset + rows[i];
+			offsets[i] = mt_row_offset(keep, rows[i]);
 		qsort(offsets, n, sizeof(uint64), cmp_uint64);
 		for (int i = 0; i < n; i++)
 			if (m == 0 || offsets[m - 1] != offsets[i])
@@ -2012,7 +2143,7 @@ src_unit_tids(void *arg, const VexecSourceUnit *u, int n, const uint64 *rows, It
 			elog(ERROR, "%d rows' ids read of a part where %d were asked for", got, m);
 		for (int i = 0; i < n; i++)
 		{
-			uint64		off = keep->first_offset + rows[i];
+			uint64		off = mt_row_offset(keep, rows[i]);
 			uint64	   *at = bsearch(&off, offsets, m, sizeof(uint64), cmp_uint64);
 
 			ItemPointerSet(&tids[i], CH_ROWID_TO_BLOCK(ids[at - offsets]), CH_ROWID_TO_OFFSET(ids[at - offsets]));
@@ -2159,6 +2290,20 @@ src_set_join_keys(void *arg, int nkeys, const ScanKeyData *keys)
 	SrcState   *st = arg;
 
 	ch_scan_set_join_keys(st->scan, nkeys, keys);
+}
+
+/*
+ * W32 (minor 12, VC35): the device owner of a parallel plan, the scan's only
+ * claimer, takes a part's units at once, its device units then cut as a
+ * serial scan's (mergetree_unit())
+ */
+static void
+src_claim_alone(void *arg)
+{
+	SrcState   *st = arg;
+
+	if (ch_device_claim_alone)
+		ch_scan_claim_alone(st->scan);
 }
 
 /* ---- the sink ---- */
@@ -2311,6 +2456,7 @@ ch_vexec_register(void)
 			 */
 			r->unit_tids = src_unit_tids;
 			r->row_tids = src_row_tids;
+			r->claim_alone = src_claim_alone;
 		}
 		/*
 		 * W6 (minor 8): the plain engine's parts, their columns' compressed
@@ -2324,6 +2470,7 @@ ch_vexec_register(void)
 			r->read_unit_bytes = src_read_unit_bytes;
 			r->unit_tids = src_unit_tids;
 			r->row_tids = src_row_tids;
+			r->claim_alone = src_claim_alone;
 		}
 		vexec_register_source(r);
 		if (external)

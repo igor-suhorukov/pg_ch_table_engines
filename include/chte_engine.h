@@ -571,6 +571,24 @@ CHTE_API int			chte_read_rows(chte_table *table, const char *part_name, const ch
 						   chte_error *error);
 
 /*
+ * VC34: as chte_read_rows, of rows of one granule of a wide part, each value read where it
+ * lies -- each column's streams from the granule's marks, streams[0 .. nstreams) as
+ * chte_part_streams_of gave them over [granule, granule + 1), decompressed only as far as
+ * the row, the value decoded there -- where ClickHouse's reader makes a whole granule of every
+ * column to return a row.  *reader is NULL where it does not take them: a row not of the
+ * granule, a column of no streams given, of another type than the table's, or the part lacks.
+ * Optional: a library built before it lacks it.
+ */
+CHTE_API int			chte_read_granule_rows(chte_table *table, const char *part_name, const char *columns,
+								   uint32_t granule, const uint64_t *offsets, size_t n,
+								   const chte_part_stream *streams, size_t nstreams,
+								   chte_reader **reader, chte_error *error);
+
+/* VC34: the granule of a part holding the row at offset, its first row's offset and its rows */
+CHTE_API int			chte_part_granule_of(chte_table *table, const char *part_name, uint64_t offset,
+								 uint32_t *granule, uint64_t *first, uint64_t *rows, chte_error *error);
+
+/*
  * A part written again without the rows whose _pg_rowid are dead[0 .. n),
  * ascending -- deletions every snapshot sees, folded into it -- as a new part
  * named as a mutation of it, block_number its version (all_<min>_<max>_<level>_<block_number>),

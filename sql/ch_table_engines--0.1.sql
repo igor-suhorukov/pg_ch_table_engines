@@ -190,9 +190,10 @@ CREATE FUNCTION ch.engine_info(OUT version text, OUT threads integer, OUT functi
 -- What this session's fetches of rows by their TIDs read (ch_table_engines.md
 -- §3, VC16): the rows read from a part, the columns decoded for them, those
 -- rows read of every column, the rows taken from a granule kept from a fetch
--- before, and the row ids found among offsets located before.
+-- before, the row ids found among offsets located before, and the rows read
+-- where they lie (VC34).
 CREATE FUNCTION ch.fetch_stats(OUT fetches bigint, OUT columns bigint, OUT whole bigint,
-							   OUT kept bigint, OUT located bigint)
+							   OUT kept bigint, OUT located bigint, OUT pointed bigint)
 	AS 'MODULE_PATHNAME', 'ch_fetch_stats' LANGUAGE C STRICT VOLATILE;
 
 -- MergeTree parts' streams kept in shared memory for a GPU's units (ch_table_engines.md
@@ -203,6 +204,14 @@ CREATE FUNCTION ch.fetch_stats(OUT fetches bigint, OUT columns bigint, OUT whole
 CREATE FUNCTION ch.device_streams(OUT kept integer, OUT found bigint, OUT described bigint,
 								  OUT parts_loaded bigint)
 	AS 'MODULE_PATHNAME', 'ch_device_streams_info' LANGUAGE C STRICT VOLATILE;
+
+-- MergeTree parts' granules a filter keeps, kept in shared memory (ch_table_engines.md
+-- §3, VC31): the entries kept now, NULL where none can be -- the extension not
+-- preloaded, or ch.part_selections 0 -- and this session's answers found among
+-- them, kept, and compared with the engine library's (CHTE_SPEC_CHECK).
+CREATE FUNCTION ch.part_selections(OUT kept integer, OUT found bigint, OUT stored bigint,
+								   OUT checked bigint)
+	AS 'MODULE_PATHNAME', 'ch_part_selections_info' LANGUAGE C STRICT VOLATILE;
 
 -- The footers of Parquet and Arrow files the session's process has read from
 -- them (ch_table_engines.md §3, VC25), each file's at its first use in the

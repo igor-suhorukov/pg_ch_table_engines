@@ -46,7 +46,7 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		11	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		12	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
 									 * price; 5: columns in steps; 6:
@@ -55,7 +55,9 @@
 									 * read_unit_bytes; 9: unit_tids; 10:
 									 * a column's flags, granules passed
 									 * over; 11: a unit's granules' rows and
-									 * its part's identity */
+									 * its part's identity; 12: a unit of
+									 * several ranges of granules, a sole
+									 * claimer's units */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -220,6 +222,15 @@ typedef struct VexecSourceSpec
 	const uint64 *(*granules_passed) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
 									  uint32 end);
 	void	   *granules_arg;
+
+	/*
+	 * From minor version 12 (W26, pg_vector_executor.md §3.28): whether vexec
+	 * takes a VEXEC_UNIT_MERGETREE unit of several ranges of its part's
+	 * granules (VexecSourceUnit's stream_rows), so that a source cuts no unit
+	 * at the granules granules_passed passes over -- a unit costs a device far
+	 * more than a granule's rows do -- but leaves them out of its ranges
+	 */
+	bool		unit_ranges;
 } VexecSourceSpec;
 
 /* One batch from a source. */
@@ -405,6 +416,17 @@ typedef struct VexecSourceUnit
 	uint64		unit_id[2];
 	uint32		ngranules;
 	const uint32 *granule_rows;
+
+	/*
+	 * From minor version 12 (W26, pg_vector_executor.md §3.28), where the
+	 * spec has unit_ranges: a VEXEC_UNIT_MERGETREE unit of several ranges of
+	 * its part's granules -- its parts and granule_rows those of each range in
+	 * turn -- its streams each range's in turn, a column's again for each:
+	 * each stream's range's rows, so that the device decodes each range alone
+	 * and puts them together; NULL where the unit is one range, each stream
+	 * the unit's rows'
+	 */
+	const uint32 *stream_rows;
 } VexecSourceUnit;
 
 /*
@@ -622,6 +644,18 @@ typedef struct VexecSourceRoutine
 	 * their ids, as a unit's rowid_name column holds them (above).
 	 */
 	void		(*row_tids) (Relation rel, int n, const uint64 *ids, ItemPointerData *tids);
+
+	/*
+	 * Optional, from minor version 12 (W32, pg_vector_executor.md §3.29): the
+	 * participant of a parallel scan whose state this is alone claims the
+	 * scan's units from now on -- the device owner of W13's parallel twin,
+	 * which reads every unit -- so that the source may hand it a part's
+	 * adjacent units at once, as a serial scan's: a parallel scan's unit is a
+	 * sixty-fourth of the table, ClickBench's twenty granules, each else one
+	 * device unit.  Called once, before the participant asks for its first.
+	 * A unit another participant claimed meanwhile stays its own.
+	 */
+	void		(*claim_alone) (void *state);
 } VexecSourceRoutine;
 
 /*

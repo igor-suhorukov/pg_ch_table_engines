@@ -110,6 +110,7 @@ extern bool ch_enable_fetch_columns;
 extern bool ch_enable_sink_columns;
 extern bool ch_enable_memory_parts;
 extern bool ch_enable_fetch_cache;
+extern bool ch_enable_point_reads;
 extern bool ch_enable_part_summaries;
 extern bool ch_enable_summary_pruning;
 extern double ch_fetch_cost;
@@ -398,8 +399,22 @@ extern Oid	ch_rewrite_source(Relation rel);
 extern Node *ch_external_copy_to(CopyStmt *stmt, Oid relid);
 extern void ch_external_truncated(Relation rel);
 extern void ch_external_totals(Relation rel, double *rows, uint64 *bytes);
-extern bool ch_unit_select(ChTable *t, ChPart *p, chte_filter *filter, uint32 begin, uint32 end,
-						   chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows);
+
+/*
+ * VC31: a filter's key (filter.c), by which a part's granules it keeps are
+ * kept in shared memory (selections.c): two hashes of its nodes and values,
+ * the table's definition and the engine's settings; both 0, none
+ */
+typedef struct ChFilterKey
+{
+	uint64		h1;
+	uint64		h2;
+} ChFilterKey;
+
+extern bool ch_unit_select(ChTable *t, ChPart *p, chte_filter *filter, const ChFilterKey *key, uint32 begin,
+						   uint32 end, chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows);
+/* CHTE_SPEC_CHECK in the environment, the tests': what is kept or read a shorter way checked against the long */
+extern bool ch_spec_check(void);
 extern void ch_unit_column_bytes(ChTable *t, ChPart *p, const char *columns, uint64 *compressed,
 								 uint64 *uncompressed);
 extern void ch_unit_stats(ChTable *t, const ChPart *p, const char *column, chte_column_stats *stats);
@@ -484,6 +499,8 @@ extern void ch_vexec_register(void);
 /* streams.c: MergeTree parts' streams by granule run, kept in shared memory for a GPU's units (VC29) */
 extern int	ch_device_streams;
 extern int	ch_device_skip_granules;
+extern bool ch_device_unit_ranges;
+extern bool ch_device_claim_alone;
 extern void ch_streams_init(void);
 extern bool ch_streams_find(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, int ncols,
 							const AttrNumber *attnums, uint64 *rows, chte_part_stream **streams, size_t *nstreams,
@@ -491,6 +508,19 @@ extern bool ch_streams_find(const ChTable *t, const ChPart *part, uint32 begin, 
 extern void ch_streams_keep(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, int ncols,
 							const AttrNumber *attnums, const chte_part_streams *ps);
 extern void ch_streams_described(void);
+
+/* selections.c: MergeTree parts' granules a filter keeps, kept in shared memory (VC31) */
+#define CH_SELECTION_RANGES 32		/* the most ranges an entry holds */
+extern int	ch_part_selections;
+extern bool ch_enable_part_selections;
+extern void ch_selections_init(void);
+extern bool ch_selections_find(const ChTable *t, const ChPart *part, const ChFilterKey *fk, uint32 begin,
+							   uint32 end, chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows);
+extern void ch_selections_keep(const ChTable *t, const ChPart *part, const ChFilterKey *fk, uint32 begin,
+							   uint32 end, const chte_mark_range *ranges, size_t nranges, uint64 rows);
+extern void ch_selections_check(const ChPart *part, uint32 begin, uint32 end, const chte_mark_range *found_ranges,
+								size_t found_n, uint64 found_rows, const chte_mark_range *ranges, size_t n,
+								uint64 rows);
 
 /* own.c: tables of their own files (§2.18, CH8) */
 extern void ch_own_table_setup(Relation rel, TupleDesc desc, ChTable *t);

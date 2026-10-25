@@ -369,6 +369,12 @@ class ExternalTable;
 std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
                                         std::optional<MarkRanges> mark_ranges);
 
+/// VC33: a wide part's named columns' marks, each stream's, loaded into the process's mark cache where they
+/// are not there -- a merge's sequential source, which openReader's reader is, only looks there
+/// (MergeTreeMarksLoader.cpp:305-313), so that a fetch's every reader decompressed them again
+void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
+               AlterConversionsPtr alter_conversions);
+
 /// Mark ranges, ascending, as runs of adjacent granules, each for a sequential source of its own; none: the
 /// whole part, one run.  MergeTreeSequentialSource takes the rows of a read from the granule after the one
 /// it read last (MergeTreeSequentialSource.cpp:205-214, 233): past a gap between ranges that is another
