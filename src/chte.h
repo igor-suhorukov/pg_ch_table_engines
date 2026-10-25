@@ -101,6 +101,9 @@ typedef struct ChStorageId
 	 ItemPointerGetOffsetNumberNoCheck(tid) - 1)
 #define CH_MAX_ROWID ((uint64) MaxBlockNumber * CH_ROWS_PER_BLOCK)
 
+/* W6: a GPU's unit of a MergeTree part, a run of at most this many granules (vexec.c, streams.c) */
+#define CH_DEVICE_UNIT_MARKS	256
+
 /* module.c */
 extern bool ch_enable_chscan;
 extern bool ch_enable_fetch_columns;
@@ -480,9 +483,11 @@ extern void ch_vexec_register(void);
 
 /* streams.c: MergeTree parts' streams by granule run, kept in shared memory for a GPU's units (VC29) */
 extern int	ch_device_streams;
+extern int	ch_device_skip_granules;
 extern void ch_streams_init(void);
 extern bool ch_streams_find(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, int ncols,
-							const AttrNumber *attnums, uint64 *rows, chte_part_stream **streams, size_t *nstreams);
+							const AttrNumber *attnums, uint64 *rows, chte_part_stream **streams, size_t *nstreams,
+							uint32 **granule_rows);
 extern void ch_streams_keep(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, int ncols,
 							const AttrNumber *attnums, const chte_part_streams *ps);
 extern void ch_streams_described(void);

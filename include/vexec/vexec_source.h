@@ -46,7 +46,7 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		10	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		11	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
 									 * price; 5: columns in steps; 6:
@@ -54,7 +54,8 @@
 									 * read_unit; 8: MergeTree's units,
 									 * read_unit_bytes; 9: unit_tids; 10:
 									 * a column's flags, granules passed
-									 * over */
+									 * over; 11: a unit's granules' rows and
+									 * its part's identity */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -390,6 +391,20 @@ typedef struct VexecSourceUnit
 	 * row_tids() makes; NULL where unit_tids() gives them by their places
 	 */
 	const char *rowid_name;
+
+	/*
+	 * From minor version 11 (W21, pg_vector_executor.md §3.28), a
+	 * VEXEC_UNIT_MERGETREE unit's place in its part, for vexec's condition cache
+	 * (minor 10's granules_passed): the part's identity, as VexecSourceBatch's
+	 * unit_id has it -- zeros for none -- its granules' count, and each of the
+	 * unit's nparts granules' rows, in their order, so that the device says of
+	 * each granule whether a row of it passed the scan's quals; NULL where the
+	 * source does not say.  A unit of granules the cache passes over is handed
+	 * without them: a source cuts its units at them.
+	 */
+	uint64		unit_id[2];
+	uint32		ngranules;
+	const uint32 *granule_rows;
 } VexecSourceUnit;
 
 /*

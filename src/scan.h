@@ -99,6 +99,12 @@ extern void ch_scan_set_unit_check(TableScanDesc scan, ChUnitCheck check, void *
 typedef const uint64 *(*ChGranuleSkip) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
 										uint32 end);
 extern void ch_scan_set_granule_skip(TableScanDesc scan, ChGranuleSkip skip, void *arg);
+/* W21: granules of a unit passed over for the device by the caller's granule skip, counted */
+extern void ch_scan_note_skipped(TableScanDesc scan, int64 n);
+/* W21: the unit being read here has the caller's granule skip applied already: skip_granules() asks no more */
+extern void ch_scan_granules_cut(TableScanDesc scan);
+/* W21: the claimed unit let go unread -- every granule of it passed over -- not counted as passed to the device */
+extern void ch_scan_drop_unit(TableScanDesc scan);
 /* A part's identity, never another's: of its storage, name, rows and time of writing; zeros for a temporary table's */
 extern void ch_part_unit_id(const ChTable *t, const ChPart *part, uint64 *id);
 

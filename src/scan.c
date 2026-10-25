@@ -150,6 +150,7 @@ typedef struct ChScanDescData
 	uint64		unit_rows;		/* rows of the granules kept */
 	uint64		count_left;		/* a scan of no column: rows of the unit not yet handed */
 	bool		one_unit;		/* V8e: the claimed unit's batches alone, then an end */
+	bool		skip_done;		/* W21: the unit's granules the caller passes over are cut already (ch_scan_granules_cut()) */
 	chte_reader *reader;
 	ResourceOwner reader_owner;
 	uint32		nrows;			/* of the batch */
@@ -281,6 +282,7 @@ release_unit(ChScanDesc scan)
 	end_reader(scan);
 	scan->part = NULL;
 	scan->selected = false;
+	scan->skip_done = false;
 	scan->count_left = 0;
 	scan->dead_lo = scan->dead_hi = 0;
 }
@@ -1443,6 +1445,34 @@ ch_scan_set_granule_skip(TableScanDesc sscan, ChGranuleSkip skip, void *arg)
 	scan->granule_skip_arg = arg;
 }
 
+/* W21: granules of the claimed unit the caller passes over for the device (pg_accel's W21), as skip_granules() counts its own */
+void
+ch_scan_note_skipped(TableScanDesc sscan, int64 n)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	scan->counts.marks_skipped += n;
+	scan->counts.marks_read -= n;
+}
+
+void
+ch_scan_granules_cut(TableScanDesc sscan)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	Assert(scan->part != NULL);
+	scan->skip_done = true;
+}
+
+void
+ch_scan_drop_unit(TableScanDesc sscan)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	Assert(scan->part != NULL && scan->reader == NULL);
+	release_unit(scan);
+}
+
 void
 ch_part_unit_id(const ChTable *t, const ChPart *part, uint64 *id)
 {
@@ -1492,7 +1522,7 @@ skip_granules(ChScanDesc scan)
 	int64		passed = 0;
 
 	if (scan->granule_skip == NULL || scan->part->listing != NULL || scan->unit_rows == 0 ||
-		scan->part->marks <= 0)
+		scan->part->marks <= 0 || scan->skip_done)
 		return;
 	ch_part_unit_id(scan->table, scan->part, id);
 	if (id[0] == 0 && id[1] == 0)

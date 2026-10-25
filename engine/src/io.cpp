@@ -700,6 +700,7 @@ extern "C" int chte_part_streams_of(chte_table * table, const char * part_name, 
         table->part_streams.clear();
         table->part_types.clear();
         table->part_refusal.clear();
+        table->part_granule_rows.clear();
         *out = {};
         auto refuse = [&](const String & why)
         {
@@ -719,7 +720,12 @@ extern "C" int chte_part_streams_of(chte_table * table, const char * part_name, 
         }
         uint64_t rows = 0;
         for (size_t m = begin; m < end; ++m)
-            rows += part->index_granularity->getMarkRows(m);
+        {
+            size_t mark_rows = part->index_granularity->getMarkRows(m);
+            rows += mark_rows;
+            /// W21: each granule's rows, for the device's condition cache
+            table->part_granule_rows.push_back(static_cast<uint32_t>(mark_rows));
+        }
 
         auto mutations = storage.getMutationsSnapshot({});
         auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table->context);
@@ -835,6 +841,7 @@ extern "C" int chte_part_streams_of(chte_table * table, const char * part_name, 
         out->nstreams = table->part_streams.size();
         out->streams = table->part_streams.data();
         out->types = table->part_types.c_str();
+        out->granule_rows = table->part_granule_rows.data();
     });
 }
 

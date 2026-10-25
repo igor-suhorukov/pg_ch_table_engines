@@ -461,7 +461,7 @@ chte_table * makeTable(const chte_table_def * def, ContextMutablePtr context, St
                                                  std::move(pages_disk));
     StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
     StorageMetadataPtr snapshot = handle;
-    auto * table = new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}, {}, {}};
+    auto * table = new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}, {}, {}, {}};
     if (projections && !projections->children.empty())
         table->projections = projections;
     return table;

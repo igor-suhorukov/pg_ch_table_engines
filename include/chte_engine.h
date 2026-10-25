@@ -448,6 +448,12 @@ typedef struct chte_part_streams
 	const chte_part_stream *streams;
 	const char *types;			/* each column's type as the part keeps it, ';' after each */
 	const char *refusal;		/* NULL, or why the columns are not read so */
+	/*
+	 * pg_accel's W21 (pg_vector_executor.md §3.28): each granule's rows over [begin, end), end -
+	 * begin of them, so that the device may say of each granule whether a row of it passed the
+	 * scan's quals, for vexec's condition cache; NULL from a library built before it
+	 */
+	const uint32_t *granule_rows;
 } chte_part_streams;
 
 CHTE_API int			chte_part_streams_of(chte_table *table, const char *part_name, const char *columns,

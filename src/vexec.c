@@ -198,6 +198,15 @@ typedef struct SrcState
 	uint32		mt_end;
 	chte_page_file *mt_files;	/* the pages store's: the claimed part's manifest */
 	size_t		mt_nfiles;
+	/*
+	 * W21 (pg_accel's §3.28): the claimed part's identity for vexec's condition
+	 * cache, and the granules it passes over, none of their rows true of the
+	 * scan's quals -- a bit each, asked once a part -- or NULL
+	 */
+	uint64		mt_id[2];
+	uint64	   *mt_skip;
+	uint64	   *mt_skip_buf;
+	uint32		mt_skip_words;
 	/* F7 (minor 10, VC30): vexec's condition cache, which names the granules passed over; NULL none */
 	const uint64 *(*granules_passed) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
 									  uint32 end);
@@ -1432,8 +1441,6 @@ unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
  * reads them again and keeps what the quals keep.  The plain engine's
  * parts of no deletion alone; read_unit() reads a run again on the CPU.
  */
-#define CH_DEVICE_UNIT_MARKS	256
-
 typedef struct SrcMtUnit
 {
 	SrcUnit		unit;			/* read_unit()'s: the part and the run, first */
@@ -1453,7 +1460,7 @@ typedef struct SrcMtUnit
  */
 static bool
 mergetree_streams(SrcState *st, uint32 begin, uint32 end, int ncols, const AttrNumber *attnums,
-				  chte_part_streams *ps, chte_part_stream **kept)
+				  chte_part_streams *ps, chte_part_stream **kept, uint32 **granule_rows)
 {
 	ChTable    *t = ch_scan_table(st->scan);
 	const ChPart *part = st->mt_unit.part;
@@ -1463,11 +1470,21 @@ mergetree_streams(SrcState *st, uint32 begin, uint32 end, int ncols, const AttrN
 
 	memset(ps, 0, sizeof(*ps));
 	*kept = NULL;
-	if (ch_streams_find(t, part, begin, end, ncols, attnums, &rows, kept, &nfound))
+	*granule_rows = NULL;
+	if (ch_streams_find(t, part, begin, end, ncols, attnums, &rows, kept, &nfound, granule_rows))
 	{
 		ps->rows = rows;
 		ps->nstreams = nfound;
 		ps->streams = *kept;
+		/* W21: the run's granules' rows, in the scan's memory as long as the unit's pointers are */
+		if (*granule_rows != NULL)
+		{
+			uint32	   *rows_kept = MemoryContextAlloc(st->cxt, sizeof(uint32) * (end - begin));
+
+			memcpy(rows_kept, *granule_rows, sizeof(uint32) * (end - begin));
+			pfree(*granule_rows);
+			*granule_rows = rows_kept;
+		}
 		return true;
 	}
 	initStringInfo(&list);
@@ -1482,15 +1499,75 @@ mergetree_streams(SrcState *st, uint32 begin, uint32 end, int ncols, const AttrN
 	if (ps->refusal != NULL)
 		return false;
 	ch_streams_keep(t, part, begin, end, ncols, attnums, ps);
+	/* W21: each granule's rows, copied: the library's until its next call */
+	if (ps->granule_rows != NULL)
+	{
+		*granule_rows = MemoryContextAlloc(st->cxt, sizeof(uint32) * (end - begin));
+		memcpy(*granule_rows, ps->granule_rows, sizeof(uint32) * (end - begin));
+	}
 	return true;
 }
 
-/* The claimed unit's next run of granules for the device; false, nothing set, where its part's columns are not read so. */
+/*
+ * W21: the rest of the claimed part, granules [mt_next, mt_end), read here --
+ * the device refused it -- less those the condition cache passes over, each
+ * noted; false, nothing to read, where none is left.  The unit let go first
+ * where it is still claimed (dropped).
+ */
 static bool
+mergetree_rest_here(SrcState *st, bool claimed)
+{
+	chte_mark_range *ranges = palloc(sizeof(chte_mark_range) * Max(st->mt_end - st->mt_next, 1));
+	int			nranges = 0;
+	int64		skipped = 0;
+
+	for (uint32 m = st->mt_next; m < st->mt_end; m++)
+	{
+		if (st->mt_skip != NULL && (st->mt_skip[m / 64] & (UINT64CONST(1) << (m % 64))))
+		{
+			skipped++;
+			continue;
+		}
+		if (nranges > 0 && ranges[nranges - 1].end == m)
+			ranges[nranges - 1].end = m + 1;
+		else
+		{
+			ranges[nranges].begin = m;
+			ranges[nranges].end = m + 1;
+			nranges++;
+		}
+	}
+	if (skipped > 0)
+		ch_scan_note_skipped(st->scan, skipped);
+	if (claimed)
+		ch_scan_drop_unit(st->scan);
+	st->mt_next = st->mt_end;
+	if (nranges > 0)
+	{
+		ch_scan_read_unit(st->scan, st->mt_unit.part, ranges, nranges, 0);
+		if (st->mt_skip != NULL)
+			ch_scan_granules_cut(st->scan);
+	}
+	pfree(ranges);
+	return nranges > 0;
+}
+
+/*
+ * The claimed unit's next run of granules for the device: MT_UNIT_OK with the
+ * unit set; MT_UNIT_REFUSED, nothing set, where its part's columns are not read
+ * so; MT_UNIT_NONE where no granule is left, every one the condition cache
+ * passed over (W21).
+ */
+#define MT_UNIT_REFUSED		-1
+#define MT_UNIT_NONE		0
+#define MT_UNIT_OK			1
+
+static int
 mergetree_unit(SrcState *st, VexecSourceUnit *u)
 {
 	uint32		begin = st->mt_next;
-	uint32		end = Min(begin + CH_DEVICE_UNIT_MARKS, st->mt_end);
+	uint32		end;
+	uint32	   *granule_rows = NULL;
 	chte_part_streams ps;
 	MemoryContext old;
 	SrcMtUnit  *keep;
@@ -1502,6 +1579,52 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	uint64		first_offset = 0;
 
 	/*
+	 * W21: the granules the condition cache passes over -- none of their rows
+	 * true of the scan's quals -- left out: the run begins past them and ends
+	 * before the next, each counted as passed over
+	 */
+	if (st->mt_skip != NULL)
+	{
+#define MT_SKIPPED(m) ((st->mt_skip[(m) / 64] & (UINT64CONST(1) << ((m) % 64))) != 0)
+		uint32		limit;
+
+		while (begin < st->mt_end && MT_SKIPPED(begin))
+			begin++;
+		if (begin > st->mt_next)
+			ch_scan_note_skipped(st->scan, begin - st->mt_next);
+		st->mt_next = begin;
+		if (begin >= st->mt_end)
+			return MT_UNIT_NONE;
+		limit = Min(begin + CH_DEVICE_UNIT_MARKS, st->mt_end);
+		end = limit;
+		/*
+		 * The run cut before a run of granules passed over of ch.device_skip_granules
+		 * or more, or one reaching the part's end; a shorter one is read with the
+		 * unit -- the device drops its rows, none of them true -- a unit costing
+		 * the device more than a few granules' rows do
+		 */
+		for (uint32 m = begin + 1; m < limit; m++)
+		{
+			uint32		run_end;
+
+			if (!MT_SKIPPED(m))
+				continue;
+			run_end = m;
+			while (run_end < st->mt_end && MT_SKIPPED(run_end))
+				run_end++;
+			if (run_end - m >= (uint32) ch_device_skip_granules || run_end >= st->mt_end)
+			{
+				end = m;
+				break;
+			}
+			m = run_end - 1;
+		}
+#undef MT_SKIPPED
+	}
+	else
+		end = Min(begin + CH_DEVICE_UNIT_MARKS, st->mt_end);
+
+	/*
 	 * W13: a scan of TIDs: the run's first row's place in its part, the rows
 	 * of the granules before it -- asked first: a call's streams are the
 	 * library's until the next
@@ -1509,20 +1632,23 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	if (st->tids && begin > 0)
 	{
 		chte_part_streams before;
+		uint32	   *before_rows;
 
-		if (!mergetree_streams(st, 0, begin, 1, &st->cols[0].attnum, &before, &kept))
-			return false;
+		if (!mergetree_streams(st, 0, begin, 1, &st->cols[0].attnum, &before, &kept, &before_rows))
+			return MT_UNIT_REFUSED;
 		first_offset = before.rows;
 		if (kept)
 			pfree(kept);
+		if (before_rows)
+			pfree(before_rows);
 	}
 	attnums = palloc(sizeof(AttrNumber) * st->ncols);
 	for (int i = 0; i < st->ncols; i++)
 		attnums[i] = st->cols[i].attnum;
-	if (!mergetree_streams(st, begin, end, st->ncols, attnums, &ps, &kept))
+	if (!mergetree_streams(st, begin, end, st->ncols, attnums, &ps, &kept, &granule_rows))
 	{
 		pfree(attnums);
-		return false;
+		return MT_UNIT_REFUSED;
 	}
 	pfree(attnums);
 	old = MemoryContextSwitchTo(st->cxt);
@@ -1598,9 +1724,17 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	u->token = keep;
 	u->nstreams = (int) ps.nstreams;
 	u->streams = streams;
+	/* W21 (minor 11): the part's identity and the run's granules' rows, for vexec's condition cache */
+	if (u->size >= offsetof(VexecSourceUnit, granule_rows) + sizeof(u->granule_rows))
+	{
+		u->unit_id[0] = st->mt_id[0];
+		u->unit_id[1] = st->mt_id[1];
+		u->ngranules = (uint32) st->mt_unit.part->marks;
+		u->granule_rows = granule_rows;
+	}
 	MemoryContextSwitchTo(old);
 	st->mt_next = end;
-	return true;
+	return MT_UNIT_OK;
 }
 
 /*
@@ -1648,6 +1782,28 @@ mergetree_begin(SrcState *st, const ChScanUnit *unit)
 	st->mt_end = ranges[nranges - 1].end;
 	pfree(parts);
 	pfree(ranges);
+	/* W21: the part's identity, and the granules the condition cache passes over, asked once a part */
+	ch_part_unit_id(t, unit->part, st->mt_id);
+	st->mt_skip = NULL;
+	if (st->granules_passed != NULL && (st->mt_id[0] != 0 || st->mt_id[1] != 0) && unit->part->marks > 0)
+	{
+		const uint64 *bits = st->granules_passed(st->granules_arg, st->mt_id, (uint32) unit->part->marks,
+												st->mt_next, st->mt_end);
+
+		if (bits != NULL)
+		{
+			uint32		words = ((uint32) unit->part->marks + 63) / 64;
+
+			if (words > st->mt_skip_words)
+			{
+				st->mt_skip_buf = st->mt_skip_buf ? repalloc(st->mt_skip_buf, sizeof(uint64) * words) :
+					MemoryContextAlloc(st->cxt, sizeof(uint64) * words);
+				st->mt_skip_words = words;
+			}
+			memcpy(st->mt_skip_buf, bits, sizeof(uint64) * words);
+			st->mt_skip = st->mt_skip_buf;
+		}
+	}
 	return true;
 }
 
@@ -1665,39 +1821,67 @@ src_next_unit(void *arg, VexecSourceUnit *u)
 	{
 		if (st->mt_next < st->mt_end)
 		{
-			if (mergetree_unit(st, u))
+			int			r = mergetree_unit(st, u);
+
+			if (r == MT_UNIT_OK)
 				return true;
-			ch_scan_read_unit(st->scan, st->mt_unit.part,
-							  &(chte_mark_range) {st->mt_next, st->mt_end}, 1, 0);
 			st->mt_open = false;
-			u->format = VEXEC_UNIT_CPU;
-			return true;
+			/* refused: the rest read here, cut as the condition cache cuts it (W21); or every granule left passed over: the part is done */
+			if (r == MT_UNIT_REFUSED && mergetree_rest_here(st, false))
+			{
+				u->format = VEXEC_UNIT_CPU;
+				return true;
+			}
 		}
 		st->mt_open = false;
 	}
-	if (!ch_scan_claim_unit(st->scan, &unit))
-		return false;
-	if (unit.rows == 0)
+	for (;;)
 	{
-		/* none of its granules kept: read as nothing, here */
-		ch_scan_one_unit(st->scan);
-		u->format = VEXEC_UNIT_CPU;
-		return true;
-	}
-	if (mergetree_begin(st, &unit))
-	{
-		if (mergetree_unit(st, u))
+		if (!ch_scan_claim_unit(st->scan, &unit))
+			return false;
+		if (unit.rows == 0)
 		{
-			st->mt_open = true;
-			ch_scan_pass_unit(st->scan);
-			/* as getnextslot counts each row it returns */
-			if (pgstat_should_count_relation(st->rel))
-				st->rel->pgstat_info->counts.tuples_returned += unit.rows;
+			/* none of its granules kept: read as nothing, here */
+			ch_scan_one_unit(st->scan);
+			u->format = VEXEC_UNIT_CPU;
 			return true;
 		}
-		ch_scan_one_unit(st->scan);
-		u->format = VEXEC_UNIT_CPU;
-		return true;
+		if (mergetree_begin(st, &unit))
+		{
+			int			r = mergetree_unit(st, u);
+
+			if (r == MT_UNIT_OK)
+			{
+				st->mt_open = true;
+				ch_scan_pass_unit(st->scan);
+				/* as getnextslot counts each row it returns */
+				if (pgstat_should_count_relation(st->rel))
+					st->rel->pgstat_info->counts.tuples_returned += unit.rows;
+				return true;
+			}
+			/*
+			 * W21: the condition cache cut the part -- every granule passed over
+			 * (nothing to read: the next unit), or the device refused the rest,
+			 * read here less the granules passed over; else the part refused
+			 * whole, read here as it is
+			 */
+			if (st->mt_skip != NULL)
+			{
+				if (r == MT_UNIT_NONE)
+				{
+					ch_scan_drop_unit(st->scan);
+					continue;
+				}
+				if (!mergetree_rest_here(st, true))
+					continue;
+				u->format = VEXEC_UNIT_CPU;
+				return true;
+			}
+			ch_scan_one_unit(st->scan);
+			u->format = VEXEC_UNIT_CPU;
+			return true;
+		}
+		break;
 	}
 	if (!unit_for_device(st, &unit, u))
 	{

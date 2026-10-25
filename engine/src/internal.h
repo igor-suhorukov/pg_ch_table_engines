@@ -558,6 +558,7 @@ struct chte_table
     std::vector<chte_part_stream> part_streams;
     std::string part_types;
     std::string part_refusal;
+    std::vector<uint32_t> part_granule_rows;  /// W21: each granule's rows of the last answer's range
     /// VC21: the definition's projections, described in the metadata where a search by row id, an
     /// insert, a merge or a rewrite first needs them (chte::describeProjections); none: described
     DB::ASTPtr projections;

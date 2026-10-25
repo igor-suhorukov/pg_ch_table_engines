@@ -86,9 +86,45 @@ typedef struct ChStreamsShared
 	ChStreamsSlot slots[FLEXIBLE_ARRAY_MEMBER];
 } ChStreamsShared;
 
+/*
+ * W21 (pg_accel's §3.28): a run's granules' rows -- end - begin of them, as
+ * chte_part_streams_of() gives them -- kept once a run beside its columns'
+ * streams, for vexec's condition cache: the device then says of each granule
+ * whether a row of it passed the scan's quals.  A table of its own, an eighth
+ * of ch.device_streams entries, under the streams' lock.
+ */
+typedef struct ChRunsKey
+{
+	Oid			dbid;
+	Oid			spcid;
+	RelFileNumber relnumber;
+	uint32		begin;
+	uint32		end;
+	int64		part_rows;
+	TimestampTz part_created;
+	char		part[CH_STREAMS_NAME];
+} ChRunsKey;
+
+typedef struct ChRunsSlot
+{
+	uint32		hash;			/* 0: empty */
+	uint32		nmarks;
+	ChRunsKey	key;
+	uint32		rows[CH_DEVICE_UNIT_MARKS];
+} ChRunsSlot;
+
+typedef struct ChRunsShared
+{
+	uint32		nslots;
+	uint32		used;
+	ChRunsSlot	slots[FLEXIBLE_ARRAY_MEMBER];
+} ChRunsShared;
+
 int			ch_device_streams = 8192;
+int			ch_device_skip_granules = 32;
 
 static ChStreamsShared *shared = NULL;
+static ChRunsShared *runs = NULL;
 static uint64 found_runs = 0;
 static uint64 described_runs = 0;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -110,6 +146,23 @@ shared_size(void)
 	return add_size(offsetof(ChStreamsShared, slots), mul_size(slot_count(), sizeof(ChStreamsSlot)));
 }
 
+/* W21: the runs' slots, a power of two, twice an eighth of the entries or more */
+static uint32
+runs_slot_count(void)
+{
+	uint32		n = 2;
+
+	while (n < (uint32) Max(ch_device_streams / 8, 16) * 2)
+		n <<= 1;
+	return n;
+}
+
+static Size
+runs_size(void)
+{
+	return add_size(offsetof(ChRunsShared, slots), mul_size(runs_slot_count(), sizeof(ChRunsSlot)));
+}
+
 static void
 streams_shmem_request(void)
 {
@@ -117,7 +170,7 @@ streams_shmem_request(void)
 		prev_shmem_request_hook();
 	if (ch_device_streams <= 0)
 		return;
-	RequestAddinShmemSpace(shared_size());
+	RequestAddinShmemSpace(add_size(shared_size(), runs_size()));
 	RequestNamedLWLockTranche("ch_table_engines device streams", 1);
 }
 
@@ -139,6 +192,13 @@ streams_shmem_startup(void)
 		shared->used = 0;
 		memset(shared->slots, 0, sizeof(ChStreamsSlot) * shared->nslots);
 	}
+	runs = ShmemInitStruct("ch_table_engines device runs", runs_size(), &found);
+	if (!found)
+	{
+		runs->nslots = runs_slot_count();
+		runs->used = 0;
+		memset(runs->slots, 0, sizeof(ChRunsSlot) * runs->nslots);
+	}
 	LWLockRelease(AddinShmemInitLock);
 }
 
@@ -154,6 +214,23 @@ ch_streams_init(void)
 							&ch_device_streams,
 							8192, 0, 1 << 24,
 							PGC_POSTMASTER, 0,
+							NULL, NULL, NULL);
+	/*
+	 * W21 (pg_accel's §3.28): a GPU's unit cut at a run of granules vexec's condition
+	 * cache passes over only where the run is this long: measured on ClickBench's Q20
+	 * to Q23 at 10M rows, hot, a unit costs the device about 0.13 ms and a granule of
+	 * cached columns about 6 us, so a cut at every granule made 152 units of Q20's
+	 * three parts and the device 2.5 times slower than reading everything; at 4, 16,
+	 * 32 and 64 the four took 30.4, 18.9, 18.7 and 19.6 ms by ClickBench's mean, 21.6
+	 * with the cache off
+	 */
+	DefineCustomIntVariable("ch.device_skip_granules",
+							"The least run of granules passed over by vexec's condition cache at which a GPU's unit is cut.",
+							"A shorter run is read with the unit, its rows dropped by the device's filter; a run at the "
+							"start or the end of a part is always left out. 1 cuts at every granule.",
+							&ch_device_skip_granules,
+							32, 1, 1 << 20,
+							PGC_USERSET, 0,
 							NULL, NULL, NULL);
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = streams_shmem_request;
@@ -181,11 +258,17 @@ make_key(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, AttrNum
 }
 
 static uint32
-key_hash(const ChStreamsKey *key)
+key_hash_bytes(const unsigned char *p, Size n)
 {
-	uint32		h = hash_bytes((const unsigned char *) key, sizeof(*key));
+	uint32		h = hash_bytes(p, n);
 
 	return h == 0 ? 1 : h;
+}
+
+static uint32
+key_hash(const ChStreamsKey *key)
+{
+	return key_hash_bytes((const unsigned char *) key, sizeof(*key));
 }
 
 /* The slot of a key, or of the empty one where its probe ends; under the lock */
@@ -203,6 +286,38 @@ probe(const ChStreamsKey *key, uint32 h)
 	}
 }
 
+/* W21: a run's key -- the columns' without the attribute -- its padding zeroed; false where none holds it */
+static bool
+make_runs_key(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, ChRunsKey *key)
+{
+	if (runs == NULL || t->storage.backend >= 0 || strlen(part->name) >= CH_STREAMS_NAME || end - begin > CH_DEVICE_UNIT_MARKS)
+		return false;
+	memset(key, 0, sizeof(*key));
+	key->dbid = t->storage.locator.dbOid;
+	key->spcid = t->storage.locator.spcOid;
+	key->relnumber = t->storage.locator.relNumber;
+	key->begin = begin;
+	key->end = end;
+	key->part_rows = part->rows;
+	key->part_created = part->created;
+	strcpy(key->part, part->name);
+	return true;
+}
+
+static ChRunsSlot *
+runs_probe(const ChRunsKey *key, uint32 h)
+{
+	uint32		mask = runs->nslots - 1;
+
+	for (uint32 i = h & mask;; i = (i + 1) & mask)
+	{
+		ChRunsSlot *s = &runs->slots[i];
+
+		if (s->hash == 0 || (s->hash == h && memcmp(&s->key, key, sizeof(*key)) == 0))
+			return s;
+	}
+}
+
 /*
  * The streams of the columns attnums over granules [begin, end) of a part,
  * as chte_part_streams_of() would answer for them -- each column's in its
@@ -211,7 +326,8 @@ probe(const ChStreamsKey *key, uint32 h)
  */
 bool
 ch_streams_find(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, int ncols,
-				const AttrNumber *attnums, uint64 *rows, chte_part_stream **streams, size_t *nstreams)
+				const AttrNumber *attnums, uint64 *rows, chte_part_stream **streams, size_t *nstreams,
+				uint32 **granule_rows)
 {
 	ChStreamsKey *keys;
 	uint32	   *hashes;
@@ -234,6 +350,7 @@ ch_streams_find(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, 
 		hashes[c] = key_hash(&keys[c]);
 	}
 	out = palloc0(sizeof(chte_part_stream) * ncols * CH_STREAMS_MAX);
+	*granule_rows = NULL;
 	LWLockAcquire(shared->lock, LW_SHARED);
 	for (int c = 0; c < ncols && all; c++)
 	{
@@ -256,6 +373,22 @@ ch_streams_find(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, 
 			x->to = s->streams[k].to;
 			x->skip = s->streams[k].skip;
 			strlcpy(x->file, s->streams[k].file, sizeof(x->file));
+		}
+	}
+	/* W21: the run's granules' rows, where kept */
+	if (all)
+	{
+		ChRunsKey	rk;
+
+		if (make_runs_key(t, part, begin, end, &rk))
+		{
+			ChRunsSlot *r = runs_probe(&rk, key_hash_bytes((const unsigned char *) &rk, sizeof(rk)));
+
+			if (r->hash != 0 && r->nmarks == end - begin)
+			{
+				*granule_rows = palloc(sizeof(uint32) * r->nmarks);
+				memcpy(*granule_rows, r->rows, sizeof(uint32) * r->nmarks);
+			}
 		}
 	}
 	LWLockRelease(shared->lock);
@@ -326,6 +459,30 @@ ch_streams_keep(const ChTable *t, const ChPart *part, uint32 begin, uint32 end, 
 			y->to = x->to;
 			y->skip = x->skip;
 			strlcpy(y->file, x->file, sizeof(y->file));
+		}
+	}
+	/* W21: the run's granules' rows, once a run */
+	if (ps->granule_rows != NULL && runs != NULL)
+	{
+		ChRunsKey	rk;
+
+		if (make_runs_key(t, part, begin, end, &rk))
+		{
+			uint32		h = key_hash_bytes((const unsigned char *) &rk, sizeof(rk));
+			ChRunsSlot *r;
+
+			if (runs->used + 1 > runs->nslots / 2)
+			{
+				memset(runs->slots, 0, sizeof(ChRunsSlot) * runs->nslots);
+				runs->used = 0;
+			}
+			r = runs_probe(&rk, h);
+			if (r->hash == 0)
+				runs->used++;
+			r->hash = h;
+			r->key = rk;
+			r->nmarks = end - begin;
+			memcpy(r->rows, ps->granule_rows, sizeof(uint32) * (end - begin));
 		}
 	}
 	LWLockRelease(shared->lock);
