@@ -9,6 +9,11 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Compression/CompressionFactory.h>
+#include <Core/ServerSettings.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <Parsers/ParserCreateQuery.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Common/DateLUT.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTrackerBlockerInThread.h>
@@ -66,9 +71,13 @@ constexpr std::string_view used_registrations[] = {
 };
 std::unordered_set<std::string_view> registered;
 bool all_registered = false;
+bool used_registered = false;	/* VC22: in the postmaster, inherited */
 
 void registerUsedFunctions()
 {
+    if (used_registered)
+        return;
+    used_registered = true;
     /// as registerFunctions() does: what registration allocates is not a call's
     MemoryTrackerBlockerInThread blocker;
     auto & factory = FunctionFactory::instance();
@@ -334,12 +343,38 @@ extern "C" void chte_shutdown(void)
 /// built in every process's chte_init, the backends' before they plan, every parallel worker's before
 /// it reads.  Built here, they are each forked process's, inherited, and chte_init's
 /// setDefaultTimezone("UTC") finds them.  DateLUT starts no thread and keeps only its tables and a
-/// mutex, which no thread holds as the postmaster forks; nothing else of ClickHouse's is made.
+/// mutex, which no thread holds as the postmaster forks.
+/// VC22 (ch_table_engines.md §8 item 24): and ClickHouse's other statics that start no thread and that
+/// no thread holds a lock of as the postmaster forks -- it has none but this one -- made here once,
+/// each forked process's then, where every backend and worker made them in its chte_init and its first
+/// table's open: the used functions' registrations (VC12), the settings' accessors -- a query's, the
+/// server's and MergeTree's, which the global context and a table's settings read -- the factories of
+/// data types and codecs a definition's columns are made by, and the parser's of a definition: a fresh
+/// backend's chte_init 1.0 -> 0.4 ms, its first table's columns 0.3 -> 0.19.  No context is made here:
+/// ClickHouse makes one shared context a process (Context.cpp, ContextSharedPart's constructor).  The
+/// threads are counted before and after.
 extern "C" int chte_preload(chte_error * error)
 {
     return guarded(error, [&]
     {
+        int threads = chte_thread_count();
+
         DateLUT::setDefaultTimezone("UTC");
+        registerUsedFunctions();
+        {
+            MemoryTrackerBlockerInThread blocker;
+            Settings settings;
+            ServerSettings server;
+            MergeTreeSettings tree;
+            (void) DataTypeFactory::instance().get("Nullable(String)");
+            (void) CompressionCodecFactory::instance().getDefaultCodec();
+            String query = "CREATE TABLE t (a Int32 CODEC(LZ4), b Nullable(String)) ENGINE = MergeTree ORDER BY a";
+            ParserCreateQuery parser;
+            (void) parseQuery(parser, query, "a definition", DBMS_DEFAULT_MAX_QUERY_SIZE, DBMS_DEFAULT_MAX_PARSER_DEPTH,
+                              DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        }
+        if (chte_thread_count() != threads)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "the preload started {} threads", chte_thread_count() - threads);
     });
 }
 

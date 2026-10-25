@@ -104,6 +104,8 @@ extern "C" int chte_part_locate(chte_table * table, const char * part_name, cons
             if (rowids[i] < rowids[i - 1])
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_part_locate: row ids not in order");
 
+        /// VC21: the row id's projection, its parts' loaded
+        describeProjections(*table);
         auto & storage = *table->storage;
         auto part = storage.partWithProjections(part_name);
         const auto & projections = part->getProjectionParts();

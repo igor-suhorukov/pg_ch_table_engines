@@ -172,6 +172,8 @@ extern "C" int chte_write_begin(chte_table * table, uint64_t block_number, chte_
         /// block 0: numbered by chte_write_block before chte_write_finish (VC18)
         /// a part's writing -- its sort, statistics and projections -- looks up functions of its own
         registerAllFunctions();
+        /// VC21: a part's projections written with it
+        describeProjections(*table);
         auto w = std::make_unique<chte_writer>();
         w->table = table;
         w->block_number = block_number;
@@ -756,8 +758,12 @@ extern "C" int chte_part_streams_of(chte_table * table, const char * part_name, 
                     refuse("a stream's file of a name too long, " + file);
                     return;
                 }
-                MergeTreeMarksLoader loader(info, nullptr, part->index_granularity_info.getMarksFilePath(*stream),
-                                            part->getMarksCount(), part->index_granularity_info, false, ReadSettings{},
+                /// W15 (pg_accel's §3.27): the marks kept in the process's mark cache, which a part's later
+                /// runs and a scan's readers find -- each run's loaded them again, 0.12 to 0.39 ms a call of
+                /// a fresh backend's, five of them a part of ClickBench's 10M rows
+                MergeTreeMarksLoader loader(info, table->context->getMarkCache().get(),
+                                            part->index_granularity_info.getMarksFilePath(*stream), part->getMarksCount(),
+                                            part->index_granularity_info, /* save_marks_in_cache= */ true, ReadSettings{},
                                             nullptr, 1, false);
                 auto getter = loader.loadMarks();
                 auto first = getter->getMark(begin, 0);
@@ -1130,6 +1136,8 @@ extern "C" int chte_merge(chte_table * table, const char * const * part_names, s
         /// a merge's algorithms -- a summing engine's sums, an aggregating one's states -- and its
         /// projections look up functions and aggregate functions by name
         registerAllFunctions();
+        /// VC21: the merged part's projections made with it, the inputs' loaded
+        describeProjections(*table);
         auto & storage = *table->storage;
         MergeTreeData::DataPartsVector parts;
         for (size_t i = 0; i < nparts; ++i)

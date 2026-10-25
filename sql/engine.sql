@@ -75,4 +75,36 @@ SET max_parallel_workers_per_gather = 2;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(c60) FROM ew WHERE c1 % 2 = 0;
 SELECT count(*), sum(c60) FROM ew WHERE c1 % 2 = 0;
 
+-- VC21 (ch_table_engines.md §8 item 24): a table's projections described in
+-- the engine where a search by row id, an insert, a merge or a rewrite first
+-- needs them, not as each process opens the table: a fresh backend's fetches
+-- through an index, its insert and its merge -- the merged part with its row
+-- ids' projection -- and the rows then found through it
+\c
+SET client_min_messages = warning;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT a, c1, c40, c60 FROM ew WHERE a IN (11, 3011);
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+\c
+SET client_min_messages = warning;
+INSERT INTO ew (a, c1, c40, c60) VALUES (6001, 1, 2, 3);
+SELECT ch.optimize('ew', true) > 0 AS merged;
+SELECT count(*) AS parts, bool_and(position(convert_to('_pg_rowid_index.proj/', 'UTF8') IN p.manifest) > 0) AS projections
+  FROM ch.parts p JOIN pg_class c ON c.relfilenode = p.relfilenumber
+ WHERE c.oid = 'ew'::regclass;
+\c
+SET client_min_messages = warning;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT a, c1, c40, c60 FROM ew WHERE a IN (7, 6001);
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- VC22: ClickHouse's thread-free statics made in the postmaster as it
+-- preloaded the library, every process's since: the postmaster has its one
+-- thread still
+SELECT count(*) AS postmaster_threads
+  FROM pg_ls_dir('/proc/' || split_part(pg_read_file('postmaster.pid'), E'\n', 1) || '/task');
+
 DROP TABLE ef, eu, ew;

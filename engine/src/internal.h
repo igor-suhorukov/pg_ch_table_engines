@@ -156,6 +156,9 @@ bool allFunctionsRegistered();
 /// Whether the function factory knows every name, an aggregate function's included.
 bool functionsRegistered(const Names & names);
 
+/// VC21: the table's projections described in its metadata, where they are not yet (table.cpp)
+void describeProjections(chte_table & table);
+
 void setError(chte_error * error, int code, const std::string & message) noexcept;
 
 /// Runs f; an exception becomes *error and a nonzero result.
@@ -270,6 +273,9 @@ public:
     DataPartPtr partWithProjections(const String & part_name) const;
     /// The same, its files checked against its checksums, as ClickHouse checks a part it loads.
     DataPartPtr checkedPart(const String & part_name) const;
+    /// VC21: the loaded parts' projections loaded again as next asked for, the table's projections
+    /// described since (describeProjections)
+    void forgetLoadedProjections() const;
     void forgetPart(const String & part_name) const;
 
     /// While this process loads a part of the table, the table's metadata without its projections,
@@ -531,4 +537,7 @@ struct chte_table
     std::vector<chte_part_stream> part_streams;
     std::string part_types;
     std::string part_refusal;
+    /// VC21: the definition's projections, described in the metadata where a search by row id, an
+    /// insert, a merge or a rewrite first needs them (chte::describeProjections); none: described
+    DB::ASTPtr projections;
 };

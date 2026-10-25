@@ -1288,9 +1288,10 @@ unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
 	MemoryContext old;
 	ChTable    *t = ch_scan_table(st->scan);
 
+	/* W13 (minor 9): a scan of TIDs, a table of its own files', whose rows' ids are their files' */
 	if (unit->part->listing == NULL || (unit->deletions && !t->own) || unit->part->deletes ||
 		!ch_is_external_rel(st->rel, &kind) || (kind != CH_EXTERNAL_PARQUET && kind != CH_EXTERNAL_ARROW) ||
-		st->tids || st->ncols == 0)
+		(st->tids && (!t->own || ch_engine()->external_read_rows == NULL)) || st->ncols == 0)
 		return false;
 	old = MemoryContextSwitchTo(st->cxt);
 	names = palloc(sizeof(char *) * st->ncols);
@@ -1334,6 +1335,9 @@ unit_for_device(SrcState *st, const ChScanUnit *unit, VexecSourceUnit *u)
 	u->column_flags = flags;
 	u->deleted = NULL;
 	u->token = keep;
+	/* W13 (minor 9): a scan of TIDs: its rows' ids, its file's own column, read by the device */
+	if (st->tids && u->size >= offsetof(VexecSourceUnit, rowid_name) + sizeof(u->rowid_name))
+		u->rowid_name = CH_ROWID_COLUMN;
 	if (unit->deletions)
 	{
 		/* CH8: the unit's rows the snapshot sees deleted, by their ids in the part's file */
@@ -1379,6 +1383,7 @@ typedef struct SrcMtUnit
 {
 	SrcUnit		unit;			/* read_unit()'s: the part and the run, first */
 	chte_mark_range range;
+	uint64		first_offset;	/* W13: the run's first row's offset in its part */
 	int			nfiles;
 	char	  (*files)[128];	/* per stream: its file, */
 	uint64	   *from;			/* its first block's offset there, */
@@ -1410,8 +1415,27 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	VexecSourceStream *streams;
 	const char **names;
 	uint8	   *flags;
-	char	   *list = mergetree_names(st);
+	char	   *list;
+	uint64		first_offset = 0;
 
+	/*
+	 * W13: a scan of TIDs: the run's first row's place in its part, the rows
+	 * of the granules before it -- asked first: a call's streams are the
+	 * library's until the next
+	 */
+	if (st->tids && begin > 0)
+	{
+		chte_part_streams before;
+		char	   *one = psprintf("c%d", st->cols[0].attnum);
+
+		CH_CALL("describing a part's columns for the device",
+				ch_engine()->part_streams_of(t->handle, st->mt_unit.part->name, one, 0, begin, &before, CH_ERR));
+		pfree(one);
+		if (before.refusal != NULL)
+			return false;
+		first_offset = before.rows;
+	}
+	list = mergetree_names(st);
 	CH_CALL("describing a part's columns for the device",
 			ch_engine()->part_streams_of(t->handle, st->mt_unit.part->name, list, begin, end, &ps, CH_ERR));
 	pfree(list);
@@ -1425,6 +1449,7 @@ mergetree_unit(SrcState *st, VexecSourceUnit *u)
 	keep->unit.ranges = &keep->range;
 	keep->unit.nranges = 1;
 	keep->unit.rows = ps.rows;
+	keep->first_offset = first_offset;
 	keep->nfiles = (int) ps.nstreams;
 	keep->files = palloc(sizeof(*keep->files) * Max(ps.nstreams, 1));
 	keep->from = palloc(sizeof(uint64) * Max(ps.nstreams, 1));
@@ -1506,7 +1531,7 @@ mergetree_begin(SrcState *st, const ChScanUnit *unit)
 	int			nranges;
 
 	if (t->external || t->kind != CH_ENGINE_MERGETREE || ch_engine()->part_streams_of == NULL ||
-		unit->deletions || st->tids || st->ncols == 0)
+		unit->deletions || st->ncols == 0)
 		return false;
 	for (int i = 0; i < st->ncols; i++)
 		if (st->cols[i].col->kind == CH_COL_CSTRING || st->cols[i].col->low_cardinality)
@@ -1629,6 +1654,197 @@ src_read_unit_bytes(void *arg, const VexecSourceUnit *u, int stream, uint64 offs
 	CH_CALL("reading a part's file for the device",
 			ch_engine()->part_file_read(t->handle, keep->unit.part->name, keep->files[stream],
 										keep->from[stream] + offset, length, dest, CH_ERR));
+}
+
+/*
+ * W13 (pg_vector_executor.md §3.27; minor 9): the TIDs of rows of a unit
+ * next_unit() handed a scan of TIDs, by their places among the unit's rows:
+ * a MergeTree run's rows' ids read from the part's _pg_rowid at their
+ * offsets in it, the granules holding them alone (chte_read_rows); a table
+ * of its own files', its unit's ids, as its file holds them
+ * (chte_own_unit_ids).  Each id's TID as next() makes it.
+ */
+static int
+cmp_uint64(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* W13 (minor 9): the TIDs of rows by their ids, as next() makes them */
+static void
+src_row_tids(Relation rel, int n, const uint64 *ids, ItemPointerData *tids)
+{
+	(void) rel;
+	for (int i = 0; i < n; i++)
+		ItemPointerSet(&tids[i], CH_ROWID_TO_BLOCK(ids[i]), CH_ROWID_TO_OFFSET(ids[i]));
+}
+
+static void
+src_unit_tids(void *arg, const VexecSourceUnit *u, int n, const uint64 *rows, ItemPointerData *tids)
+{
+	SrcState   *st = arg;
+	ChTable    *t = ch_scan_table(st->scan);
+	const ChEngine *eng = ch_engine();
+
+	if (n <= 0)
+		return;
+	for (int i = 0; i < n; i++)
+		if (rows[i] >= u->rows)
+			elog(ERROR, "a row's TID asked past its unit's rows");
+	if (u->format == VEXEC_UNIT_MERGETREE)
+	{
+		SrcMtUnit  *keep = (SrcMtUnit *) u->token;
+		uint64	   *offsets = palloc(sizeof(uint64) * n);
+		uint64	   *ids = palloc(sizeof(uint64) * n);
+		chte_reader *reader = NULL;
+		ResourceOwner owner;
+		int			m = 0;
+		int			got = 0;
+
+		/* the offsets ascending, each once */
+		for (int i = 0; i < n; i++)
+			offsets[i] = keep->first_offset + rows[i];
+		qsort(offsets, n, sizeof(uint64), cmp_uint64);
+		for (int i = 0; i < n; i++)
+			if (m == 0 || offsets[m - 1] != offsets[i])
+				offsets[m++] = offsets[i];
+		owner = ch_handle_reserve();
+		CH_CALL("reading rows' ids for their TIDs",
+				eng->read_rows(t->handle, keep->unit.part->name, CH_ROWID_COLUMN, offsets, (size_t) m, &reader,
+							   CH_ERR));
+		ch_handle_opened(owner, CH_HANDLE_READER, reader);
+		for (;;)
+		{
+			uint32		nrows;
+			chte_vector v;
+
+			CH_CALL("reading rows' ids for their TIDs", eng->read_next(reader, &nrows, CH_ERR));
+			if (nrows == 0)
+				break;
+			CH_CALL("reading rows' ids for their TIDs", eng->read_vector(reader, 0, &v, CH_ERR));
+			for (uint32 r = 0; r < nrows && got < m; r++)
+				ids[got++] = ((const uint64 *) v.values)[r];
+		}
+		ch_handle_closing(owner, CH_HANDLE_READER, reader);
+		eng->read_end(reader);
+		if (got != m)
+			elog(ERROR, "%d rows' ids read of a part where %d were asked for", got, m);
+		for (int i = 0; i < n; i++)
+		{
+			uint64		off = keep->first_offset + rows[i];
+			uint64	   *at = bsearch(&off, offsets, m, sizeof(uint64), cmp_uint64);
+
+			ItemPointerSet(&tids[i], CH_ROWID_TO_BLOCK(ids[at - offsets]), CH_ROWID_TO_OFFSET(ids[at - offsets]));
+		}
+		pfree(offsets);
+		pfree(ids);
+		return;
+	}
+	if (u->format == VEXEC_UNIT_PARQUET || u->format == VEXEC_UNIT_ARROW)
+	{
+		/*
+		 * a table of its own files': each row's place in its file, from its
+		 * unit's row groups' rows in the file's metadata, and the ids at those
+		 * places read from the row groups holding them alone
+		 * (chte_external_read_rows) -- the file's every id, read once a
+		 * backend (chte_own_unit_ids), took 50 ms of ClickBench's Q24 in a
+		 * fresh one, its 5 million of them
+		 */
+		SrcUnit    *keep = (SrcUnit *) u->token;
+		uint64	   *starts = palloc(sizeof(uint64) * (u->nparts + 1));
+		uint64	   *at = palloc(sizeof(uint64) * u->nparts);
+		uint64	   *offsets = palloc(sizeof(uint64) * n);
+		uint64	   *places = palloc(sizeof(uint64) * n);
+		uint64	   *ids = palloc(sizeof(uint64) * n);
+		chte_reader *reader = NULL;
+		ResourceOwner owner;
+		int			m = 0;
+		int			got = 0;
+
+		if (!t->own || keep->part->listing == NULL || eng->external_read_rows == NULL || eng->external_select == NULL)
+			elog(ERROR, "a unit's rows' TIDs asked of a table not of its own files");
+		starts[0] = 0;
+		for (int k = 0; k < u->nparts; k++)
+		{
+			chte_mark_range range;
+			size_t		nranges = 0;
+			uint64		grows = 0;
+
+			CH_CALL("listing a file's row groups",
+					eng->external_select(t->handle, keep->part->listing->handle, (size_t) keep->part->file, NULL,
+										 (uint32) u->parts[k], (uint32) u->parts[k] + 1, &range, 1, &nranges,
+										 &grows, CH_ERR));
+			starts[k + 1] = starts[k] + grows;
+			at[k] = UINT64_MAX;
+		}
+		if (starts[u->nparts] != u->rows)
+			elog(ERROR, "a unit of " UINT64_FORMAT " rows in its row groups where it has " UINT64_FORMAT,
+				 starts[u->nparts], u->rows);
+		for (int i = 0; i < n; i++)
+		{
+			int			k = 0;
+
+			while (k + 1 < u->nparts && rows[i] >= starts[k + 1])
+				k++;
+			/* the row group's first row's place in the file: the rows of those before it */
+			if (at[k] == UINT64_MAX)
+			{
+				chte_mark_range range;
+				size_t		nranges = 0;
+				uint64		before = 0;
+
+				if (u->parts[k] > 0)
+					CH_CALL("listing a file's row groups",
+							eng->external_select(t->handle, keep->part->listing->handle, (size_t) keep->part->file,
+												 NULL, 0, (uint32) u->parts[k], &range, 1, &nranges, &before,
+												 CH_ERR));
+				at[k] = before;
+			}
+			places[i] = at[k] + rows[i] - starts[k];
+			offsets[i] = places[i];
+		}
+		qsort(offsets, n, sizeof(uint64), cmp_uint64);
+		for (int i = 0; i < n; i++)
+			if (m == 0 || offsets[m - 1] != offsets[i])
+				offsets[m++] = offsets[i];
+		owner = ch_handle_reserve();
+		CH_CALL("reading rows' ids for their TIDs",
+				eng->external_read_rows(t->handle, keep->part->listing->handle, (size_t) keep->part->file,
+										CH_ROWID_COLUMN, offsets, (size_t) m, &reader, CH_ERR));
+		ch_handle_opened(owner, CH_HANDLE_READER, reader);
+		for (;;)
+		{
+			uint32		nrows;
+			chte_vector v;
+
+			CH_CALL("reading rows' ids for their TIDs", eng->read_next(reader, &nrows, CH_ERR));
+			if (nrows == 0)
+				break;
+			CH_CALL("reading rows' ids for their TIDs", eng->read_vector(reader, 0, &v, CH_ERR));
+			for (uint32 r = 0; r < nrows && got < m; r++)
+				ids[got++] = ((const uint64 *) v.values)[r];
+		}
+		ch_handle_closing(owner, CH_HANDLE_READER, reader);
+		eng->read_end(reader);
+		if (got != m)
+			elog(ERROR, "%d rows' ids read of a file where %d were asked for", got, m);
+		for (int i = 0; i < n; i++)
+		{
+			uint64	   *p = bsearch(&places[i], offsets, m, sizeof(uint64), cmp_uint64);
+
+			ItemPointerSet(&tids[i], CH_ROWID_TO_BLOCK(ids[p - offsets]), CH_ROWID_TO_OFFSET(ids[p - offsets]));
+		}
+		pfree(starts);
+		pfree(at);
+		pfree(offsets);
+		pfree(places);
+		pfree(ids);
+		return;
+	}
+	elog(ERROR, "a unit's rows' TIDs asked of a unit of no device's format");
 }
 
 /* The library's id of the dictionary of a column of the last batch (minor 3) */
@@ -1811,6 +2027,12 @@ ch_vexec_register(void)
 		{
 			r->next_unit = src_next_unit;
 			r->read_unit = src_read_unit;
+			/*
+			 * W13 (minor 9): a TID scan's units -- its own files' alone --
+			 * their rows' ids their files' column, or their TIDs by their places
+			 */
+			r->unit_tids = src_unit_tids;
+			r->row_tids = src_row_tids;
 		}
 		/*
 		 * W6 (minor 8): the plain engine's parts, their columns' compressed
@@ -1822,6 +2044,8 @@ ch_vexec_register(void)
 			r->next_unit = src_next_unit;
 			r->read_unit = src_read_unit;
 			r->read_unit_bytes = src_read_unit_bytes;
+			r->unit_tids = src_unit_tids;
+			r->row_tids = src_row_tids;
 		}
 		vexec_register_source(r);
 		if (external)

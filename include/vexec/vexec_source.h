@@ -46,13 +46,13 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		8	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		9	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
 									 * price; 5: columns in steps; 6:
 									 * set_join_keys; 7: next_unit,
 									 * read_unit; 8: MergeTree's units,
-									 * read_unit_bytes */
+									 * read_unit_bytes; 9: unit_tids */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -332,6 +332,13 @@ typedef struct VexecSourceUnit
 	/* from minor version 8, VEXEC_UNIT_MERGETREE's: its columns' streams */
 	int			nstreams;
 	const VexecSourceStream *streams;
+
+	/*
+	 * From minor version 9, a unit of a scan of TIDs: the column of its
+	 * rows' ids in its file, an unsigned 64-bit integer each, whose TIDs
+	 * row_tids() makes; NULL where unit_tids() gives them by their places
+	 */
+	const char *rowid_name;
 } VexecSourceUnit;
 
 /*
@@ -505,9 +512,13 @@ typedef struct VexecSourceRoutine
 	 * as the source's does -- comes as VEXEC_UNIT_CPU: next() then hands its
 	 * rows, and returns false at its end, and the scan goes on at the next
 	 * call of next_unit().  Called only for a scan begun with no keys, its
-	 * columns in one step, without TIDs.  The unit's pointers are the
-	 * source's until the next call of next_unit() or read_unit(), or the
-	 * scan's end.
+	 * columns in one step, without TIDs -- or, from minor version 9, with
+	 * them (VEXEC_SRC_TIDS) where the source has unit_tids(), which then
+	 * gives a unit's rows' TIDs -- or row_tids(), from the ids of a column
+	 * of the unit's file it names (rowid_name).  The unit's pointers are the
+	 * source's until
+	 * the next call of next_unit() or read_unit(), or the scan's end; its
+	 * token, until the scan's end.
 	 */
 	bool		(*next_unit) (void *state, VexecSourceUnit *unit);
 
@@ -527,6 +538,24 @@ typedef struct VexecSourceRoutine
 	 */
 	void		(*read_unit_bytes) (void *state, const VexecSourceUnit *unit, int stream,
 									uint64 offset, uint64 length, void *dest);
+
+	/*
+	 * Optional, from minor version 9 (pg_vector_executor.md §3.27, W13): the
+	 * TIDs of n rows of a unit next_unit() handed a scan begun with TIDs,
+	 * each by its place among the unit's rows, deleted ones counted, in any
+	 * order -- into tids, as next() would have handed them: a fetch of the
+	 * row by its TID under the scan's snapshot finds it.  Called between
+	 * batches, for any of the scan's units, until its end.  A unit whose
+	 * rows' TIDs the source cannot give so comes as VEXEC_UNIT_CPU.
+	 */
+	void		(*unit_tids) (void *state, const VexecSourceUnit *unit, int n, const uint64 *rows,
+							  ItemPointerData *tids);
+
+	/*
+	 * Optional, from minor version 9: the TIDs of n rows of the relation by
+	 * their ids, as a unit's rowid_name column holds them (above).
+	 */
+	void		(*row_tids) (Relation rel, int n, const uint64 *ids, ItemPointerData *tids);
 } VexecSourceRoutine;
 
 /*

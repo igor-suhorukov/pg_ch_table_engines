@@ -238,6 +238,12 @@ MergeTreeData::DataPartPtr PgMergeTree::partWithProjections(const String & part_
     return loaded.part;
 }
 
+void PgMergeTree::forgetLoadedProjections() const
+{
+    for (auto & [name, loaded] : parts)
+        loaded.projections = false;
+}
+
 MergeTreeData::DataPartPtr PgMergeTree::checkedPart(const String & part_name) const
 {
     DataPartPtr part = partWithProjections(part_name);
@@ -441,10 +447,11 @@ chte_table * openTable(const chte_table_def * def)
             metadata.secondary_indices.push_back(IndexDescription::getIndexFromAST(
                 index, columns, /* is_implicitly_created= */ false, metadata.escape_index_filenames, context));
 
-    if (create.columns_list->projections)
-        for (const auto & projection : create.columns_list->projections->children)
-            metadata.projections.add(ProjectionDescription::getProjectionFromAST(
-                projection, columns, &metadata.partition_key, context, LoadingStrictnessLevel::ATTACH));
+    /// VC21 (ch_table_engines.md §8 item 24): the projections -- _pg_rowid_index, a search by row id's
+    /// -- described where a search, an insert, a merge or a rewrite first needs them, not at every open:
+    /// ClickHouse analyzes each one's query to describe it, 0.6 to 0.9 ms of a fresh process's 1.6 for
+    /// the table's open, which a scan never reads
+    ASTPtr projections = create.columns_list->projections ? create.columns_list->projections->clone() : nullptr;
 
     auto settings = std::make_unique<MergeTreeSettings>(context->getMergeTreeSettings());
     settings->loadFromQuery(storage_def, context, /* is_loading_from_existing_metadata= */ true);
@@ -467,9 +474,32 @@ chte_table * openTable(const chte_table_def * def)
                                                  std::move(pages_disk));
     StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
     StorageMetadataPtr snapshot = handle;
-    return new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}};
+    auto * table = new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}, {}};
+    if (projections && !projections->children.empty())
+        table->projections = projections;
+    return table;
 }
 
+}
+
+void chte::describeProjections(chte_table & table)
+{
+    if (!table.projections)
+        return;
+    Names names;
+    collectFunctionNames(table.projections.get(), names);
+    if (!functionsRegistered(names))
+        registerAllFunctions();
+    auto copy = std::make_shared<StorageInMemoryMetadata>(*table.metadata);
+    for (const auto & projection : table.projections->children)
+        copy->projections.add(ProjectionDescription::getProjectionFromAST(
+            projection, copy->columns, &copy->partition_key, table.context, LoadingStrictnessLevel::ATTACH));
+    table.storage->setInMemoryMetadata(*copy);
+    StorageMetadataHandle handle = table.storage->getInMemoryMetadataPtr(table.context, /* bypass_metadata_cache= */ true);
+    table.metadata = handle;
+    /// a part loaded before has its projections to load, which its loads found none of
+    table.storage->forgetLoadedProjections();
+    table.projections = nullptr;
 }
 
 extern "C" int chte_table_open(const chte_table_def * def, chte_table ** table, chte_error * error)
