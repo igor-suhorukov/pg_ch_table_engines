@@ -931,14 +931,25 @@ std::unique_ptr<chte_reader> openExternalReader(chte_table & table, const chte_e
     }
 
     std::shared_ptr<ReadBufferFromFilePRead> buf = openListed(listed.path, listed.size, listed.mtime);
-    /// VC27: the file's footer from the process's metadata cache, parsed once
-    ObjectMetadata object;
-    object.size_bytes = listed.size;
-    object.etag = parquetFileAttr(listed.size, listed.mtime);
-    auto format = std::make_shared<ParquetV3BlockInputFormat>(
-        *buf, header, ext.format_settings, singleThreadedResources(ext.context), info,
-        ext.format_settings.parquet.local_read_min_bytes_for_seek, parquetMetadataCache(),
-        RelativePathWithMetadata(listed.path, object));
+    std::shared_ptr<ParquetV3BlockInputFormat> format;
+    if (info && info->rows_to_read)
+    {
+        /// VC27: a fetch's reader -- a few rows at offsets, read again and again in one process -- takes the file's
+        /// footer from the process's metadata cache, parsed once.  A scan's reader, mostly a fresh worker's one
+        /// reading of its file, parses its own: through the cache, ClickBench's small queries over a table of its
+        /// own Parquet files took 2.5 to 3.9 ms more, its footers of 105 columns kept and copied out (VP's rest)
+        ObjectMetadata object;
+        object.size_bytes = listed.size;
+        object.etag = parquetFileAttr(listed.size, listed.mtime);
+        format = std::make_shared<ParquetV3BlockInputFormat>(
+            *buf, header, ext.format_settings, singleThreadedResources(ext.context), info,
+            ext.format_settings.parquet.local_read_min_bytes_for_seek, parquetMetadataCache(),
+            RelativePathWithMetadata(listed.path, object));
+    }
+    else
+        format = std::make_shared<ParquetV3BlockInputFormat>(
+            *buf, header, ext.format_settings, singleThreadedResources(ext.context), info,
+            ext.format_settings.parquet.local_read_min_bytes_for_seek);
     if (units)
         format->setBucketsToRead(std::make_shared<ParquetFileBucketInfo>(*units));
     return pipelineReader(table, std::move(resolved), listed, names, QueryPipeline(Pipe(format)), /* cast= */ false, std::move(buf));

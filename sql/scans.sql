@@ -19,6 +19,20 @@ RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 RESET max_parallel_workers_per_gather;
 RESET ch.enable_chscan;
+-- its units (VC36): each the granules left to claim over 34 -- smaller toward the
+-- scan's end -- within a least of 64K rows, 8 of a mergetree part's granules, and
+-- a most of a million; an Arrow file's least one record batch, a Parquet file's
+-- reader's eight row groups; every granule in one unit, a part's last cut short
+SELECT string_agg(granules::text, ' ' ORDER BY part, first_granule) AS units
+  FROM ch.parallel_units(ARRAY[1164, 40, 18]);
+SELECT part, count(*) AS units, min(granules), max(granules), sum(granules)
+  FROM ch.parallel_units(ARRAY[1164, 40, 18]) GROUP BY part ORDER BY part;
+SELECT count(*) AS units, min(granules), max(granules), sum(granules)
+  FROM ch.parallel_units(ARRAY[63, 15], 131072);
+SELECT count(*) AS units, min(granules), max(granules), sum(granules)
+  FROM ch.parallel_units(ARRAY[63, 15], 131072, true);
+SELECT * FROM ch.parallel_units(ARRAY[0, 3, 200000], 8192) WHERE part < 3 OR first_granule = 0;
+SELECT * FROM ch.parallel_units(ARRAY[-1]);
 
 -- a TID scan fetches a row by its row id
 SELECT ctid AS tid FROM sc WHERE a = 54321 \gset

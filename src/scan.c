@@ -9,11 +9,13 @@
  *	  A scan reads units: a part each, or, in a parallel scan, runs of a
  *	  part's granules, numbered in the parts' order, which every participant
  *	  derives alike from the same snapshot and takes through an atomic
- *	  counter.  A run is the parts' granules over CH_UNITS, between
- *	  CH_UNIT_MIN_MARKS and CH_UNIT_MAX_MARKS, so that the participants end
- *	  near one another: with a million rows a unit, 10M rows made 11 units,
- *	  and of a Gather's 7 participants the last ran twice as long as the
- *	  average.  A plain scan reads every column; ChScan
+ *	  counter.  A run is the granules left to claim over CH_UNIT_DIVISOR,
+ *	  within CH_UNIT_MIN_ROWS and CH_UNIT_MAX_ROWS, so that the units shrink
+ *	  toward the scan's end and the participants end near one another: with
+ *	  a million rows a unit, 10M rows made 11 units, and of a Gather's 7
+ *	  participants the last ran twice as long as the average; with 64 units
+ *	  of one size, a 16-worker scan's last ended up to a unit's time after the
+ *	  others (VC36).  A plain scan reads every column; ChScan
  *	  and vexec's source name the columns they need and may give a filter,
  *	  which ClickHouse's analysis prunes parts and granules by (filter.c): a
  *	  unit is read as the granules the filter keeps.  A scan that needs no
@@ -61,6 +63,7 @@
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
 #include "pgstat.h"
@@ -76,6 +79,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 #include "utils/varlena.h"
 
@@ -84,14 +88,25 @@
 #include "tombstones.h"
 
 /*
- * The units of a parallel scan: about CH_UNITS of them, each a run of at
- * least CH_UNIT_MIN_MARKS granules -- 64K rows at 8,192 rows a granule, so
- * that a unit's reader is begun no more often than that -- and at most
- * CH_UNIT_MAX_MARKS, a million rows
+ * The units of a parallel scan (VC36, pg_accel's §3.31 F8): each the
+ * granules left to claim over CH_UNIT_DIVISOR -- smaller as the scan nears
+ * its end, so that its participants' last units end together -- within a
+ * least of CH_UNIT_MIN_ROWS rows, so that a unit's reader is begun no more
+ * often than that, and a most of CH_UNIT_MAX_ROWS, a million: ClickBench's
+ * 43 queries over mergetree 2.7% faster by its mean than in 64 units of one
+ * size, 9 beyond their spreads, none slower; a least of 2 or 4 granules made
+ * a scan of few columns slower.  By rows: an Arrow file's granules are its
+ * record batches, 131,072 rows each in a table of its own files, its least
+ * one of them -- ClickBench on Arrow 8 to 10% faster -- where a mergetree
+ * part's are 8,192 rows.  A Parquet file's reader parses its file's footer
+ * whole, every column chunk of every row group -- ClickBench's 105 columns'
+ * -- so its least is CH_UNIT_MIN_ROWS_PARQUET, eight such row groups: with
+ * one, ClickBench's small queries were 25 to 68% slower.
  */
-#define CH_UNITS 64
-#define CH_UNIT_MIN_MARKS 8
-#define CH_UNIT_MAX_MARKS 128
+#define CH_UNIT_DIVISOR 34
+#define CH_UNIT_MIN_ROWS 65536
+#define CH_UNIT_MIN_ROWS_PARQUET 1048576
+#define CH_UNIT_MAX_ROWS 1048576
 
 typedef struct ChParallelScan
 {
@@ -109,7 +124,7 @@ typedef struct ChScanDescData
 	List	   *parts;			/* ChPart, the snapshot's */
 	int			nparts;
 	uint32	   *unit_start;		/* parallel: each part's first unit; NULL in a serial scan */
-	uint32		unit_marks;		/* parallel: the granules of a unit */
+	uint32	   *unit_first;		/* parallel: each unit's first granule in its part, nunits + 1 */
 	uint32		nunits;
 	uint32		next_unit;		/* serial */
 	bool		claim_alone;	/* VC35: parallel, its participant the only one claiming: a part's units at once */
@@ -376,15 +391,64 @@ load_deletions(ChScanDesc scan, Snapshot snapshot)
 }
 
 /*
- * The units of a parallel scan: each part's runs of unit_marks granules, the
- * parts' granules over CH_UNITS within its bounds -- the same in every
- * participant, whose snapshot sees the same parts
+ * The units of a parallel scan of parts of these granules and rows: each
+ * part's runs of granules, each the granules left to claim, in the parts'
+ * order, over CH_UNIT_DIVISOR within its part's least and most -- each
+ * part's first unit in unit_start (nparts + 1), each unit's first granule in
+ * its part in the array returned (nunits + 1), their count in *nunits
+ */
+static uint32 *
+size_units(int nparts, const int32 *marks, const int64 *rows, bool parquet, uint32 *unit_start,
+		   uint32 *nunits)
+{
+	uint64		left = 0;
+	uint64		min_rows = parquet ? CH_UNIT_MIN_ROWS_PARQUET : CH_UNIT_MIN_ROWS;
+	uint32		cap = 64;
+	uint32	   *first = palloc(sizeof(uint32) * (cap + 1));
+	int			i;
+
+	for (i = 0; i < nparts; i++)
+		left += Max(marks[i], 1);
+	*nunits = 0;
+	for (i = 0; i < nparts; i++)
+	{
+		uint32		n = (uint32) Max(marks[i], 1);
+		uint64		per = Max((uint64) Max(rows[i], 0) / n, 1);	/* a granule's rows */
+		uint64		least = Max(min_rows / per, 1);
+		uint64		most = Max(CH_UNIT_MAX_ROWS / per, least);
+		uint32		m = 0;
+
+		unit_start[i] = *nunits;
+		do
+		{
+			uint64		size = Min(Max((left + CH_UNIT_DIVISOR - 1) / CH_UNIT_DIVISOR, least), most);
+
+			if (*nunits == cap)
+			{
+				cap *= 2;
+				first = repalloc(first, sizeof(uint32) * (cap + 1));
+			}
+			first[(*nunits)++] = m;
+			size = Min(size, (uint64) (n - m));
+			m += (uint32) size;
+			left -= size;
+		} while (m < n);
+	}
+	unit_start[nparts] = *nunits;
+	first[*nunits] = 0;
+	return first;
+}
+
+/*
+ * The units of a parallel scan, size_units()'s of the snapshot's parts --
+ * the same in every participant, whose snapshot sees the same parts
  */
 static void
 setup_units(ChScanDesc scan)
 {
 	ListCell   *lc;
-	uint64		marks = 0;
+	int32	   *marks;
+	int64	   *rows;
 	int			i = 0;
 
 	scan->nparts = list_length(scan->parts);
@@ -393,22 +457,76 @@ setup_units(ChScanDesc scan)
 		scan->nunits = scan->nparts;
 		return;
 	}
-	foreach(lc, scan->parts)
-		marks += ((ChPart *) lfirst(lc))->marks;
-	scan->unit_marks = (uint32) Min(Max((marks + CH_UNITS - 1) / CH_UNITS, CH_UNIT_MIN_MARKS),
-									CH_UNIT_MAX_MARKS);
-	scan->unit_start = palloc(sizeof(uint32) * (scan->nparts + 1));
-	scan->nunits = 0;
+	marks = palloc(sizeof(int32) * Max(scan->nparts, 1));
+	rows = palloc(sizeof(int64) * Max(scan->nparts, 1));
 	foreach(lc, scan->parts)
 	{
-		ChPart	   *p = lfirst(lc);
-		uint32		n = p->marks > scan->unit_marks ?
-			(p->marks + scan->unit_marks - 1) / scan->unit_marks : 1;
-
-		scan->unit_start[i++] = scan->nunits;
-		scan->nunits += n;
+		marks[i] = ((ChPart *) lfirst(lc))->marks;
+		rows[i++] = ((ChPart *) lfirst(lc))->rows;
 	}
-	scan->unit_start[i] = scan->nunits;
+	scan->unit_start = palloc(sizeof(uint32) * (scan->nparts + 1));
+	scan->unit_first = size_units(scan->nparts, marks, rows,
+								  scan->table->external && scan->table->ext_kind != CH_EXTERNAL_ARROW,
+								  scan->unit_start, &scan->nunits);
+	pfree(marks);
+	pfree(rows);
+}
+
+/* ---- ch.parallel_units() (VC36) ---- */
+
+/*
+ * ch.parallel_units(part_granules int4[], granule_rows int8, parquet bool):
+ * the units a parallel scan makes of parts of these granules, each of
+ * granule_rows rows, read by a Parquet file's reader or not -- each unit's
+ * part, from 1, its first granule and its granules
+ */
+PG_FUNCTION_INFO_V1(ch_parallel_units);
+Datum
+ch_parallel_units(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	int64		granule_rows = PG_GETARG_INT64(1);
+	bool		parquet = PG_GETARG_BOOL(2);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Datum	   *elems;
+	bool	   *enulls;
+	int			nparts;
+	int32	   *marks;
+	int64	   *rows;
+	uint32	   *start;
+	uint32	   *first;
+	uint32		nunits;
+
+	if (granule_rows < 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("a granule's rows must be at least 1")));
+	InitMaterializedSRF(fcinfo, 0);
+	deconstruct_array_builtin(arr, INT4OID, &elems, &enulls, &nparts);
+	marks = palloc(sizeof(int32) * Max(nparts, 1));
+	rows = palloc(sizeof(int64) * Max(nparts, 1));
+	for (int i = 0; i < nparts; i++)
+	{
+		if (enulls[i] || DatumGetInt32(elems[i]) < 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("a part's granules must be a count, not %s",
+								   enulls[i] ? "NULL" : psprintf("%d", DatumGetInt32(elems[i])))));
+		marks[i] = DatumGetInt32(elems[i]);
+		rows[i] = (int64) marks[i] * granule_rows;
+	}
+	start = palloc(sizeof(uint32) * (nparts + 1));
+	first = size_units(nparts, marks, rows, parquet, start, &nunits);
+	for (int p = 0; p < nparts; p++)
+		for (uint32 u = start[p]; u < start[p + 1]; u++)
+		{
+			uint32		end = u + 1 < start[p + 1] ? first[u + 1] : (uint32) Max(marks[p], 1);
+			Datum		values[3];
+			bool		nulls[3] = {false};
+
+			values[0] = Int32GetDatum(p + 1);
+			values[1] = Int32GetDatum((int32) first[u]);
+			values[2] = Int32GetDatum((int32) (end - first[u]));
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
+	return (Datum) 0;
 }
 
 static bool claim_one_unit(ChScanDesc scan);
@@ -483,7 +601,6 @@ claim_one_unit(ChScanDesc scan)
 	{
 		int			lo = 0;
 		int			hi = scan->nparts - 1;
-		ChPart	   *part;
 		uint32		k;
 		uint32		last;
 
@@ -498,7 +615,6 @@ claim_one_unit(ChScanDesc scan)
 				hi = mid - 1;
 		}
 		p = lo;
-		part = list_nth(scan->parts, p);
 		k = u - scan->unit_start[p];
 		/*
 		 * VC35 (pg_accel's §3.29 W32): the only participant claiming, a
@@ -516,10 +632,8 @@ claim_one_unit(ChScanDesc scan)
 				last = scan->unit_start[p + 1];
 		}
 		scan->unit_whole = k == 0 && last == scan->unit_start[p + 1];
-		scan->unit_begin = scan->unit_whole ? 0 : k * scan->unit_marks;
-		scan->unit_end = scan->unit_whole || last == scan->unit_start[p + 1] ||
-			(last - scan->unit_start[p]) * scan->unit_marks >= (uint32) part->marks ?
-			0 : (last - scan->unit_start[p]) * scan->unit_marks;
+		scan->unit_begin = scan->unit_whole ? 0 : scan->unit_first[u];
+		scan->unit_end = scan->unit_whole || last == scan->unit_start[p + 1] ? 0 : scan->unit_first[last];
 	}
 	scan->part = list_nth(scan->parts, p);
 	scan->selected = false;

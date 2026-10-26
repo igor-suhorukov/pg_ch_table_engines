@@ -196,6 +196,16 @@ CREATE FUNCTION ch.fetch_stats(OUT fetches bigint, OUT columns bigint, OUT whole
 							   OUT kept bigint, OUT located bigint, OUT pointed bigint)
 	AS 'MODULE_PATHNAME', 'ch_fetch_stats' LANGUAGE C STRICT VOLATILE;
 
+-- The units a parallel scan makes of parts of these granules (ch_table_engines.md
+-- VC36): each the granules left to claim over 34, within a least of 64K rows --
+-- a Parquet file's reader's, a million -- and a most of a million; each unit's
+-- part, from 1, its first granule and its granules.
+CREATE FUNCTION ch.parallel_units(part_granules int4[], granule_rows int8 DEFAULT 8192,
+								  parquet bool DEFAULT false,
+								  OUT part int4, OUT first_granule int4, OUT granules int4)
+	RETURNS SETOF record
+	AS 'MODULE_PATHNAME', 'ch_parallel_units' LANGUAGE C STRICT IMMUTABLE;
+
 -- MergeTree parts' streams kept in shared memory for a GPU's units (ch_table_engines.md
 -- §3, VC29): the entries kept now, NULL where none can be -- the extension not
 -- preloaded, or ch.device_streams 0 -- this session's runs of granules found
