@@ -269,6 +269,48 @@ remove_tmp_dir(int code, Datum arg)
 	(void) rmtree(DatumGetPointer(arg), true);
 }
 
+/* The process's temporary directory; made, once */
+static char tmp_dir[MAXPGPATH];
+static bool tmp_dir_made = false;
+
+/*
+ * The process's own temporary directory, removed as it exits; one a crash
+ * leaves goes at the next start, its name PostgreSQL's temporary files'
+ * (fd.c, RemovePgTempFiles()).
+ */
+static const char *
+make_tmp_dir(void)
+{
+	if (tmp_dir_made)
+		return tmp_dir;
+	snprintf(tmp_dir, sizeof(tmp_dir), "%s/base/%s", DataDir, PG_TEMP_FILES_DIR);
+	(void) MakePGDirectory(tmp_dir);
+	snprintf(tmp_dir, sizeof(tmp_dir), "%s/base/%s/%schte_%d/", DataDir, PG_TEMP_FILES_DIR, PG_TEMP_FILE_PREFIX,
+			 MyProcPid);
+	if (MakePGDirectory(tmp_dir) < 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create directory \"%s\": %m", tmp_dir)));
+	on_proc_exit(remove_tmp_dir, PointerGetDatum(tmp_dir));
+	tmp_dir_made = true;
+	return tmp_dir;
+}
+
+/*
+ * pg_accel's §3.32 F12 (VC38): made where a merge first needs it -- a vertical
+ * merge keeps its rows' sources there -- not by every process that starts the
+ * engine, its mkdir() and its removal at the exit 0.28 Mcycles a process
+ */
+void
+ch_engine_temporary_files(void)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (tmp_dir_made || eng->set_temporary_path == NULL)
+		return;
+	CH_CALL("setting the temporary directory", eng->set_temporary_path(make_tmp_dir(), CH_ERR));
+}
+
 /* The library's file, as ch.engine_library names it */
 static void
 engine_path(char *path)
@@ -330,7 +372,6 @@ ch_engine(void)
 {
 	char		path[MAXPGPATH];
 	char		work[MAXPGPATH];
-	static char tmp[MAXPGPATH];
 	void	   *handle;
 	chte_init_options options;
 	chte_error	err;
@@ -407,6 +448,12 @@ ch_engine(void)
 		engine.own_list_summaries = NULL;
 	}
 	*(void **) &engine.footers_read = dlsym(handle, "chte_footers_read");
+	/* optional: a library built before pg_accel's F12 takes the temporary directory at its start alone */
+	*(void **) &engine.set_temporary_path = dlsym(handle, "chte_set_temporary_path");
+	/* optional: a library built before pg_accel's F13 counts no unit's footer */
+	*(void **) &engine.footers_pruned = dlsym(handle, "chte_footers_pruned");
+	/* optional: a library built before pg_accel's F11 decodes every column's ranges as it lists a part */
+	*(void **) &engine.ranges_decoded = dlsym(handle, "chte_ranges_decoded");
 	/* optional: a library built before pg_accel's F7 says no batch's granule */
 	*(void **) &engine.read_granule = dlsym(handle, "chte_read_granule");
 	/* optional: a library built before pg_accel's F6 reads no row alone */
@@ -524,20 +571,8 @@ ch_engine(void)
 	options.data_path = path;
 	snprintf(work, sizeof(work), "%s/pg_chte/", DataDir);
 	options.work_path = work;
-	/*
-	 * The process's own temporary directory, removed as it exits; one a crash
-	 * leaves goes at the next start, its name PostgreSQL's temporary files'
-	 * (fd.c, RemovePgTempFiles()).
-	 */
-	snprintf(tmp, sizeof(tmp), "%s/base/%s", DataDir, PG_TEMP_FILES_DIR);
-	(void) MakePGDirectory(tmp);
-	snprintf(tmp, sizeof(tmp), "%s/base/%s/%schte_%d/", DataDir, PG_TEMP_FILES_DIR, PG_TEMP_FILE_PREFIX, MyProcPid);
-	if (MakePGDirectory(tmp) < 0 && errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create directory \"%s\": %m", tmp)));
-	on_proc_exit(remove_tmp_dir, PointerGetDatum(tmp));
-	options.tmp_path = tmp;
+	/* the temporary directory where a merge first needs it (VC38), else now */
+	options.tmp_path = engine.set_temporary_path != NULL ? NULL : make_tmp_dir();
 	options.log_level = ch_engine_log_level;
 	options.settings = ch_engine_settings;
 	options.callbacks.interrupted = engine_interrupted;

@@ -21,8 +21,10 @@ RESET max_parallel_workers_per_gather;
 RESET ch.enable_chscan;
 -- its units (VC36): each the granules left to claim over 34 -- smaller toward the
 -- scan's end -- within a least of 64K rows, 8 of a mergetree part's granules, and
--- a most of a million; an Arrow file's least one record batch, a Parquet file's
--- reader's eight row groups; every granule in one unit, a part's last cut short
+-- a most of a million; an Arrow file's least one record batch, as a table of its
+-- own Parquet files' one row group (VC39), a Parquet file's reader's of its whole
+-- footer, a table of files not its own, eight row groups; every granule in one
+-- unit, a part's last cut short
 SELECT string_agg(granules::text, ' ' ORDER BY part, first_granule) AS units
   FROM ch.parallel_units(ARRAY[1164, 40, 18]);
 SELECT part, count(*) AS units, min(granules), max(granules), sum(granules)

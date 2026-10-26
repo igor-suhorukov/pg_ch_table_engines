@@ -144,6 +144,12 @@ typedef struct ChEngine
 	void		(*read_granule) (chte_reader *, int64_t *, int32_t *);
 	/* optional (pg_accel's F6, VC27): the rows the process read alone of Arrow batches, for the tests */
 	uint64_t	(*rows_read_alone) (void);
+	/* optional (pg_accel's §3.32 F12, VC38): the temporary directory set where a merge first needs it */
+	int			(*set_temporary_path) (const char *, chte_error *);
+	/* optional (pg_accel's §3.32 F13, VC39): the Parquet units' readers given their row groups' footer, for the tests */
+	uint64_t	(*footers_pruned) (void);
+	/* optional (pg_accel's §3.32 F11, VC37): the columns' ranges decoded from summaries, for the tests */
+	uint64_t	(*ranges_decoded) (void);
 } ChEngine;
 
 /* GUCs */
@@ -164,6 +170,13 @@ typedef enum ChEngineFunctions
 
 /* The library, loaded and initialized on the first call. */
 extern const ChEngine *ch_engine(void);
+
+/*
+ * The process's temporary directory, for the merge about to run: made and
+ * given to the library where it was not yet (VC38), removed as the process
+ * exits
+ */
+extern void ch_engine_temporary_files(void);
 
 /* The postmaster's: the library mapped, nothing of it called (VC12) */
 extern void ch_engine_map(void);

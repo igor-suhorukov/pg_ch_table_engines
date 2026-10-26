@@ -413,6 +413,7 @@ merge_own(Relation rel, ChTable *t, List *chosen, bool fold_only, int *nfolded)
 	tmp = psprintf("tmp_merge_%s", next.name);
 	dir = tmp_part_dir(&t->storage, tmp);
 	file = psprintf("%s/%s", dir, t->own_file);
+	ch_engine_temporary_files();
 	CH_CALL("merging parts",
 			eng->own_merge(t->handle, listing->handle, files, (size_t) n, mine_all, (size_t) nmine_all, dropped,
 						   t->own_format, file, t->file_columns, t->nfile_columns, missing_values(rel, t),

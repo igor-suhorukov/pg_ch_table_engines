@@ -19,6 +19,6 @@ SELECT amname, amtype FROM pg_am WHERE amhandler::text LIKE 'ch.%' ORDER BY amna
 SELECT version, threads FROM ch.engine_info();
          version          | threads 
 --------------------------+---------
- ClickHouse v26.8.8.8-lts |       5
+ ClickHouse v26.8.8.8-lts |       1
 (1 row)
 

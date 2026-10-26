@@ -59,7 +59,8 @@ typedef struct chte_init_options
 	const char *data_path;		/* root of the parts' directories, ends with '/' */
 	const char *work_path;		/* ClickHouse's own directory, ends with '/'; NULL: data_path */
 	const char *tmp_path;		/* the process's own directory of temporary files -- a vertical
-								 * merge's rows' sources -- which it clears; ends with '/' */
+								 * merge's rows' sources -- which it clears; ends with '/'; NULL:
+								 * none until chte_set_temporary_path() */
 	const char *log_level;		/* "error", "warning", "information", "debug", "trace" */
 	const char *settings;		/* ClickHouse settings "name = value, ...", or NULL */
 	chte_callbacks callbacks;
@@ -75,6 +76,14 @@ CHTE_API int			chte_init(const chte_init_options *options, chte_error *error);
  * it builds them in each process's chte_init, which still sets the zone where it was not.
  */
 CHTE_API int			chte_preload(chte_error *error);
+
+/*
+ * The process's own directory of temporary files, as chte_init_options.tmp_path, set where a merge
+ * first needs one (pg_accel's §3.32 F12): a vertical merge keeps its rows' sources there.  Setting it
+ * up clears the temporary files in it; the same path again is a no-op.  Optional: a library built
+ * before it takes tmp_path at chte_init alone.
+ */
+CHTE_API int			chte_set_temporary_path(const char *path, chte_error *error);
 
 /*
  * Shuts the process's ClickHouse down: its background executors' idle threads end, so
@@ -843,6 +852,19 @@ CHTE_API int			chte_own_list_summaries(chte_table *table, const char *const *pat
  * reads none.  Optional: a library built before it lacks it.
  */
 CHTE_API uint64_t	chte_footers_read(void);
+
+/*
+ * pg_accel's §3.32 F13 (VC39): the Parquet units' readers the process has given a footer of their row
+ * groups alone, for the tests.  Optional: a library built before it lacks it.
+ */
+CHTE_API uint64_t	chte_footers_pruned(void);
+
+/*
+ * pg_accel's §3.32 F11 (VC37): the columns whose units' ranges the process has decoded from parts'
+ * summaries, each at a filter's first ask of it, for the tests.  Optional: a library built before it
+ * lacks it.
+ */
+CHTE_API uint64_t	chte_ranges_decoded(void);
 
 /*
  * The places in a listed file of the rows of ids: offsets[i] the place of ids[i], UINT64_MAX

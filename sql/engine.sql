@@ -125,4 +125,25 @@ SELECT count(*), sum(c60) FROM ew WHERE c1 % 3 = 0;
 SELECT torn_down - :before_torn_down >= 1 AS torn_down FROM ch.engine_exits();
 RESET ch.fast_exit;
 
-DROP TABLE ef, eu, ew;
+-- pg_accel's §3.32 F12 (VC38): a process that reads a table of its own files
+-- alone starts no thread of ClickHouse's -- the background executors start
+-- with its first MergeTree table -- and makes no temporary directory, which a
+-- merge alone needs
+CREATE TABLE eo (a int, b text) USING parquet;
+INSERT INTO eo SELECT g, 'v' || g FROM generate_series(1, 100) g;
+\c
+SET client_min_messages = warning;
+SELECT count(*), sum(a) FROM eo WHERE a > 10;
+SELECT threads FROM ch.engine_info();
+SELECT count(*) AS temporary_directories
+  FROM pg_ls_dir('base/pgsql_tmp', true, false) AS d WHERE d = 'pgsql_tmpchte_' || pg_backend_pid();
+SELECT count(*), sum(a) FROM ef WHERE a > 10;
+SELECT threads FROM ch.engine_info();
+-- a merge makes it
+INSERT INTO ef SELECT g, 'v' || g FROM generate_series(102, 120) g;
+SELECT ch.optimize('ef', true) AS merged;
+SELECT count(*) AS temporary_directories
+  FROM pg_ls_dir('base/pgsql_tmp', true, false) AS d WHERE d = 'pgsql_tmpchte_' || pg_backend_pid();
+SELECT count(*), sum(a) FROM ef;
+
+DROP TABLE ef, eu, ew, eo;

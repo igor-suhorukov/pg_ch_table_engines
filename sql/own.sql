@@ -62,6 +62,21 @@ DO $$ BEGIN
 	EXECUTE 'EXPLAIN SELECT min(d), max(t) FROM p';
 END $$;
 SELECT ch.footers_read() AS footers_read;
+-- pg_accel's §3.32 F11 (VC37): of a summary's columns, the units' ranges of those a filter or min() and max() ask
+-- for alone decoded, each once -- the plans above: id's of each table's part, and a column min() and max() answer
+-- of p's; a plan with no filter or min() decodes none, nor the same filter's again
+SELECT ch.ranges_decoded() AS ranges_decoded;
+DO $$ BEGIN
+	EXECUTE 'EXPLAIN SELECT count(*), sum(i4) FROM p';
+	EXECUTE 'EXPLAIN SELECT count(*), sum(id) FROM p WHERE id BETWEEN 20000 AND 30000';
+END $$;
+SELECT ch.ranges_decoded() AS ranges_decoded;
+-- F13 (VC39): the unit's reader of the row groups a filter keeps given their footer alone, the others' column
+-- chunks left out -- the suite's servers compare it with the whole footer (CHTE_SPEC_CHECK) -- its rows as ever
+SET max_parallel_workers_per_gather = 0;
+SELECT count(*), sum(i4), min(d), max(t) FROM p WHERE id BETWEEN 140000 AND 150000;
+SELECT ch.footers_pruned() AS footers_pruned;
+RESET max_parallel_workers_per_gather;
 \c
 SET extra_float_digits = 0;
 SET vexec.mode = off;

@@ -616,7 +616,7 @@ HINT:  Set another location with ALTER TABLE ... SET (location = '...').
 SELECT threads FROM ch.engine_info();
  threads 
 ---------
-       5
+       1
 (1 row)
 
 DROP TABLE ext, g, sub, src;

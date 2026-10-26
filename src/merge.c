@@ -185,6 +185,7 @@ merge_chosen(Relation rel, ChTable *t, const PartPlace *chosen, int n)
 		/* the merged part's version a block number of the storage's: no other part ever has its name */
 		ch_counters_allocate(&t->storage, 0, 1, &ignored, &version);
 		owner = ch_handle_reserve();
+		ch_engine_temporary_files();
 		CH_CALL("merging parts", eng->merge(t->handle, names, ninputs, version, &writer, CH_ERR));
 		ch_handle_opened(owner, CH_HANDLE_WRITER, writer);
 		CH_CALL("merging parts", eng->write_part(writer, 0, &info, CH_ERR));

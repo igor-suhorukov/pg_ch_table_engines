@@ -169,6 +169,33 @@ ch_footers_read(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The Parquet units' readers the session's process has given a footer of
+ * their row groups alone (pg_accel's §3.32 F13, VC39), for the tests; NULL
+ * where the engine library predates the count.
+ */
+PG_FUNCTION_INFO_V1(ch_ranges_decoded);
+Datum
+ch_ranges_decoded(PG_FUNCTION_ARGS)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (eng->ranges_decoded == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) eng->ranges_decoded());
+}
+
+PG_FUNCTION_INFO_V1(ch_footers_pruned);
+Datum
+ch_footers_pruned(PG_FUNCTION_ARGS)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (eng->footers_pruned == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) eng->footers_pruned());
+}
+
+/*
  * The rows the session's process has read alone of an Arrow file's record
  * batches (VC27), for the tests; NULL where the engine library predates it.
  */

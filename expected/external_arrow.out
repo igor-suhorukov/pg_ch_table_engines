@@ -354,7 +354,7 @@ DETAIL:  A table of access method arrow reads the files at its location, and is 
 SELECT threads FROM ch.engine_info();
  threads 
 ---------
-       5
+       1
 (1 row)
 
 DROP TABLE pq, a_none, a_lz4, a_zstd, ag, ad, src;

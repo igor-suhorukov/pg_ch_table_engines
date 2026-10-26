@@ -569,7 +569,7 @@ DETAIL:  A table of access method iceberg reads the files at its location, and i
 SELECT threads FROM ch.engine_info();
  threads 
 ---------
-       5
+       1
 (1 row)
 
 DROP TABLE ice, ref, src;

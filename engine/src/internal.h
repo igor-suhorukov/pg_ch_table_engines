@@ -140,6 +140,9 @@ struct Engine
 /// The initialized engine; throws if chte_init has not succeeded.
 Engine & engine();
 
+/// The global background executors, started once, with the first MergeTree table a process makes (F12)
+void startBackgroundExecutors();
+
 /// Throws QUERY_WAS_CANCELLED when the caller's interrupted() callback says so.
 void checkInterrupted();
 

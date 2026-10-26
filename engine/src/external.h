@@ -64,7 +64,17 @@ struct OwnSummaryColumn
     bool bounded = false;    /// the least and greatest values exact
     Field min;
     Field max;
-    std::vector<std::optional<Range>> ranges;
+
+    /// Each unit's range of the column's values, for a filter's pruning: a summary of format 3 keeps their bytes,
+    /// decoded at the first ask (pg_accel's §3.32 F11, VC37) -- a plan's filter names a few of a table's columns, a
+    /// scan's none, and every unit's range of each of ClickBench's 105 made 3.2 Mcycles of each fresh plan
+    const std::vector<std::optional<Range>> & unitRanges(size_t nunits) const;
+
+    /// format 3: the ranges' bytes, within their summary's (OwnSummary::bytes)
+    const char * ranges_data = nullptr;
+    size_t ranges_size = 0;
+    mutable bool ranges_decoded = false;
+    mutable std::vector<std::optional<Range>> ranges;
 };
 
 /// VC25: a table of its own files' part's summary (chte_own_summary), which the caller keeps in the part's catalog row
@@ -79,6 +89,8 @@ struct OwnSummary
     UInt64 arrow_body = 0;
     UInt64 arrow_fields = 0;
     std::map<String, OwnSummaryColumn> columns;
+    /// format 3: the summary's bytes, which its columns' ranges are decoded from as asked
+    String bytes;
 };
 
 /// A file's footer, as read once in the process for a format, a path, a size and a modification time -- or, a table

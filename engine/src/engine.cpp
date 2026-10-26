@@ -14,6 +14,7 @@
 #include <DataTypes/DataTypeFactory.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Common/checkStackSize.h>
 #include <Common/DateLUT.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTrackerBlockerInThread.h>
@@ -262,36 +263,49 @@ extern "C" int chte_init(const chte_init_options * options, chte_error * error)
         DateLUT::setDefaultTimezone("UTC");
         applySettings(engine->global, options->settings);
 
-        /// MergeTreeData's constructor initializes the global background executors
-        /// (MergeTreeData.cpp:775), each of which starts its threads at once
-        /// (MergeTreeBackgroundExecutor.cpp:90-91).  Nothing is ever scheduled on them here;
-        /// they get one thread each, started with every signal blocked so that the server's
-        /// signals keep going to the thread that handles them.
+        /// The background executors' sizes, for startBackgroundExecutors(): one thread each
         for (const char * name : {"background_pool_size", "background_move_pool_size",
                                   "background_fetches_pool_size", "background_common_pool_size"})
             engine->global->setServerSetting(name, Field(UInt64(1)));
         engine->global->setServerSetting("background_merges_mutations_concurrency_ratio", Field(Float64(1)));
-
-        sigset_t all;
-        sigset_t old;
-        sigfillset(&all);
-        pthread_sigmask(SIG_BLOCK, &all, &old);
-        try
-        {
-            engine->global->initializeBackgroundExecutorsIfNeeded();
-        }
-        catch (...)
-        {
-            pthread_sigmask(SIG_SETMASK, &old, nullptr);
-            throw;
-        }
-        pthread_sigmask(SIG_SETMASK, &old, nullptr);
 
         state = engine.release();
         /// Static destructors join the global thread pool's threads (ThreadPool.cpp:700-743),
         /// so the executors must have ended theirs first; see chte_shutdown.
         atexit(chte_shutdown);
     });
+}
+
+namespace
+{
+bool executors_started = false;
+}
+
+/// MergeTreeData's constructor initializes the global background executors (MergeTreeData.cpp:775),
+/// each of which starts its threads at once (MergeTreeBackgroundExecutor.cpp:90-91).  Nothing is ever
+/// scheduled on them here; they get one thread each (chte_init), started with every signal blocked so that
+/// the server's signals keep going to the thread that handles them.  pg_accel's §3.32 F12 (VC38): started
+/// as the process makes its first MergeTree table (makeTable()), where chte_init started them -- a process
+/// that reads tables of their own files alone starts none, 0.47 Mcycles and four threads a process
+void chte::startBackgroundExecutors()
+{
+    if (executors_started)
+        return;
+    sigset_t all;
+    sigset_t old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    try
+    {
+        engine().global->initializeBackgroundExecutorsIfNeeded();
+    }
+    catch (...)
+    {
+        pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        throw;
+    }
+    pthread_sigmask(SIG_SETMASK, &old, nullptr);
+    executors_started = true;
 }
 
 extern "C" void chte_shutdown(void)
@@ -303,11 +317,14 @@ extern "C" void chte_shutdown(void)
     auto & global = state->global;
     try
     {
-        /// The executors first: their threads are the ones exit() would wait for.
-        global->getMergeMutateExecutor()->wait();
-        global->getMovesExecutor()->wait();
-        global->getFetchesExecutor()->wait();
-        global->getCommonExecutor()->wait();
+        /// The executors first, where they were started: their threads are the ones exit() would wait for.
+        if (executors_started)
+        {
+            global->getMergeMutateExecutor()->wait();
+            global->getMovesExecutor()->wait();
+            global->getFetchesExecutor()->wait();
+            global->getCommonExecutor()->wait();
+        }
     }
     catch (...)
     {
@@ -353,12 +370,18 @@ extern "C" void chte_shutdown(void)
 /// backend's chte_init 1.0 -> 0.4 ms, its first table's columns 0.3 -> 0.19.  No context is made here:
 /// ClickHouse makes one shared context a process (Context.cpp, ContextSharedPart's constructor).  The
 /// threads are counted before and after.
+/// pg_accel's §3.32 F12 (VC38), at the user's word: and the main thread's stack bounds that
+/// checkStackSize() finds once a thread (Common/checkStackSize.cpp:41, 133-140) -- glibc's
+/// pthread_getattr_np() reading /proc/self/maps, 0.37 Mcycles of each process's first table's open --
+/// thread-local, constinit, inherited by the main thread of every process forked from here, whose stack
+/// is where the postmaster's is.
 extern "C" int chte_preload(chte_error * error)
 {
     return guarded(error, [&]
     {
         int threads = chte_thread_count();
 
+        checkStackSize();
         DateLUT::setDefaultTimezone("UTC");
         registerUsedFunctions();
         {
@@ -375,6 +398,23 @@ extern "C" int chte_preload(chte_error * error)
         }
         if (chte_thread_count() != threads)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "the preload started {} threads", chte_thread_count() - threads);
+    });
+}
+
+/// pg_accel's §3.32 F12 (VC38): the process's own directory of temporary files, set where a merge first
+/// needs it -- a vertical merge's rows' sources (MergeTask.cpp, RowsSourcesTemporaryFile) -- not by every
+/// process's chte_init, which made it and removed it again; setting it up clears the temporary files in it
+extern "C" int chte_set_temporary_path(const char * path, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        static String set;
+        if (!path || !*path)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_set_temporary_path: a path is required");
+        if (set == path)
+            return;
+        engine().global->setTemporaryStoragePath(path, /* max_size= */ 0);
+        set = path;
     });
 }
 

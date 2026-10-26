@@ -94,5 +94,27 @@ SET ch.enable_part_selections = off;
 SELECT count(*), sum(b) FROM sel WHERE a BETWEEN 30000 AND 30500;
 RESET ch.enable_part_selections;
 
+-- VC40: a filter of the key's second column, the granules it keeps more
+-- ranges than an entry holds in itself, as ClickBench's Q19's: kept in the
+-- pool beside the table, and found by a fresh backend, which loads no part
+CREATE TABLE sel_many (a int NOT NULL, b int NOT NULL, c int)
+  USING mergetree WITH (order_by = 'a, b', settings = 'index_granularity = 64');
+INSERT INTO sel_many SELECT i / 200, i % 200, i FROM generate_series(0, 39999) i;
+SELECT count(*) AS parts FROM ch.parts('sel_many');
+SET ch.enable_part_selections = off;
+SELECT count(*), sum(c) FROM sel_many WHERE b = 7;
+RESET ch.enable_part_selections;
+\c
+SET max_parallel_workers_per_gather = 0;
+SELECT count(*), sum(c) FROM sel_many WHERE b = 7;
+SELECT stored > 0 AS kept FROM ch.part_selections();
+\c
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(c) FROM sel_many WHERE b = 7;
+SELECT s.found > 0 AS found, s.stored = 0 AS none_kept, s.checked > 0 OR d.parts_loaded = 0 AS no_part_loaded
+  FROM ch.part_selections() s, ch.device_streams() d;
+SELECT count(*), sum(c) FROM sel_many WHERE b = 7;
+DROP TABLE sel_many;
+
 DROP TABLE sel, sel_want;
 DROP FUNCTION sel_got(int);

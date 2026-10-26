@@ -20,15 +20,22 @@
  *	  the table's definition and the process's engine settings, which are
  *	  what else the answer depends on.  A filter of a hash join's keys
  *	  (VC3), whose values change with each batch of the join's inner side,
- *	  has no key, and its answers are not kept; nor those of more ranges than
- *	  an entry holds, nor a temporary table's.
+ *	  has no key, and its answers are not kept; nor a temporary table's.
+ *
+ *	  An entry holds CH_SELECTION_RANGES ranges in itself, and an answer of
+ *	  more in a pool of ranges beside the table (VC40, pg_accel's §3.32 F15):
+ *	  ClickBench's Q19, a filter of the key's third column, keeps hundreds of
+ *	  ranges of its largest part, and each fresh backend loaded its parts and
+ *	  searched their primary index again, 1.3 ms of its plan.
  *
  *	  A table of ch.part_selections entries in the main shared memory, made
- *	  where the extension is preloaded; probed from a hash of the key, under
- *	  one lock, shared to find and exclusive to keep.  Full, it is emptied
- *	  and filled again: entries of parts merged away or dropped go so.  Not
- *	  preloaded, nothing is kept.  With CHTE_SPEC_CHECK in the environment,
- *	  the tests', each answer found is compared with the engine's.
+ *	  where the extension is preloaded, and a pool of as many ranges as its
+ *	  entries hold in themselves; probed from a hash of the key, under one
+ *	  lock, shared to find and exclusive to keep.  Full, either is emptied with
+ *	  the other and filled again: entries of parts merged away or dropped go
+ *	  so.  Not preloaded, nothing is kept.  With CHTE_SPEC_CHECK in the
+ *	  environment, the tests', each answer found is compared with the
+ *	  engine's.
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -70,6 +77,7 @@ typedef struct ChSelectionsSlot
 	uint32		nranges;
 	ChSelectionsKey key;
 	uint64		rows;			/* the kept granules' */
+	uint32		pooled;			/* more than CH_SELECTION_RANGES: the first of the pool's */
 	chte_mark_range ranges[CH_SELECTION_RANGES];
 } ChSelectionsSlot;
 
@@ -78,6 +86,7 @@ typedef struct ChSelectionsShared
 	LWLock	   *lock;
 	uint32		nslots;			/* a power of two, twice the entries or more */
 	uint32		used;
+	uint32		pool_used;		/* of pool_ranges() after the slots */
 	ChSelectionsSlot slots[FLEXIBLE_ARRAY_MEMBER];
 } ChSelectionsShared;
 
@@ -101,10 +110,41 @@ slot_count(void)
 	return n;
 }
 
+/* VC40: the pool's ranges, as many as the entries hold in themselves */
+static uint32
+pool_ranges(void)
+{
+	return (uint32) ch_part_selections * CH_SELECTION_RANGES;
+}
+
 static Size
 shared_size(void)
 {
-	return add_size(offsetof(ChSelectionsShared, slots), mul_size(slot_count(), sizeof(ChSelectionsSlot)));
+	return add_size(add_size(offsetof(ChSelectionsShared, slots), mul_size(slot_count(), sizeof(ChSelectionsSlot))),
+					mul_size(pool_ranges(), sizeof(chte_mark_range)));
+}
+
+/* The pool: after the slots */
+static inline chte_mark_range *
+pool(void)
+{
+	return (chte_mark_range *) &shared->slots[shared->nslots];
+}
+
+/* An entry's ranges: in itself, or in the pool */
+static inline const chte_mark_range *
+slot_ranges(const ChSelectionsSlot *s)
+{
+	return s->nranges > CH_SELECTION_RANGES ? pool() + s->pooled : s->ranges;
+}
+
+/* Every entry gone, and the pool's ranges with them; under the lock */
+static void
+empty_all(void)
+{
+	memset(shared->slots, 0, sizeof(ChSelectionsSlot) * shared->nslots);
+	shared->used = 0;
+	shared->pool_used = 0;
 }
 
 static void
@@ -133,8 +173,7 @@ selections_shmem_startup(void)
 	{
 		shared->lock = &(GetNamedLWLockTranche("ch_table_engines part selections"))->lock;
 		shared->nslots = slot_count();
-		shared->used = 0;
-		memset(shared->slots, 0, sizeof(ChSelectionsSlot) * shared->nslots);
+		empty_all();
 	}
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -229,12 +268,44 @@ ch_selections_find(const ChTable *t, const ChPart *part, const ChFilterKey *fk, 
 		*nranges = s->nranges;
 		*rows = s->rows;
 		if (ranges != NULL)
-			memcpy(ranges, s->ranges, sizeof(chte_mark_range) * Min((size_t) s->nranges, cap));
+			memcpy(ranges, slot_ranges(s), sizeof(chte_mark_range) * Min((size_t) s->nranges, cap));
 	}
 	LWLockRelease(shared->lock);
 	if (found)
 		found_count++;
 	return found;
+}
+
+/*
+ * CHTE_SPEC_CHECK: every range of an answer found, palloc'd, for its
+ * comparison with the library's -- not counted as found again; NULL where
+ * the entry went since
+ */
+chte_mark_range *
+ch_selections_ranges(const ChTable *t, const ChPart *part, const ChFilterKey *fk, uint32 begin, uint32 end,
+					 size_t *nranges, uint64 *rows)
+{
+	ChSelectionsKey key;
+	uint32		h;
+	ChSelectionsSlot *s;
+	chte_mark_range *ranges = NULL;
+
+	if (!make_key(t, part, fk, begin, end, &key))
+		return NULL;
+	h = key_hash(&key);
+	LWLockAcquire(shared->lock, LW_SHARED);
+	s = probe(&key, h);
+	if (s->hash != 0)
+	{
+		*nranges = s->nranges;
+		*rows = s->rows;
+		ranges = MemoryContextAllocExtended(CurrentMemoryContext, sizeof(chte_mark_range) * Max(s->nranges, 1),
+											MCXT_ALLOC_NO_OOM);
+		if (ranges != NULL)
+			memcpy(ranges, slot_ranges(s), sizeof(chte_mark_range) * s->nranges);
+	}
+	LWLockRelease(shared->lock);
+	return ranges;
 }
 
 /* The engine library's answer for marks [begin, end) of a part under the filter of key fk, kept */
@@ -246,16 +317,18 @@ ch_selections_keep(const ChTable *t, const ChPart *part, const ChFilterKey *fk, 
 	uint32		h;
 	ChSelectionsSlot *s;
 
-	if (nranges > CH_SELECTION_RANGES || !make_key(t, part, fk, begin, end, &key))
+	if (!make_key(t, part, fk, begin, end, &key) || nranges > pool_ranges())
 		return;
 	h = key_hash(&key);
 	LWLockAcquire(shared->lock, LW_EXCLUSIVE);
-	/* full: every entry goes, those of parts merged away or dropped among them */
-	if (shared->used + 1 > (uint32) ch_part_selections)
-	{
-		memset(shared->slots, 0, sizeof(ChSelectionsSlot) * shared->nslots);
-		shared->used = 0;
-	}
+	/*
+	 * full, the table or the pool an answer of more ranges than an entry
+	 * holds takes: every entry goes, those of parts merged away or dropped
+	 * among them
+	 */
+	if (shared->used + 1 > (uint32) ch_part_selections ||
+		(nranges > CH_SELECTION_RANGES && shared->pool_used + nranges > pool_ranges()))
+		empty_all();
 	s = probe(&key, h);
 	if (s->hash == 0)
 		shared->used++;
@@ -263,7 +336,14 @@ ch_selections_keep(const ChTable *t, const ChPart *part, const ChFilterKey *fk, 
 	s->key = key;
 	s->rows = rows;
 	s->nranges = (uint32) nranges;
-	memcpy(s->ranges, ranges, sizeof(chte_mark_range) * nranges);
+	s->pooled = 0;
+	if (nranges > CH_SELECTION_RANGES)
+	{
+		/* another answer of its key's in the pool left there until the pool is emptied */
+		s->pooled = shared->pool_used;
+		shared->pool_used += (uint32) nranges;
+	}
+	memcpy(unconstify(chte_mark_range *, slot_ranges(s)), ranges, sizeof(chte_mark_range) * nranges);
 	LWLockRelease(shared->lock);
 	stored_count++;
 }

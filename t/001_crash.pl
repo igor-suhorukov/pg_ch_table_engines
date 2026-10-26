@@ -76,7 +76,9 @@ fsync = on
 	# and the table keeps working; the dead writer's part does not get in the way
 	$node->safe_psql('postgres', q{INSERT INTO t VALUES (0, 'after')});
 	is($node->safe_psql('postgres', q{SELECT count(*) FROM t}), '160001', "$level: inserts after recovery");
-	is($node->safe_psql('postgres', q{SELECT threads FROM ch.engine_info()}), '5', "$level: the engine library after recovery");
+	# its executors started with the session's first MergeTree table (pg_accel's §3.32 F12)
+	is($node->safe_psql('postgres', q{SELECT count(*) > 0 FROM t; SELECT threads FROM ch.engine_info()}), "t\n5",
+	   "$level: the engine library after recovery");
 	$node->stop;
 }
 done_testing();

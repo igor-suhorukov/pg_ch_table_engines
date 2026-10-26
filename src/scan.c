@@ -98,10 +98,15 @@
  * a scan of few columns slower.  By rows: an Arrow file's granules are its
  * record batches, 131,072 rows each in a table of its own files, its least
  * one of them -- ClickBench on Arrow 8 to 10% faster -- where a mergetree
- * part's are 8,192 rows.  A Parquet file's reader parses its file's footer
- * whole, every column chunk of every row group -- ClickBench's 105 columns'
- * -- so its least is CH_UNIT_MIN_ROWS_PARQUET, eight such row groups: with
- * one, ClickBench's small queries were 25 to 68% slower.
+ * part's are 8,192 rows.  A Parquet file's reader of a table of files not
+ * its own parses its file's footer whole, every column chunk of every row
+ * group -- ClickBench's 105 columns' -- so its least is
+ * CH_UNIT_MIN_ROWS_PARQUET, eight such row groups: with one, ClickBench's
+ * small queries were 25 to 68% slower.  A table of its own Parquet files'
+ * reader is given its row groups' footer alone (VC39, pg_accel's §3.32
+ * F13), and its least is an Arrow file's, one row group: ClickBench on
+ * Parquet 5.0% faster by its mean than at eight, 12 queries beyond their
+ * spreads, Q22 8% slower.
  */
 #define CH_UNIT_DIVISOR 34
 #define CH_UNIT_MIN_ROWS 65536
@@ -466,7 +471,8 @@ setup_units(ChScanDesc scan)
 	}
 	scan->unit_start = palloc(sizeof(uint32) * (scan->nparts + 1));
 	scan->unit_first = size_units(scan->nparts, marks, rows,
-								  scan->table->external && scan->table->ext_kind != CH_EXTERNAL_ARROW,
+								  scan->table->external && !scan->table->own &&
+								  scan->table->ext_kind != CH_EXTERNAL_ARROW,
 								  scan->unit_start, &scan->nunits);
 	pfree(marks);
 	pfree(rows);
@@ -477,8 +483,9 @@ setup_units(ChScanDesc scan)
 /*
  * ch.parallel_units(part_granules int4[], granule_rows int8, parquet bool):
  * the units a parallel scan makes of parts of these granules, each of
- * granule_rows rows, read by a Parquet file's reader or not -- each unit's
- * part, from 1, its first granule and its granules
+ * granule_rows rows, read by a Parquet file's reader of its whole footer --
+ * a table of files not its own -- or not; each unit's part, from 1, its
+ * first granule and its granules
  */
 PG_FUNCTION_INFO_V1(ch_parallel_units);
 Datum

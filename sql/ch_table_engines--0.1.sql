@@ -198,8 +198,9 @@ CREATE FUNCTION ch.fetch_stats(OUT fetches bigint, OUT columns bigint, OUT whole
 
 -- The units a parallel scan makes of parts of these granules (ch_table_engines.md
 -- VC36): each the granules left to claim over 34, within a least of 64K rows --
--- a Parquet file's reader's, a million -- and a most of a million; each unit's
--- part, from 1, its first granule and its granules.
+-- a Parquet file's reader's of its whole footer, a table of files not its own
+-- (VC39), a million -- and a most of a million; each unit's part, from 1, its
+-- first granule and its granules.
 CREATE FUNCTION ch.parallel_units(part_granules int4[], granule_rows int8 DEFAULT 8192,
 								  parquet bool DEFAULT false,
 								  OUT part int4, OUT first_granule int4, OUT granules int4)
@@ -229,6 +230,19 @@ CREATE FUNCTION ch.part_selections(OUT kept integer, OUT found bigint, OUT store
 -- files' footers read by its units' readers alone.
 CREATE FUNCTION ch.footers_read() RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_footers_read' LANGUAGE C VOLATILE;
+
+-- The readers of Parquet files' units the session's process has given a
+-- footer of their own row groups alone (pg_accel's §3.32 F13, VC39), the
+-- others' column chunks left out, where each parsed its file's whole footer.
+CREATE FUNCTION ch.footers_pruned() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_footers_pruned' LANGUAGE C VOLATILE;
+
+-- The columns whose units' ranges the session's process has decoded from parts'
+-- summaries (pg_accel's §3.32 F11, VC37): a summary keeps each column's
+-- ranges apart, decoded as a filter first asks for them, where every
+-- column's were decoded as the part was listed.
+CREATE FUNCTION ch.ranges_decoded() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_ranges_decoded' LANGUAGE C VOLATILE;
 
 -- The rows the session's process has read alone of the uncompressed record
 -- batches of Arrow files (ch_table_engines.md §3, VC27): a fetch's rows by

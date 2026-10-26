@@ -157,7 +157,19 @@ PgMergeTree::PgMergeTree(
     if (pages_disk)
         own_policy = std::make_shared<StoragePolicy>(
             "chte_pages", Volumes{std::make_shared<SingleDiskVolume>("chte_pages", pages_disk)}, 0.0);
-    initializeDirectoriesAndFormatVersion(relative_path, /* attach= */ true, /* date_column_name= */ "");
+    /// pg_accel's §3.32 F12 (VC38): MergeTreeData::initializeDirectoriesAndFormatVersion()'s work but its
+    /// read of format_version.txt -- 0.17 of its 0.25 Mcycles, a process's first open of the table: the shim's
+    /// tables are of the format of custom partitions, the least where there is no date column
+    /// (MergeTreeData.cpp:528-530), and nothing writes another; the directories made as it makes them
+    /// (:540-544), the file neither read nor written
+    relative_data_path = relative_path;
+    for (const auto & disk : getDisks())
+        if (!disk->isBroken() && !disk->isReadOnly())
+        {
+            disk->createDirectories(relative_data_path);
+            disk->createDirectories(std::filesystem::path(relative_data_path) / DETACHED_DIR_NAME);
+        }
+    format_version = MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING;
 }
 
 MergeTreeData::MutationsSnapshotPtr PgMergeTree::getMutationsSnapshot(const IMutationsSnapshot::Params & params) const
@@ -457,6 +469,7 @@ chte_table * makeTable(const chte_table_def * def, ContextMutablePtr context, St
     std::shared_ptr<PagesDisk> pages_disk;
     if (def->pages)
         pages_disk = std::make_shared<PagesDisk>("chte_pages", e.parts_disk->getPath(), *def->pages);
+    startBackgroundExecutors();
     auto storage = std::make_shared<PgMergeTree>(id, def->relative_path, metadata, context, merging, std::move(settings),
                                                  std::move(pages_disk));
     StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
@@ -709,7 +722,10 @@ chte_table * openTableSpec(const chte_table_spec * spec)
 
     /// Keys as openTable() builds them, each over its own columns: no partition key; the primary key the
     /// sorting key's where it is the same columns and the engine adds none to the sorting key
-    metadata.partition_key = KeyDescription::getKeyFromAST(nullptr, ColumnsDescription{}, MergeTreeData::createVirtuals(nullptr), context);
+    /// pg_accel's §3.32 F12 (VC38): the empty partition key as ClickHouse makes one without its analyzer
+    /// (KeyDescription::buildEmptyKey()), where getKeyFromAST(nullptr) analyzed an empty list -- 0.39 Mcycles of a
+    /// process's first open; CHTE_SPEC_CHECK compares it with the CREATE TABLE text's
+    metadata.partition_key = KeyDescription::buildEmptyKey();
     metadata.virtuals = MergeTreeData::createVirtuals(&metadata.partition_key);
     NamesAndTypesList additional_columns;
     if (key_column)

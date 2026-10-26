@@ -516,6 +516,8 @@ extern bool ch_enable_part_selections;
 extern void ch_selections_init(void);
 extern bool ch_selections_find(const ChTable *t, const ChPart *part, const ChFilterKey *fk, uint32 begin,
 							   uint32 end, chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows);
+extern chte_mark_range *ch_selections_ranges(const ChTable *t, const ChPart *part, const ChFilterKey *fk,
+											 uint32 begin, uint32 end, size_t *nranges, uint64 *rows);
 extern void ch_selections_keep(const ChTable *t, const ChPart *part, const ChFilterKey *fk, uint32 begin,
 							   uint32 end, const chte_mark_range *ranges, size_t nranges, uint64 rows);
 extern void ch_selections_check(const ChPart *part, uint32 begin, uint32 end, const chte_mark_range *found_ranges,

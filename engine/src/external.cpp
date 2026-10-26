@@ -60,6 +60,7 @@
 #include <Processors/Formats/Impl/Parquet/SchemaConverter.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
+#include <Processors/Formats/Impl/Parquet/ThriftUtil.h>
 #include <Processors/Formats/Impl/ParquetV3BlockInputFormat.h>
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipeline.h>
@@ -84,6 +85,7 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CANNOT_FSTAT;
+    extern const int CANNOT_READ_FROM_FILE_DESCRIPTOR;
     extern const int CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN;
     extern const int CANNOT_STAT;
     extern const int FILE_CHANGED_DURING_READ;
@@ -729,12 +731,16 @@ const std::vector<uint8_t> & keptUnits(chte_filter & filter, const ExternalTable
                 columns.push_back(it_column != footer.summary->columns.end() && it_column->second.type == k.type->getName()
                                   ? &it_column->second : nullptr);
             }
+            /// F11: the filter's columns' ranges alone, decoded as first asked
+            std::vector<const std::vector<std::optional<Range>> *> column_ranges;
+            for (const auto * column : columns)
+                column_ranges.push_back(column ? &column->unitRanges(kept.size()) : nullptr);
             for (size_t u = 0; u < kept.size(); ++u)
             {
                 Hyperrectangle hyperrectangle(keys.columns(), Range::createWholeUniverse());
                 for (size_t c = 0; c < columns.size(); ++c)
-                    if (columns[c] && u < columns[c]->ranges.size() && columns[c]->ranges[u])
-                        hyperrectangle[c] = *columns[c]->ranges[u];
+                    if (column_ranges[c] && u < column_ranges[c]->size() && (*column_ranges[c])[u])
+                        hyperrectangle[c] = *(*column_ranges[c])[u];
                 kept[u] = info->key_condition->checkInHyperrectangle(hyperrectangle, types).can_be_true ? 1 : 0;
             }
         }
@@ -897,6 +903,275 @@ struct PipelineRead
     }
 };
 
+/*
+ * pg_accel's §3.32 F13 (VC39): a Parquet unit's reader given a footer of its own row groups alone.  ClickHouse's
+ * reader parses its file's whole footer at its first block (ParquetV3BlockInputFormat.cpp:96-104), every column
+ * chunk of every row group, and frees it as the unit ends (~Reader()): ClickBench's 800 kB of 63 row groups of 106
+ * columns, about 5 Mcycles a unit, more than a unit's reading of three columns -- what made a Parquet table's units
+ * smaller than eight row groups slower.  The footer's bytes are read once a process and the row groups' places
+ * found in them by a walk of Thrift's compact protocol; each unit's reader is given those bytes with the other row
+ * groups' each an empty RowGroup -- no rows, which the reader passes over before it looks at their columns
+ * (Parquet/Reader.cpp:701-710) -- decoded by ClickHouse's own deserializeThriftStruct(), through its metadata cache,
+ * which the reader takes a footer from (ParquetV3BlockInputFormat.cpp:109-123): ClickHouse unmodified.
+ */
+
+/// Thrift's compact protocol, its values passed over (thrift/protocol/TCompactProtocol.tcc)
+struct CompactWalk
+{
+    const uint8_t * p;
+    const uint8_t * end;
+
+    uint8_t byte()
+    {
+        if (p >= end)
+            throw Exception(ErrorCodes::INCORRECT_DATA, "a Parquet footer ends inside a value");
+        return *p++;
+    }
+
+    void pass(uint64_t n)
+    {
+        if (n > static_cast<uint64_t>(end - p))
+            throw Exception(ErrorCodes::INCORRECT_DATA, "a Parquet footer ends inside a value");
+        p += n;
+    }
+
+    uint64_t varint()
+    {
+        uint64_t v = 0;
+        for (int shift = 0; shift < 64; shift += 7)
+        {
+            uint8_t b = byte();
+            v |= static_cast<uint64_t>(b & 0x7f) << shift;
+            if (!(b & 0x80))
+                return v;
+        }
+        throw Exception(ErrorCodes::INCORRECT_DATA, "a Parquet footer's varint is too long");
+    }
+
+    /// a value of a compact type: 1 and 2 a field's booleans, in its header
+    void value(int type, int depth)
+    {
+        if (depth > 64)
+            throw Exception(ErrorCodes::INCORRECT_DATA, "a Parquet footer nests too deep");
+        switch (type)
+        {
+            case 1: case 2: return;
+            case 3: pass(1); return;
+            case 4: case 5: case 6: varint(); return;
+            case 7: pass(8); return;
+            case 8: pass(varint()); return;
+            case 9: case 10:
+            {
+                uint8_t h = byte();
+                uint64_t n = h >> 4;
+                if (n == 15)
+                    n = varint();
+                for (uint64_t i = 0; i < n; ++i)
+                    element(h & 0x0f, depth + 1);
+                return;
+            }
+            case 11:
+            {
+                uint64_t n = varint();
+                if (n == 0)
+                    return;
+                uint8_t kv = byte();
+                for (uint64_t i = 0; i < n; ++i)
+                {
+                    element(kv >> 4, depth + 1);
+                    element(kv & 0x0f, depth + 1);
+                }
+                return;
+            }
+            case 12: structure(depth + 1); return;
+            case 13: pass(16); return;
+            default:
+                throw Exception(ErrorCodes::INCORRECT_DATA, "a Parquet footer's value of compact type {}", type);
+        }
+    }
+
+    /// an element of a list, a set or a map: a boolean a byte of its own
+    void element(int type, int depth)
+    {
+        if (type == 1 || type == 2)
+            pass(1);
+        else
+            value(type, depth);
+    }
+
+    void structure(int depth)
+    {
+        for (;;)
+        {
+            uint8_t h = byte();
+            if (h == 0)
+                return;
+            if ((h >> 4) == 0)
+                varint();
+            value(h & 0x0f, depth);
+        }
+    }
+};
+
+/// A Parquet file's footer's bytes, its length and magic left out, and each row group's place in them
+struct ParquetFooterBytes
+{
+    UInt64 size = 0;
+    Int64 mtime = 0;
+    String bytes;
+    std::vector<std::pair<size_t, size_t>> row_groups;
+};
+
+/// FileMetaData's row groups' places: its field 4, a list of RowGroup structs; false where it has none so
+bool rowGroupPlaces(ParquetFooterBytes & footer)
+{
+    const auto * begin = reinterpret_cast<const uint8_t *>(footer.bytes.data());
+    CompactWalk walk{begin, begin + footer.bytes.size()};
+    int16_t id = 0;
+    bool found = false;
+    for (;;)
+    {
+        uint8_t h = walk.byte();
+        if (h == 0)
+            break;
+        int type = h & 0x0f;
+        if ((h >> 4) != 0)
+            id = static_cast<int16_t>(id + (h >> 4));
+        else
+        {
+            /// the long form: the id a zigzag varint
+            uint64_t v = walk.varint();
+            id = static_cast<int16_t>((v >> 1) ^ (0 - (v & 1)));
+        }
+        if (id == 4 && type == 9)
+        {
+            uint8_t lh = walk.byte();
+            uint64_t n = lh >> 4;
+            if (n == 15)
+                n = walk.varint();
+            if ((lh & 0x0f) != 12)
+                return false;
+            for (uint64_t i = 0; i < n; ++i)
+            {
+                size_t from = static_cast<size_t>(walk.p - begin);
+                walk.structure(1);
+                footer.row_groups.emplace_back(from, static_cast<size_t>(walk.p - begin));
+            }
+            found = true;
+            continue;
+        }
+        walk.value(type, 1);
+    }
+    return found && walk.p == walk.end;
+}
+
+/// The footers' bytes, kept in the process by path, size and modification time
+std::map<String, std::shared_ptr<const ParquetFooterBytes>> footer_bytes;
+std::atomic<uint64_t> footers_pruned{0};
+
+void readAt(int fd, char * to, size_t n, off_t at, const String & path)
+{
+    size_t done = 0;
+    while (done < n)
+    {
+        ssize_t got = ::pread(fd, to + done, n - done, at + static_cast<off_t>(done));
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0)
+            throw ErrnoException(ErrorCodes::CANNOT_READ_FROM_FILE_DESCRIPTOR, "Cannot read the footer of {}", path);
+        done += static_cast<size_t>(got);
+    }
+}
+
+std::shared_ptr<const ParquetFooterBytes> parquetFooterBytes(int fd, const ListedFile & listed)
+{
+    auto it = footer_bytes.find(listed.path);
+    if (it != footer_bytes.end() && it->second->size == listed.size && it->second->mtime == listed.mtime)
+        return it->second;
+    auto footer = std::make_shared<ParquetFooterBytes>();
+    footer->size = listed.size;
+    footer->mtime = listed.mtime;
+    char tail[8];
+    if (listed.size < 12)
+        return nullptr;
+    readAt(fd, tail, sizeof(tail), static_cast<off_t>(listed.size - 8), listed.path);
+    UInt32 length;
+    memcpy(&length, tail, sizeof(length));
+    if (memcmp(tail + 4, "PAR1", 4) != 0 || static_cast<UInt64>(length) + 12 > listed.size)
+        return nullptr;
+    footer->bytes.resize(length);
+    readAt(fd, footer->bytes.data(), length, static_cast<off_t>(listed.size - 8 - length), listed.path);
+    if (!rowGroupPlaces(*footer))
+        return nullptr;
+    if (footer_bytes.size() >= MAX_FOOTERS)
+        footer_bytes.clear();
+    footer_bytes[listed.path] = footer;
+    return footer;
+}
+
+/// A RowGroup of no column and no row, in the compact protocol: columns an empty list of structs, total_byte_size
+/// and num_rows 0
+constexpr char EMPTY_ROW_GROUP[] = {0x19, 0x0c, 0x16, 0x00, 0x16, 0x00, 0x00};
+
+/// The file's footer with its units' row groups alone, the others empty; none where it cannot be made so
+std::optional<parquet::format::FileMetaData> unitFooter(int fd, const ListedFile & listed, const std::vector<size_t> & units,
+                                                         size_t nunits)
+{
+    auto footer = parquetFooterBytes(fd, listed);
+    if (!footer || footer->row_groups.size() != nunits || footer->row_groups.empty())
+        return std::nullopt;
+    std::vector<uint8_t> wanted(nunits, 0);
+    for (size_t u : units)
+        if (u < nunits)
+            wanted[u] = 1;
+    const String & bytes = footer->bytes;
+    String edited;
+    edited.reserve(footer->row_groups.front().first + (bytes.size() - footer->row_groups.back().second));
+    edited.append(bytes, 0, footer->row_groups.front().first);
+    for (size_t i = 0; i < nunits; ++i)
+    {
+        const auto & [from, to] = footer->row_groups[i];
+        if (wanted[i])
+            edited.append(bytes, from, to - from);
+        else
+            edited.append(EMPTY_ROW_GROUP, sizeof(EMPTY_ROW_GROUP));
+    }
+    edited.append(bytes, footer->row_groups.back().second, String::npos);
+
+    parquet::format::FileMetaData metadata;
+    Parquet::deserializeThriftStruct(metadata, edited.data(), edited.size());
+    /// as Parquet::Reader::readFileMetaData() takes a footer it parsed (Parquet/Reader.cpp:262-298)
+    for (auto & row_group : metadata.row_groups)
+        for (auto & column : row_group.columns)
+            if (column.meta_data.__isset.dictionary_page_offset && column.meta_data.dictionary_page_offset == 0)
+                column.meta_data.__isset.dictionary_page_offset = false;
+    if (metadata.created_by == "DuckDB")
+        return std::nullopt;
+    if (metadata.row_groups.size() != nunits)
+        return std::nullopt;
+    if (specCheck())
+    {
+        /// the tests': the kept row groups and the rest of the footer the whole footer's
+        parquet::format::FileMetaData whole;
+        Parquet::deserializeThriftStruct(whole, bytes.data(), bytes.size());
+        for (auto & row_group : whole.row_groups)
+            for (auto & column : row_group.columns)
+                if (column.meta_data.__isset.dictionary_page_offset && column.meta_data.dictionary_page_offset == 0)
+                    column.meta_data.__isset.dictionary_page_offset = false;
+        bool same = whole.row_groups.size() == metadata.row_groups.size() && whole.schema == metadata.schema &&
+            whole.num_rows == metadata.num_rows && whole.version == metadata.version &&
+            whole.key_value_metadata == metadata.key_value_metadata && whole.created_by == metadata.created_by &&
+            whole.column_orders == metadata.column_orders;
+        for (size_t i = 0; same && i < nunits; ++i)
+            same = wanted[i] ? whole.row_groups[i] == metadata.row_groups[i]
+                             : metadata.row_groups[i].num_rows == 0 && metadata.row_groups[i].columns.empty();
+        if (!same)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "file {}: a unit's footer is not its whole footer's", listed.path);
+    }
+    footers_pruned.fetch_add(1, std::memory_order_relaxed);
+    return metadata;
+}
+
 /// A reader of a listed file's units (none: all of them), or of its rows at offsets; the filter, where given,
 /// for the reader's own pruning
 std::unique_ptr<chte_reader> openExternalReader(chte_table & table, const chte_external_listing & listing, size_t file,
@@ -946,7 +1221,23 @@ std::unique_ptr<chte_reader> openExternalReader(chte_table & table, const chte_e
             ext.format_settings.parquet.local_read_min_bytes_for_seek, parquetMetadataCache(),
             RelativePathWithMetadata(listed.path, object));
     }
-    else
+    else if (ext.own && units && !units->empty() && units->size() < resolved->footer->unit_rows.size())
+    {
+        /// F13: a unit's reader of a table of its own files given its row groups' footer alone
+        if (auto metadata = unitFooter(buf->getFD(), listed, *units, resolved->footer->unit_rows.size()))
+        {
+            ObjectMetadata object;
+            object.size_bytes = listed.size;
+            object.etag = parquetFileAttr(listed.size, listed.mtime) + ":units";
+            auto cache = std::make_shared<ParquetMetadataCache>("LRU", 1ULL << 40, 1, 0.5);
+            cache->set(ParquetMetadataCache::createKey(listed.path, object.etag),
+                       std::make_shared<ParquetMetadataCacheCell>(std::move(*metadata)));
+            format = std::make_shared<ParquetV3BlockInputFormat>(
+                *buf, header, ext.format_settings, singleThreadedResources(ext.context), info,
+                ext.format_settings.parquet.local_read_min_bytes_for_seek, cache, RelativePathWithMetadata(listed.path, object));
+        }
+    }
+    if (!format)
         format = std::make_shared<ParquetV3BlockInputFormat>(
             *buf, header, ext.format_settings, singleThreadedResources(ext.context), info,
             ext.format_settings.parquet.local_read_min_bytes_for_seek);
@@ -2308,9 +2599,12 @@ ColumnPtr asMergeColumn(const ExternalColumn & column, ColumnPtr col)
  * file's format and size, its units' rows, its schema as the readers infer it, an Arrow file's batches' bodies and
  * fields, and per column of the table the file has, by the file's name of it: the type it is read as, its bytes,
  * its file's statistics and each unit's range of its values, a Parquet file's, as parquetStats() and the reader's
- * pruning read them.
+ * pruning read them.  pg_accel's §3.32 F11 (VC37): format 3 has each column's ranges after their bytes' length, so
+ * that a listing passes over them and decodes a column's as a filter first asks; a summary of format 2, written
+ * before, is read whole as then.
  */
-constexpr UInt8 OWN_SUMMARY_FORMAT = 2;
+constexpr UInt8 OWN_SUMMARY_FORMAT = 3;
+constexpr UInt8 OWN_SUMMARY_FORMAT_WHOLE = 2;
 
 /// A range's end: a value, or one of the infinities a Range takes NULL as, which readFieldBinary() loses
 void writeRangeEnd(const Field & value, bool included, WriteBuffer & out)
@@ -2505,17 +2799,44 @@ String ownSummaryBytes(const ExternalTable & ext, const ListedFile & listed)
         if (!ranges.empty())
             for (const auto & range : ranges[k])
                 n += range.has_value();
-        writeVarUInt(n, out);
+        WriteBufferFromOwnString block;
+        writeVarUInt(n, block);
         for (size_t u = 0; n > 0 && u < ranges[k].size(); ++u)
             if (const auto & range = ranges[k][u])
             {
-                writeVarUInt(u, out);
-                writeRangeEnd(range->left, range->left_included, out);
-                writeRangeEnd(range->right, range->right_included, out);
+                writeVarUInt(u, block);
+                writeRangeEnd(range->left, range->left_included, block);
+                writeRangeEnd(range->right, range->right_included, block);
             }
+        block.finalize();
+        writeVarUInt(block.str().size(), out);
+        out.write(block.str().data(), block.str().size());
     }
     out.finalize();
     return std::move(out.str());
+}
+
+/// A column's ranges, as the writer writes them: their count, then each unit's and its range's ends
+void readRanges(ReadBuffer & in, size_t nunits, std::vector<std::optional<Range>> & ranges)
+{
+    UInt64 nranges;
+    readVarUInt(nranges, in);
+    if (nranges > 0)
+        ranges.resize(nunits);
+    for (UInt64 r = 0; r < nranges; ++r)
+    {
+        UInt64 u;
+        readVarUInt(u, in);
+        Range range = Range::createWholeUniverse();
+        Field left;
+        Field right;
+        readRangeEnd(in, left, range.left_included);
+        readRangeEnd(in, right, range.right_included);
+        range.left = left;
+        range.right = right;
+        if (u < ranges.size())
+            ranges[u] = std::move(range);
+    }
 }
 
 /// A summary's bytes read; none where they are of another format, or do not read
@@ -2525,12 +2846,15 @@ std::shared_ptr<const OwnSummary> parseOwnSummary(const void * data, size_t size
         return nullptr;
     try
     {
-        ReadBufferFromMemory in(static_cast<const char *>(data), size);
+        auto s = std::make_shared<OwnSummary>();
+        /// F11: the bytes kept, a column's ranges decoded from them as asked
+        s->bytes.assign(static_cast<const char *>(data), size);
+        ReadBufferFromMemory in(s->bytes.data(), s->bytes.size());
         UInt8 byte;
         readBinary(byte, in);
-        if (byte != OWN_SUMMARY_FORMAT)
+        if (byte != OWN_SUMMARY_FORMAT && byte != OWN_SUMMARY_FORMAT_WHOLE)
             return nullptr;
-        auto s = std::make_shared<OwnSummary>();
+        bool whole = byte == OWN_SUMMARY_FORMAT_WHOLE;
         readBinary(byte, in);
         s->format = byte;
         readVarUInt(s->file_size, in);
@@ -2572,24 +2896,19 @@ std::shared_ptr<const OwnSummary> parseOwnSummary(const void * data, size_t size
                 c.min = readFieldBinary(in);
                 c.max = readFieldBinary(in);
             }
-            UInt64 nranges;
-            readVarUInt(nranges, in);
-            if (nranges > 0)
-                c.ranges.resize(s->unit_rows.size());
-            for (UInt64 r = 0; r < nranges; ++r)
+            if (whole)
             {
-                UInt64 u;
-                readVarUInt(u, in);
-                Range range = Range::createWholeUniverse();
-                Field left;
-                Field right;
-                readRangeEnd(in, left, range.left_included);
-                readRangeEnd(in, right, range.right_included);
-                range.left = left;
-                range.right = right;
-                if (u < c.ranges.size())
-                    c.ranges[u] = std::move(range);
+                readRanges(in, s->unit_rows.size(), c.ranges);
+                c.ranges_decoded = true;
+                continue;
             }
+            UInt64 length;
+            readVarUInt(length, in);
+            if (length > in.available())
+                return nullptr;
+            c.ranges_data = in.position();
+            c.ranges_size = length;
+            in.ignore(length);
         }
         return s;
     }
@@ -2634,6 +2953,28 @@ std::shared_ptr<const ResolvedFile> resolveSummary(ExternalTable & table, const 
     return file;
 }
 
+}
+
+namespace
+{
+/// F11: the columns' ranges the process decoded from summaries of format 3, for the tests
+std::atomic<uint64_t> ranges_decoded{0};
+}
+
+/// F11: a format 3 summary's column's ranges, decoded at their first ask; a format 2 summary's were decoded whole
+const std::vector<std::optional<Range>> & OwnSummaryColumn::unitRanges(size_t nunits) const
+{
+    if (!ranges_decoded)
+    {
+        ranges_decoded = true;
+        if (ranges_data)
+        {
+            ReadBufferFromMemory in(ranges_data, ranges_size);
+            readRanges(in, nunits, ranges);
+            chte::ranges_decoded.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return ranges;
 }
 
 }
@@ -2713,6 +3054,16 @@ extern "C" int chte_own_list_summaries(chte_table * table, const char * const * 
 extern "C" uint64_t chte_footers_read(void)
 {
     return footers_read.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t chte_footers_pruned(void)
+{
+    return footers_pruned.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t chte_ranges_decoded(void)
+{
+    return ranges_decoded.load(std::memory_order_relaxed);
 }
 
 extern "C" int chte_own_summary(chte_table * table, chte_external_listing * listing, size_t file, const void ** bytes,
