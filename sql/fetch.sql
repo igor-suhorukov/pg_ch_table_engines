@@ -123,3 +123,62 @@ SELECT fetched('SELECT a, c, d FROM fx WHERE b = ''b5''');
 
 DROP TABLE fx, fo;
 DROP FUNCTION fetched(text, text);
+
+-- VC34's rest: a row fetched by its TID and read where it lies
+-- (ch.enable_point_reads) decompresses an LZ4 block only up to the row's
+-- last byte, and no block its reads pass over whole -- each such row read
+-- again by ClickHouse's reader and compared under CHTE_SPEC_CHECK, as the
+-- suite runs -- where a block of another codec is decompressed whole.
+-- Granules of small blocks: a fixed width, a Nullable, a sparse column of
+-- mostly zeros, one of zeros alone -- its values' file empty, its stream's
+-- mark at the file's end, which its rows read nothing of -- and a text of
+-- many blocks a granule.
+CREATE TABLE fp (k int, a int8, n int, z int8, e int8 NOT NULL, t text) USING mergetree
+  WITH (order_by = 'k', index_granularity = 1024,
+        settings = 'min_bytes_for_wide_part = 0, min_compress_block_size = 1024, max_compress_block_size = 4096');
+INSERT INTO fp SELECT i, i * 7, CASE WHEN i % 3 = 0 THEN NULL ELSE i END, CASE WHEN i % 50 = 0 THEN i ELSE 0 END,
+    0, repeat(md5(i::text), 1 + i % 5)
+  FROM generate_series(1, 10000) i;
+INSERT INTO fp SELECT i, i * 7, CASE WHEN i % 3 = 0 THEN NULL ELSE i END, CASE WHEN i % 50 = 0 THEN i ELSE 0 END,
+    0, repeat(md5(i::text), 1 + i % 5)
+  FROM generate_series(10001, 20000) i;
+-- one part, merged: a merge's part writes a column of defaults sparse
+SELECT ch.optimize('fp', true) > 0 AS merged;
+CREATE INDEX fp_a ON fp (a);
+CREATE TABLE fpz (k int, a int8, n int, z int8, e int8 NOT NULL, t text) USING mergetree
+  WITH (order_by = 'k', index_granularity = 1024, compression = 'zstd(3)',
+        settings = 'min_bytes_for_wide_part = 0, min_compress_block_size = 1024, max_compress_block_size = 4096');
+INSERT INTO fpz SELECT * FROM fp WHERE k <= 10000;
+INSERT INTO fpz SELECT * FROM fp WHERE k > 10000;
+SELECT ch.optimize('fpz', true) > 0 AS merged;
+CREATE INDEX fpz_a ON fpz (a);
+ANALYZE fp, fpz;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET ch.enable_chscan = off;
+-- a row a granule: a granule's first, one within, a granule's last, the part's last
+CREATE TEMP TABLE p0 AS SELECT * FROM ch.fetch_stats();
+SELECT k, a, n, z, e, length(t) AS len, md5(t) AS t
+  FROM fp WHERE a IN (7, 10500, 21504, 35000, 140000) ORDER BY k;
+SELECT s.pointed - p0.pointed AS pointed FROM ch.fetch_stats() s, p0;
+SELECT ch.point_bytes_left() > 0 AS left_compressed;
+-- the same rows as ClickHouse's reader reads them, and over ZSTD's blocks
+SET ch.enable_point_reads = off;
+SELECT md5(string_agg(format('%s %s %s %s %s %s', k, a, n, z, e, md5(t)), ',' ORDER BY k)) AS rows
+  FROM fp WHERE a IN (7, 10500, 21504, 35000, 140000);
+RESET ch.enable_point_reads;
+SELECT md5(string_agg(format('%s %s %s %s %s %s', k, a, n, z, e, md5(t)), ',' ORDER BY k)) AS rows
+  FROM fp WHERE a IN (7, 10500, 21504, 35000, 140000);
+SELECT md5(string_agg(format('%s %s %s %s %s %s', k, a, n, z, e, md5(t)), ',' ORDER BY k)) AS rows
+  FROM fpz WHERE a IN (7, 10500, 21504, 35000, 140000);
+-- a fixed width within one block: LZ4's decompressed to the row, ZSTD's whole
+SELECT ch.point_bytes_left() AS l0 \gset
+SELECT k FROM fp WHERE a = 10500;
+SELECT ch.point_bytes_left() - :l0 > 0 AS lz4_left;
+SELECT ch.point_bytes_left() AS l1 \gset
+SELECT k FROM fpz WHERE a = 10500;
+SELECT ch.point_bytes_left() - :l1 AS zstd_left;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET ch.enable_chscan;
+DROP TABLE fp, fpz;

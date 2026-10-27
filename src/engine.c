@@ -454,6 +454,8 @@ ch_engine(void)
 	*(void **) &engine.footers_pruned = dlsym(handle, "chte_footers_pruned");
 	/* optional: a library built before pg_accel's F11 decodes every column's ranges as it lists a part */
 	*(void **) &engine.ranges_decoded = dlsym(handle, "chte_ranges_decoded");
+	/* optional: a library built before VC34's rest decompresses a point read's blocks whole */
+	*(void **) &engine.point_bytes_left = dlsym(handle, "chte_point_bytes_left");
 	/* optional: a library built before pg_accel's F7 says no batch's granule */
 	*(void **) &engine.read_granule = dlsym(handle, "chte_read_granule");
 	/* optional: a library built before pg_accel's F6 reads no row alone */

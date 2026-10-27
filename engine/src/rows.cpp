@@ -9,18 +9,22 @@
  * out by _part_offset (io.cpp).  Their marks are kept in the process's mark cache (VC33), which
  * a merge's sequential source only looks in.  Or, rows of one granule (VC34), each value read
  * where it lies from the granule's marks the caller keeps for every process: a fetch of a row
- * no longer makes a whole granule of every column (chte_read_granule_rows).
+ * no longer makes a whole granule of every column (chte_read_granule_rows), nor decompresses a
+ * block past the row it reads.
  */
 #include "internal.h"
 
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
+#include <Common/PODArray.h>
 #include <Common/assert_cast.h>
-#include <Compression/CompressedReadBufferFromFile.h>
+#include <Compression/CompressionFactory.h>
+#include <Compression/CompressionInfo.h>
+#include <Compression/ICompressionCodec.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadSettings.h>
-#include <IO/VarInt.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipeline.h>
@@ -28,13 +32,24 @@
 #include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
+#include <base/unaligned.h>
+#include <city.h>
 
 #include <algorithm>
+#include <atomic>
 #include <optional>
+
+/// liblz4's (contrib/lz4), which the library links for ClickHouse's LZ4 codec (CompressionCodecLZ4.cpp):
+/// its header is not on the shim's include path, dbms linking it privately
+extern "C" int LZ4_decompress_safe_partial(const char * src, char * dst, int src_size, int target_output_size,
+                                           int dst_capacity);
 
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_DECOMPRESS;
+    extern const int CHECKSUM_DOESNT_MATCH;
+    extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
 }
 
@@ -105,34 +120,194 @@ void locateByScan(chte_table & table, const MergeTreeData::DataPartPtr & part, c
 /// the granule's last value (SerializationSparse.cpp, END_OF_GRANULE_FLAG)
 constexpr UInt64 END_OF_GRANULE = 1ULL << 62;
 
-/// VC34: a column's stream over one granule, read forward from the granule's mark: its compressed blocks
-/// from the block the mark names, decompressed as the reads reach them, the first past the mark's offset in it
+/// VC34's rest (pg_accel's §3.29): the decompressed bytes of the blocks point reads reached and left
+/// compressed -- past the last byte a read took, and blocks passed over whole -- which ClickHouse's reader
+/// decompresses, for the tests
+std::atomic<uint64_t> point_bytes_left{0};
+
+/// VC34: a column's stream over one granule, read forward from the granule's mark.  Each compressed block --
+/// its checksum, CityHash128 of the rest; its header, its codec's byte and its compressed and decompressed
+/// sizes; its compressed bytes -- read whole and checked against its checksum as ClickHouse's reader reads
+/// and checks it (CompressedReadBufferBase::readCompressedData()), but decompressed only as far as the reads
+/// reach (VC34's rest): an LZ4 block's beginning, up to the last byte read, by liblz4's
+/// LZ4_decompress_safe_partial() -- the block ClickHouse's LZ4 codec writes with LZ4_compress_default() --
+/// a read past it decoding the block again, at least twice as far; a block the reads pass over whole
+/// neither read nor decompressed, its header read alone for its sizes; another codec's block decompressed
+/// whole by its codec, as ClickHouse's reader decompresses it.  Nothing is read before the first read or
+/// skip of a byte or more, as ClickHouse's reader's seek reads nothing, nor its read of none: a stream the
+/// rows asked need none of -- a sparse column's values where they are all its default -- may have its mark
+/// at the file's end
 struct GranuleStream
 {
-    std::unique_ptr<CompressedReadBufferFromFile> in;
-    uint64_t at = 0;    /// the granule's bytes of the stream passed so far
+    static constexpr size_t CHECKSUM = sizeof(CityHash_v1_0_2::uint128);
+    static constexpr size_t HEADER = ICompressionCodec::getHeaderSize();
+
+    std::unique_ptr<ReadBufferFromFileBase> file;
+    uint64_t at = 0;            /// the granule's bytes of the stream passed so far
+    /// the block the reads are in: its place in the file, its checksum and header, the reads' place in its
+    /// decompressed bytes, and how many of those are decompressed
+    size_t block = 0;
+    CityHash_v1_0_2::uint128 checksum;
+    char header_bytes[HEADER];
+    size_t compressed = 0;      /// its header and compressed bytes
+    size_t decompressed = 0;
+    size_t offset = 0;
+    size_t ready = 0;
+    bool loaded = false;
+    bool started = false;       /// the mark's block's header read
+    size_t mark_skip = 0;       /// the mark's place in its block's decompressed bytes
+    PODArray<char> raw;         /// its header and compressed bytes, once read
+    PODArray<char> data;        /// its decompressed bytes, [0, ready)
+    uint64_t left = 0;          /// the blocks passed's decompressed bytes never decompressed
 
     GranuleStream(const IMergeTreeDataPart & part, const chte_part_stream & s)
     {
         std::optional<size_t> hint;
         if (s.to > s.from)
             hint = static_cast<size_t>(s.to - s.from);
-        in = std::make_unique<CompressedReadBufferFromFile>(part.getDataPartStorage().readFile(s.file, ReadSettings{}, hint));
-        in->seek(s.from, s.skip);
+        file = part.getDataPartStorage().readFile(s.file, ReadSettings{}, hint);
+        block = s.from;
+        mark_skip = s.skip;
+    }
+
+    /// The mark's block's header, at the first read or skip
+    void start()
+    {
+        if (started)
+            return;
+        header(block);
+        offset = mark_skip;
+        started = true;
+    }
+
+    ~GranuleStream()
+    {
+        if (loaded)
+            left += decompressed - ready;
+        point_bytes_left.fetch_add(left, std::memory_order_relaxed);
+    }
+
+    GranuleStream(const GranuleStream &) = delete;
+    GranuleStream & operator=(const GranuleStream &) = delete;
+
+    /// The block at a place of the file: its checksum and header read, nothing of it decompressed
+    void header(size_t place)
+    {
+        char h[CHECKSUM + HEADER];
+        file->seek(place, SEEK_SET);
+        if (file->read(h, sizeof(h)) != sizeof(h))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "no compressed block of {} at byte {}", file->getFileName(), place);
+        block = place;
+        checksum.low64 = unalignedLoadLittleEndian<UInt64>(h);
+        checksum.high64 = unalignedLoadLittleEndian<UInt64>(h + 8);
+        memcpy(header_bytes, h + CHECKSUM, HEADER);
+        compressed = unalignedLoadLittleEndian<UInt32>(header_bytes + 1);
+        decompressed = unalignedLoadLittleEndian<UInt32>(header_bytes + 5);
+        if (compressed < HEADER || compressed > DBMS_MAX_COMPRESSED_SIZE || decompressed == 0
+            || decompressed > DBMS_MAX_DECOMPRESSED_SIZE)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "the compressed block of {} at byte {}: {} bytes compressed, {} decompressed",
+                            file->getFileName(), place, compressed, decompressed);
+        offset = 0;
+        ready = 0;
+        loaded = false;
+    }
+
+    /// On to the next block, this one's bytes not decompressed counted
+    void nextBlock()
+    {
+        left += decompressed - ready;
+        header(block + CHECKSUM + compressed);
+    }
+
+    /// The block's decompressed bytes [0, end) ready, the block read and checked first
+    void decode(size_t end)
+    {
+        if (end <= ready)
+            return;
+        if (!loaded)
+        {
+            raw.resize(compressed);
+            memcpy(raw.data(), header_bytes, HEADER);
+            file->seek(block + CHECKSUM + HEADER, SEEK_SET);
+            file->readStrict(raw.data() + HEADER, compressed - HEADER);
+            if (CityHash_v1_0_2::CityHash128(raw.data(), compressed) != checksum)
+                throw Exception(ErrorCodes::CHECKSUM_DOESNT_MATCH,
+                                "Checksum doesn't match: corrupted data. The compressed block of {} at byte {}, {} bytes",
+                                file->getFileName(), block, compressed);
+            loaded = true;
+        }
+        UInt8 method = ICompressionCodec::readMethod(raw.data());
+        if (method == static_cast<UInt8>(CompressionMethodByte::LZ4))
+        {
+            /// twice what was ready, so that the rows a granule's reads go on to decode its block a few times at most
+            size_t target = std::min(decompressed, std::max(end, 2 * ready));
+            data.resize(decompressed);
+            int got = LZ4_decompress_safe_partial(raw.data() + HEADER, data.data(), static_cast<int>(compressed - HEADER),
+                                                  static_cast<int>(target), static_cast<int>(decompressed));
+            if (got < 0 || static_cast<size_t>(got) < end)
+                throw Exception(ErrorCodes::CANNOT_DECOMPRESS, "Cannot decompress LZ4-encoded data: the block of {} at byte {}",
+                                file->getFileName(), block);
+            ready = static_cast<size_t>(got);
+        }
+        else
+        {
+            auto codec = CompressionCodecFactory::instance().get(method);
+            data.resize(decompressed + codec->getAdditionalSizeAtTheEndOfBuffer());
+            codec->decompress(raw.data(), static_cast<UInt32>(compressed), data.data());
+            ready = decompressed;
+        }
     }
 
     void skipTo(uint64_t pos)
     {
         if (pos < at)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "a granule's stream read back from byte {} to {}", at, pos);
-        in->ignore(pos - at);
+        if (pos == at)
+            return;
+        start();
+        uint64_t n = pos - at;
+        while (offset + n > decompressed)
+        {
+            n -= decompressed - offset;
+            nextBlock();
+        }
+        offset += n;
         at = pos;
     }
 
     void read(char * to, size_t n)
     {
-        in->readStrict(to, n);
-        at += n;
+        if (n == 0)
+            return;
+        start();
+        while (n > 0)
+        {
+            if (offset >= decompressed)
+                nextBlock();
+            size_t take = std::min(n, decompressed - offset);
+            decode(offset + take);
+            memcpy(to, data.data() + offset, take);
+            to += take;
+            n -= take;
+            offset += take;
+            at += take;
+        }
+    }
+
+    /// A varint, as ClickHouse's readVarUInt() reads one (IO/VarInt.h)
+    UInt64 readVarUInt()
+    {
+        UInt64 x = 0;
+        for (size_t i = 0; i < 10; ++i)
+        {
+            char b;
+            read(&b, 1);
+            UInt64 byte = static_cast<UInt8>(b);
+            x |= (byte & 0x7F) << (7 * i);
+            if (!(byte & 0x80))
+                break;
+        }
+        return x;
     }
 };
 
@@ -173,8 +348,7 @@ struct GranuleColumn
         started = true;
         while (placed < granule_rows)
         {
-            UInt64 v = 0;
-            readVarUInt(v, *sparse->in);
+            UInt64 v = sparse->readVarUInt();
             if (v & END_OF_GRANULE)
             {
                 placed += v & ~END_OF_GRANULE;
@@ -505,4 +679,9 @@ extern "C" int chte_part_granule_of(chte_table * table, const char * part_name, 
         *first = granularity.getMarkStartingRow(range.begin);
         *rows = granularity.getMarkRows(range.begin);
     });
+}
+
+extern "C" uint64_t chte_point_bytes_left(void)
+{
+    return point_bytes_left.load(std::memory_order_relaxed);
 }

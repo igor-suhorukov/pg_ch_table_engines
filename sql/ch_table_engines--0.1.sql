@@ -244,6 +244,14 @@ CREATE FUNCTION ch.footers_pruned() RETURNS bigint
 CREATE FUNCTION ch.ranges_decoded() RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_ranges_decoded' LANGUAGE C VOLATILE;
 
+-- The decompressed bytes of the blocks the session's process's point reads
+-- reached and left compressed (ch_table_engines.md §3, VC34's rest): a fetch's
+-- row read where it lies decompresses an LZ4 block up to the row's last byte
+-- alone, and none it passes over whole, where ClickHouse's reader decompresses
+-- each block whole.
+CREATE FUNCTION ch.point_bytes_left() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_point_bytes_left' LANGUAGE C VOLATILE;
+
 -- The rows the session's process has read alone of the uncompressed record
 -- batches of Arrow files (ch_table_engines.md §3, VC27): a fetch's rows by
 -- their TIDs read from their batch's buffers at those rows, not the batch's

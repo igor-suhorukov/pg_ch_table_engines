@@ -150,6 +150,8 @@ typedef struct ChEngine
 	uint64_t	(*footers_pruned) (void);
 	/* optional (pg_accel's §3.32 F11, VC37): the columns' ranges decoded from summaries, for the tests */
 	uint64_t	(*ranges_decoded) (void);
+	/* optional (pg_accel's §3.29 VC34's rest): the bytes point reads left compressed, for the tests */
+	uint64_t	(*point_bytes_left) (void);
 } ChEngine;
 
 /* GUCs */

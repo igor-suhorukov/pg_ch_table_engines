@@ -196,6 +196,23 @@ ch_footers_pruned(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The decompressed bytes of the blocks the session's process's point reads
+ * reached and left compressed (VC34's rest, pg_accel's §3.29): past the last
+ * byte of a row read, and the blocks passed over whole, which ClickHouse's
+ * reader decompresses; NULL where the engine library predates the count.
+ */
+PG_FUNCTION_INFO_V1(ch_point_bytes_left);
+Datum
+ch_point_bytes_left(PG_FUNCTION_ARGS)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (eng->point_bytes_left == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) eng->point_bytes_left());
+}
+
+/*
  * The rows the session's process has read alone of an Arrow file's record
  * batches (VC27), for the tests; NULL where the engine library predates it.
  */
