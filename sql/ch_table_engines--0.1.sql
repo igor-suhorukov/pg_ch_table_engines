@@ -252,6 +252,13 @@ CREATE FUNCTION ch.ranges_decoded() RETURNS bigint
 CREATE FUNCTION ch.point_bytes_left() RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_point_bytes_left' LANGUAGE C VOLATILE;
 
+-- The marks files the session's process has decompressed (pg_accel's §3.38
+-- VC41): a scan's readers take a part's marks from the process's mark cache
+-- once ch.enable_scan_marks warmed them; NULL where the engine library
+-- predates the count.
+CREATE FUNCTION ch.marks_loaded() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_marks_loaded' LANGUAGE C VOLATILE;
+
 -- The rows the session's process has read alone of the uncompressed record
 -- batches of Arrow files (ch_table_engines.md §3, VC27): a fetch's rows by
 -- their TIDs read from their batch's buffers at those rows, not the batch's

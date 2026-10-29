@@ -607,6 +607,18 @@ CHTE_API int			chte_part_granule_of(chte_table *table, const char *part_name, ui
 CHTE_API uint64_t	chte_point_bytes_left(void);
 
 /*
+ * VC41 (pg_accel's §3.38): whether chte_read_begin -- over the mark ranges it is given; a
+ * whole part's reader seeks nowhere and loads none -- and chte_read_begin_steps load their
+ * columns' marks into the process's mark cache before their readers, which then take them
+ * from there -- on (the default), each part's marks of a stream are decompressed once in the
+ * process; off, each reader decompresses its own, as before.  And the marks files the process
+ * has decompressed so far (ClickHouse's LoadedMarksFiles), for the tests.  Optional: a
+ * library built before them lacks them.
+ */
+CHTE_API void		chte_set_scan_marks(int on);
+CHTE_API uint64_t	chte_marks_loaded(void);
+
+/*
  * A part written again without the rows whose _pg_rowid are dead[0 .. n),
  * ascending -- deletions every snapshot sees, folded into it -- as a new part
  * named as a mutation of it, block_number its version (all_<min>_<max>_<level>_<block_number>),

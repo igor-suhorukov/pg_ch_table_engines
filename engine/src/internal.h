@@ -368,9 +368,13 @@ namespace chte
 /// An external table (external.cpp): files PostgreSQL does not own, read by ClickHouse's input formats.
 class ExternalTable;
 
-/// A reader of a part's named columns over mark_ranges (none: every granule), as chte_read_begin opens.
+/// A reader of a part's named columns over mark_ranges (none: every granule), as chte_read_begin opens; with
+/// warm_marks, their marks warmed into the process's mark cache first (VC41, warmMarks()).
 std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
-                                        std::optional<MarkRanges> mark_ranges);
+                                        std::optional<MarkRanges> mark_ranges, bool warm_marks = false);
+
+/// VC41 (pg_accel's §3.38): whether a scan's part readers warm their columns' marks first (chte_set_scan_marks)
+extern bool scan_marks;
 
 /// VC33: a wide part's named columns' marks, each stream's, loaded into the process's mark cache where they
 /// are not there -- a merge's sequential source, which openReader's reader is, only looks there

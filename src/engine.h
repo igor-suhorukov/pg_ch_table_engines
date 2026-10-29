@@ -152,6 +152,9 @@ typedef struct ChEngine
 	uint64_t	(*ranges_decoded) (void);
 	/* optional (pg_accel's §3.29 VC34's rest): the bytes point reads left compressed, for the tests */
 	uint64_t	(*point_bytes_left) (void);
+	/* optional (pg_accel's §3.38 VC41): a scan's readers' marks warmed first, and the marks files decompressed */
+	void		(*set_scan_marks) (int);
+	uint64_t	(*marks_loaded) (void);
 } ChEngine;
 
 /* GUCs */

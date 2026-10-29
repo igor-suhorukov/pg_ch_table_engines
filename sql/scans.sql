@@ -75,4 +75,32 @@ SELECT pg_stat_force_next_flush();
 SELECT n_tup_ins, seq_scan > 0 AS scanned FROM pg_stat_user_tables WHERE relname = 'ord';
 DROP TABLE ord;
 
+-- VC41 (pg_accel's §3.38): a scan's part readers over its mark ranges --
+-- two runs of the part's granules here, a reader each -- take a wide part's
+-- marks from the process's mark cache, where the scan warmed them as it
+-- began: a second scan of the same columns decompresses none of them.  Off,
+-- each reader decompresses its own, a second scan's as the first's did.
+-- Each in the session's own process, no worker beside it
+CREATE TABLE sm (k int, a int8, n int) USING mergetree
+  WITH (order_by = 'k', index_granularity = 1024, settings = 'min_bytes_for_wide_part = 0');
+INSERT INTO sm SELECT i, i * 7, i % 13 FROM generate_series(1, 10000) i;
+INSERT INTO sm SELECT i, i * 7, i % 13 FROM generate_series(10001, 20000) i;
+SELECT ch.optimize('sm', true) > 0 AS merged;
+\c
+SET max_parallel_workers_per_gather = 0;
+SET ch.enable_scan_marks = off;
+SELECT sum(a) FROM sm WHERE k BETWEEN 1000 AND 3000 OR k BETWEEN 15000 AND 17000;
+SELECT ch.marks_loaded() AS m0 \gset
+SELECT sum(a) FROM sm WHERE k BETWEEN 1000 AND 3000 OR k BETWEEN 15000 AND 17000;
+SELECT ch.marks_loaded() - :m0 > 0 AS loaded_again;
+\c
+SET max_parallel_workers_per_gather = 0;
+SELECT ch.marks_loaded() AS m0 \gset
+SELECT sum(a) FROM sm WHERE k BETWEEN 1000 AND 3000 OR k BETWEEN 15000 AND 17000;
+SELECT ch.marks_loaded() - :m0 > 0 AS loaded_first;
+SELECT ch.marks_loaded() AS m1 \gset
+SELECT sum(a) FROM sm WHERE k BETWEEN 1000 AND 3000 OR k BETWEEN 15000 AND 17000;
+SELECT ch.marks_loaded() - :m1 AS loaded_again;
+DROP TABLE sm;
+
 DROP TABLE sc, sh;

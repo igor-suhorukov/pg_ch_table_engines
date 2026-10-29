@@ -33,6 +33,7 @@ bool		ch_enable_sink_columns = true;
 bool		ch_enable_memory_parts = true;
 bool		ch_enable_fetch_cache = true;
 bool		ch_enable_point_reads = true;
+bool		ch_enable_scan_marks = true;
 bool		ch_enable_part_summaries = true;
 bool		ch_enable_summary_pruning = true;
 double		ch_fetch_cost = 55.0;
@@ -343,6 +344,23 @@ _PG_init(void)
 							 "shared memory for every process, a granule read whole only for a second row of it; "
 							 "off, ClickHouse's reader makes the row's granule of every column.",
 							 &ch_enable_point_reads,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * VC41 (pg_accel's §3.38): a scan's part readers take a merge's reader
+	 * settings, which save no marks in the process's mark cache, so that
+	 * each decompressed its part's marks again -- a reader a run where the
+	 * condition cache cut a unit into runs, 30% of ClickBench's Q1 at 100M
+	 * rows
+	 */
+	DefineCustomBoolVariable("ch.enable_scan_marks",
+							 "Whether a scan's readers of a mergetree part take its marks from the process's mark cache.",
+							 "On, a scan loads the part's marks of its columns into the mark cache before its "
+							 "readers, which then find them there, each part's marks decompressed once in the "
+							 "process; off, each reader -- a run's, a step's -- decompresses them itself.",
+							 &ch_enable_scan_marks,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

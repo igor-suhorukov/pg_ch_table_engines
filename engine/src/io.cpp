@@ -10,6 +10,7 @@
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/assert_cast.h>
 #include <Common/SimpleIncrement.h>
 #include <DataTypes/DataTypeLowCardinality.h>
@@ -40,6 +41,11 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
+}
+
+namespace ProfileEvents
+{
+    extern const Event LoadedMarksFiles;
 }
 
 using namespace chte;
@@ -555,14 +561,25 @@ std::vector<std::optional<MarkRanges>> markRuns(const std::optional<MarkRanges> 
     return runs;
 }
 
+/// VC41 (pg_accel's §3.38): a scan's part readers -- a run's sequential source, a unit's steps' readers --
+/// take a merge's reader settings, which never save marks in the mark cache though they look there
+/// (MergeTreeIOSettings.cpp:160-168, MergeTreeMarksLoader.cpp:305-315): each decompressed its part's marks of
+/// its streams again, a reader a run where the condition cache cut a unit into runs -- 30% of ClickBench's Q1
+/// at 100M rows, 13 parts.  Warmed first, as VC33 warms a fetch's, they are decompressed once a process.  A
+/// reader of a whole part, one run from its first granule, seeks nowhere and loads none: its marks are not
+/// warmed (openReader's caller, chte_read_begin).
+bool scan_marks = true;
+
 std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
-                                        std::optional<MarkRanges> mark_ranges)
+                                        std::optional<MarkRanges> mark_ranges, bool warm_marks)
 {
     auto & storage = *table.storage;
     auto snapshot = storage.getStorageSnapshot(table.metadata, table.context);
     auto mutations = storage.getMutationsSnapshot({});
     auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table.context);
 
+    if (warm_marks)
+        warmMarks(table, part, names, alter_conversions);
     auto r = std::make_unique<chte_reader>();
     r->table = &table;
     for (const auto & name : names)
@@ -693,8 +710,19 @@ extern "C" int chte_read_begin(chte_table * table, const char * part_name, const
             }
         }
 
-        *reader = openReader(*table, part, names, std::move(mark_ranges)).release();
+        bool warm = scan_marks && mark_ranges.has_value();
+        *reader = openReader(*table, part, names, std::move(mark_ranges), warm).release();
     });
+}
+
+extern "C" void chte_set_scan_marks(int on)
+{
+    scan_marks = on != 0;
+}
+
+extern "C" uint64_t chte_marks_loaded(void)
+{
+    return ProfileEvents::global_counters[ProfileEvents::LoadedMarksFiles];
 }
 
 namespace
@@ -1004,6 +1032,9 @@ extern "C" int chte_read_begin_steps(chte_table * table, const char * part_name,
         auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table->context);
         if (alter_conversions->hasPatches() || alter_conversions->hasLightweightDelete() || part->hasLightweightDelete())
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "chte_read_begin_steps: part {} has patches or a lightweight delete", part_name);
+        /// VC41: the steps' readers take their marks from the cache, as a run's sources do (openReader)
+        if (scan_marks)
+            warmMarks(*table, part, names, alter_conversions);
         ReadSettings read_settings = storage.getContext()->getReadSettings();
         read_settings.local_fs_settings.method = LocalFSReadMethod::pread;
         r->mark_cache = storage.getContext()->getMarkCache();

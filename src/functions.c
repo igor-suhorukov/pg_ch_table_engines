@@ -213,6 +213,23 @@ ch_point_bytes_left(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The marks files the session's process has decompressed (pg_accel's §3.38
+ * VC41), for the tests that check a scan's later readers take their marks
+ * from the process's mark cache; NULL where the engine library predates the
+ * count.
+ */
+PG_FUNCTION_INFO_V1(ch_marks_loaded);
+Datum
+ch_marks_loaded(PG_FUNCTION_ARGS)
+{
+	const ChEngine *eng = ch_engine();
+
+	if (eng->marks_loaded == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) eng->marks_loaded());
+}
+
+/*
  * The rows the session's process has read alone of an Arrow file's record
  * batches (VC27), for the tests; NULL where the engine library predates it.
  */

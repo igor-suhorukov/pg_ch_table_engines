@@ -456,6 +456,9 @@ ch_engine(void)
 	*(void **) &engine.ranges_decoded = dlsym(handle, "chte_ranges_decoded");
 	/* optional: a library built before VC34's rest decompresses a point read's blocks whole */
 	*(void **) &engine.point_bytes_left = dlsym(handle, "chte_point_bytes_left");
+	/* optional: a library built before pg_accel's VC41 has each scan reader decompress its marks */
+	*(void **) &engine.set_scan_marks = dlsym(handle, "chte_set_scan_marks");
+	*(void **) &engine.marks_loaded = dlsym(handle, "chte_marks_loaded");
 	/* optional: a library built before pg_accel's F7 says no batch's granule */
 	*(void **) &engine.read_granule = dlsym(handle, "chte_read_granule");
 	/* optional: a library built before pg_accel's F6 reads no row alone */

@@ -804,6 +804,9 @@ begin_reader(ChScanDesc scan)
 		uint8	   *steps = palloc0(scan->ncols + 1);
 
 		memcpy(steps, scan->col_step, scan->ncols);
+		/* VC41: the readers' marks from the process's mark cache, as the setting says */
+		if (eng->set_scan_marks != NULL)
+			eng->set_scan_marks(ch_enable_scan_marks);
 		CH_CALL("reading a part",
 				eng->read_begin_steps(scan->table->handle, scan->part->name, columns, steps,
 									  scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader,
@@ -811,9 +814,14 @@ begin_reader(ChScanDesc scan)
 		pfree(steps);
 	}
 	else
+	{
+		/* VC41: the readers' marks from the process's mark cache, as the setting says */
+		if (eng->set_scan_marks != NULL)
+			eng->set_scan_marks(ch_enable_scan_marks);
 		CH_CALL("reading a part",
 				eng->read_begin(scan->table->handle, scan->part->name, columns,
 								scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader, CH_ERR));
+	}
 	ch_handle_opened(scan->reader_owner, CH_HANDLE_READER, scan->reader);
 	/* a part written before a column was added has none: its rows take the column's missing value */
 	for (int c = 0; c < scan->ncols; c++)
