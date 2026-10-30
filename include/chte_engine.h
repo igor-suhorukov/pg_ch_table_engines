@@ -641,6 +641,37 @@ CHTE_API int			chte_read_restrict(chte_reader *reader, const chte_mark_range *ra
 							   uint64_t *dropped, chte_error *error);
 
 /*
+ * VC45 (pg_accel's §3.38, "After VP5, read again"): a reader's columns whose sparse serialization
+ * -- the offsets of the rows of other than the type's default and those rows' values (ClickHouse's
+ * ColumnSparse) -- the caller asks for as each batch is read.  chte_read_want_sparse: of the
+ * reader's columns in the order it was begun with, those whose wanted[i] is 1 -- before the first
+ * batch.  chte_read_sparse_rows: after a batch's read (chte_read_next) or its step's
+ * (chte_read_step), column's rows of other than the default, ascending, valid until the next read,
+ * and *sparse 1; *sparse 0 where the column was not sparse in the batch -- its part keeps it whole --
+ * or was not asked for.  The column is handed whole as before either way.  Optional: a library
+ * built before them lacks them.
+ */
+/*
+ * VC42 (pg_accel's §3.38, "After VP5, read again"): a part's metadata -- its columns, serialization,
+ * checksums, index granularity, counts and default codec -- shared among processes, a part never
+ * changing once committed.  chte_part_metadata_export: the part's, loaded here if it is not yet, as a
+ * blob valid until the next call on the table, *len 0 where the part's table or the part has what a
+ * blob does not hold (a partition key, TTL, a column of composite serialization ...).
+ * chte_part_metadata_import: a blob another process exported, for the part's first load here, which
+ * makes the part of it and reads none of its metadata files; *taken 0 where the part is loaded
+ * already.  Optional: a library built before them lacks them.
+ */
+CHTE_API int			chte_part_metadata_export(chte_table *table, const char *part_name, const void **data,
+									  size_t *len, chte_error *error);
+CHTE_API int			chte_part_metadata_import(chte_table *table, const char *part_name, const void *data,
+									  size_t len, int *taken, chte_error *error);
+
+CHTE_API int			chte_read_want_sparse(chte_reader *reader, const uint8_t *wanted, size_t ncolumns,
+								  chte_error *error);
+CHTE_API int			chte_read_sparse_rows(chte_reader *reader, size_t column, const uint64_t **rows, size_t *nrows,
+								  int *sparse, chte_error *error);
+
+/*
  * A part written again without the rows whose _pg_rowid are dead[0 .. n),
  * ascending -- deletions every snapshot sees, folded into it -- as a new part
  * named as a mutation of it, block_number its version (all_<min>_<max>_<level>_<block_number>),

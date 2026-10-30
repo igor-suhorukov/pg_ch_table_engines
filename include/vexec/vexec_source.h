@@ -314,6 +314,16 @@ typedef struct VexecSourceEstimate
 								 * TID, the spec's columns alone read
 								 * (fetch_columns()), in the planner's units;
 								 * 0 where the source does not price it */
+	double		fetch_threads;	/* from minor version 14: the threads of the
+								 * source's own a fetch reads its columns on
+								 * at once; 0 or 1 its caller's thread */
+	double		raw;			/* from minor version 18: the columns' bytes
+								 * read as they are decoded, uncompressed --
+								 * the work a row makes; 0 unknown */
+	double		parallel_units; /* from minor version 18: the units a
+								 * parallel scan of what the pruning keeps
+								 * is cut into, which no more participants
+								 * than share; 0 unknown */
 } VexecSourceEstimate;
 
 /*

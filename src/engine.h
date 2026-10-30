@@ -160,6 +160,12 @@ typedef struct ChEngine
 	int			(*part_granule_bounds) (chte_table *, const char *, const char *, int, uint32_t, uint32_t,
 										chte_vector *, uint8_t *, int *, chte_error *);
 	int			(*read_restrict) (chte_reader *, const chte_mark_range *, size_t, uint64_t *, chte_error *);
+	/* VC42 (pg_accel's §3.38): optional, a library built before it lacks them */
+	int			(*part_metadata_export) (chte_table *, const char *, const void **, size_t *, chte_error *);
+	int			(*part_metadata_import) (chte_table *, const char *, const void *, size_t, int *, chte_error *);
+	/* VC45 (pg_accel's §3.38): optional, a library built before it lacks them */
+	int			(*read_want_sparse) (chte_reader *, const uint8_t *, size_t, chte_error *);
+	int			(*read_sparse_rows) (chte_reader *, size_t, const uint64_t **, size_t *, int *, chte_error *);
 } ChEngine;
 
 /* GUCs */

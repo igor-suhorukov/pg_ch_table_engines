@@ -114,7 +114,11 @@ extern bool ch_enable_point_reads;
 extern bool ch_enable_scan_marks;
 extern bool ch_enable_skip_indexes;
 extern bool ch_parallel_part_affinity;
+extern bool ch_parallel_key_units;
+extern int	ch_parallel_unit_min_bytes;
+extern bool ch_enable_sparse_quals;
 extern uint64 ch_bound_granules_passed;	/* VC43: granules a running bound passed over in this process */
+extern uint64 ch_sparse_rows_passed;	/* VC45: rows of a sparse default the quals left out in this process */
 extern bool ch_enable_part_summaries;
 extern bool ch_enable_summary_pruning;
 extern double ch_fetch_cost;
@@ -518,6 +522,13 @@ extern void ch_streams_described(void);
 extern int	ch_part_selections;
 extern bool ch_enable_part_selections;
 extern void ch_selections_init(void);
+
+/* partmeta.c: the parts' loaded metadata in shared memory (VC42) */
+extern int	ch_part_metadata_entries;
+extern int	ch_part_metadata_bytes;
+extern bool ch_enable_shared_part_metadata;
+extern void ch_partmeta_init(void);
+extern void ch_part_metadata_prepare(ChTable *t, const ChPart *part);
 extern bool ch_selections_find(const ChTable *t, const ChPart *part, const ChFilterKey *fk, uint32 begin,
 							   uint32 end, chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows);
 extern chte_mark_range *ch_selections_ranges(const ChTable *t, const ChPart *part, const ChFilterKey *fk,

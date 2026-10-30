@@ -7,6 +7,7 @@
 
 #include <Columns/ColumnLowCardinality.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnSparse.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
@@ -926,8 +927,20 @@ namespace chte
 
 /// A column of a read as the caller takes it: no wrapper, and LowCardinality kept only where
 /// chte_read_keep_dictionaries asked for it (chte_read_next).
-static ColumnPtr handedColumn(const chte_reader & reader, ColumnPtr column, size_t c)
+static ColumnPtr handedColumn(chte_reader & reader, ColumnPtr column, size_t c)
 {
+    /// VC45: a sparse column's rows of other than the default, where the caller asks for them
+    if (c < reader.want_sparse.size() && reader.want_sparse[c])
+    {
+        if (const auto * sparse = typeid_cast<const ColumnSparse *>(column.get()))
+        {
+            const auto & offsets = sparse->getOffsetsData();
+            reader.sparse_rows[c].assign(offsets.begin(), offsets.end());
+            reader.sparse_known[c] = 1;
+        }
+        else
+            reader.sparse_known[c] = 0;
+    }
     column = column->convertToFullIfWrapped();
     if (c >= reader.keep_dictionary.size() || !reader.keep_dictionary[c])
         column = column->convertToFullColumnIfLowCardinality();
@@ -1417,5 +1430,34 @@ extern "C" int chte_drop_part(chte_table * table, const char * part_name, chte_e
         table->storage->forgetPart(part_name);
         auto disk = table->storage->getStoragePolicy()->getDisks().at(0);
         disk->removeRecursive(fs::path(table->storage->getRelativeDataPath()) / part_name);
+    });
+}
+
+/// VC45: the columns whose sparse rows the caller asks for
+extern "C" int chte_read_want_sparse(chte_reader * reader, const uint8_t * wanted, size_t ncolumns, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        reader->want_sparse.assign(wanted, wanted + ncolumns);
+        reader->sparse_rows.assign(ncolumns, {});
+        reader->sparse_known.assign(ncolumns, 0);
+    });
+}
+
+/// VC45: a column's rows of other than the default in the last read, where it was sparse
+extern "C" int chte_read_sparse_rows(chte_reader * reader, size_t column, const uint64_t ** rows, size_t * nrows,
+                                     int * sparse, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        *rows = nullptr;
+        *nrows = 0;
+        *sparse = 0;
+        if (column < reader->sparse_known.size() && reader->sparse_known[column] && !reader->by_offset)
+        {
+            *rows = reader->sparse_rows[column].data();
+            *nrows = reader->sparse_rows[column].size();
+            *sparse = 1;
+        }
     });
 }

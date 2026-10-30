@@ -463,6 +463,10 @@ ch_engine(void)
 	*(void **) &engine.set_skip_indexes = dlsym(handle, "chte_set_skip_indexes");
 	*(void **) &engine.part_granule_bounds = dlsym(handle, "chte_part_granule_bounds");
 	*(void **) &engine.read_restrict = dlsym(handle, "chte_read_restrict");
+	*(void **) &engine.part_metadata_export = dlsym(handle, "chte_part_metadata_export");
+	*(void **) &engine.part_metadata_import = dlsym(handle, "chte_part_metadata_import");
+	*(void **) &engine.read_want_sparse = dlsym(handle, "chte_read_want_sparse");
+	*(void **) &engine.read_sparse_rows = dlsym(handle, "chte_read_sparse_rows");
 	/* optional: a library built before pg_accel's F7 says no batch's granule */
 	*(void **) &engine.read_granule = dlsym(handle, "chte_read_granule");
 	/* optional: a library built before pg_accel's F6 reads no row alone */

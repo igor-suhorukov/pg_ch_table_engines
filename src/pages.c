@@ -205,6 +205,8 @@ ch_pages_attach(ChTable *t, const ChPart *part)
 	if (manifest != part->manifest)
 		pfree(manifest);
 	(void) hash_search(t->attached, part->name, HASH_ENTER, NULL);
+	/* VC42: its metadata another process loaded, or kept for the next */
+	ch_part_metadata_prepare(t, part);
 }
 
 /* W6: a part's files as its manifest names them, for the GPU's executor's reads of their bytes */

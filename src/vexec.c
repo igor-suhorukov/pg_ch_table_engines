@@ -436,7 +436,11 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 			st->nsteps = spec->nsteps;
 	}
 	if (spec->quals != NIL)
+	{
 		(void) ch_scan_set_filter(scan, spec->quals);
+		/* VC45: a sparse column's rows of its default, where a qual is false of it, left out */
+		ch_scan_set_sparse_quals(scan, spec->quals);
+	}
 	/*
 	 * F7 (minor 10, VC30): vexec's condition cache names a part's granules
 	 * to pass over as the scan selects them, and learns each batch's
@@ -1100,12 +1104,22 @@ src_next(void *arg, VexecSourceBatch *out_batch)
 		uint64	   *bits = MemoryContextAllocZero(out->cxt, sizeof(uint64) * ((n + 63) / 64));
 		uint32		live = 0;
 
-		for (uint32 k = 0; k < n; k++)
-			if (st->batch.visible[(pos + k) / 64] & (UINT64CONST(1) << ((pos + k) % 64)))
-			{
-				bits[k / 64] |= UINT64CONST(1) << (k % 64);
-				live++;
-			}
+		if (pos % 64 == 0)
+		{
+			/* a slice at a word's start, the library's batches' slices: the words as they are */
+			memcpy(bits, st->batch.visible + pos / 64, sizeof(uint64) * ((n + 63) / 64));
+			if (n % 64)
+				bits[n / 64] &= (UINT64CONST(1) << (n % 64)) - 1;
+			for (uint32 w = 0; w < (n + 63) / 64; w++)
+				live += (uint32) pg_popcount64(bits[w]);
+		}
+		else
+			for (uint32 k = 0; k < n; k++)
+				if (st->batch.visible[(pos + k) / 64] & (UINT64CONST(1) << ((pos + k) % 64)))
+				{
+					bits[k / 64] |= UINT64CONST(1) << (k % 64);
+					live++;
+				}
 		out_batch->visible = bits;
 		returned = live;
 	}
@@ -1262,7 +1276,9 @@ src_estimate(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, doubl
  * reads, its units; and VEXEC_EST_AGG_EXACT where aggregate() answers each
  * of them from its statistics -- a scan with no qual and no TIDs, no row of
  * it deleted, and every column one whose least and greatest values a part's
- * statistics keep (answer_from_stats()).
+ * statistics keep (answer_from_stats()).  From the contract's minor 18
+ * (VC44): the columns' bytes uncompressed, and the units a parallel scan
+ * cuts of the granules the quals keep.
  */
 static void
 src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, VexecSourceEstimate *est)
@@ -1272,10 +1288,13 @@ src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, Ve
 	double		rows;
 	double		bytes;
 	double		units;
+	double		raw;
+	double		punits;
 	bool		deleted;
 	uint32		flags = 0;
 
-	ch_estimate(rel, snapshot, spec->ncolumns, spec->attnums, tids, spec->quals, &rows, &bytes, NULL);
+	ch_estimate_parallel(rel, snapshot, spec->ncolumns, spec->attnums, tids, spec->quals, &rows, &bytes, &raw,
+						 &punits);
 	ch_estimate_units(rel, snapshot, &units, &deleted);
 	if (spec->quals == NIL && !tids && !deleted)
 	{
@@ -1298,6 +1317,12 @@ src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, Ve
 	if (est->size >= offsetof(VexecSourceEstimate, fetch) + sizeof(est->fetch) &&
 		(ch_fetch_cost > 0 || ch_fetch_value_cost > 0))
 		est->fetch = ch_fetch_price(rel, spec->ncolumns);
+	/* minor 18 (VC44, pg_accel's §3.38 F28): the bytes decoded, and a parallel scan's units */
+	if (est->size >= offsetof(VexecSourceEstimate, parallel_units) + sizeof(est->parallel_units))
+	{
+		est->raw = raw;
+		est->parallel_units = punits;
+	}
 }
 
 /*

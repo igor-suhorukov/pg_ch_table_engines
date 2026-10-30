@@ -230,6 +230,17 @@ ch_granules_bound(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) ch_bound_granules_passed);
 }
 
+/*
+ * The rows of a sparse column's default its scans' quals left out in the
+ * session's process (pg_accel's §3.38 VC45), for the tests.
+ */
+PG_FUNCTION_INFO_V1(ch_sparse_passed);
+Datum
+ch_sparse_passed(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) ch_sparse_rows_passed);
+}
+
 PG_FUNCTION_INFO_V1(ch_marks_loaded);
 Datum
 ch_marks_loaded(PG_FUNCTION_ARGS)

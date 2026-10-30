@@ -351,6 +351,15 @@ private:
         std::map<String, ColumnSize> column_sizes;    /// columnsSize()'s, so far
     };
     mutable std::map<String, LoadedPart> parts;
+    /// VC42 (pg_accel's §3.38): a part's metadata as another process loaded it, handed by the caller
+    /// (chte_part_metadata_import) before the part is first loaded here, which loadPart takes in place
+    /// of reading and parsing the part's files
+    mutable std::unordered_map<String, String> imported_metadata;
+    MutableDataPartPtr restorePart(const String & part_name, const String & blob) const;
+public:
+    /// VC42: a blob of a part's metadata for its first load here; false where it is loaded already
+    bool importMetadata(const String & part_name, String blob) const;
+private:
     LoadedPart & loadedPart(const String & part_name) const;
     /// the metadata loadPart() loads a part by, and the table's metadata it is a copy of
     mutable StorageMetadataPtr without_projections;
@@ -374,6 +383,9 @@ namespace chte
 
 /// An external table (external.cpp): files PostgreSQL does not own, read by ClickHouse's input formats.
 class ExternalTable;
+
+/// VC42: a loaded part's metadata as a blob (chte_part_metadata_export); empty where none is shareable
+String exportPartMetadata(const PgMergeTree & storage, const IMergeTreeDataPart & part);
 
 /// A reader of a part's named columns over mark_ranges (none: every granule), as chte_read_begin opens; with
 /// warm_marks, their marks warmed into the process's mark cache first (VC41, warmMarks()).
@@ -528,6 +540,11 @@ struct chte_reader
     /// dictionary handed and its id, held so that no other dictionary is made at its address
     /// while the reader compares with it
     std::vector<uint8_t> keep_dictionary;
+    /// VC45 (chte_read_want_sparse): the columns whose sparse rows the caller asks for, and per column
+    /// the last read's rows of other than the default and whether it was sparse
+    std::vector<uint8_t> want_sparse;
+    std::vector<std::vector<uint64_t>> sparse_rows;
+    std::vector<uint8_t> sparse_known;
     struct Dictionary
     {
         DB::ColumnPtr column;
@@ -602,4 +619,6 @@ struct chte_table
     /// process's at ClickBench's 105 columns
     bool implicit_indexes = false;
     std::map<std::string, std::optional<DB::IndexDescription>> column_indexes;
+    /// VC42: chte_part_metadata_export's last answer
+    std::string metadata_blob = {};
 };

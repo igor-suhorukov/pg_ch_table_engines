@@ -107,6 +107,7 @@ typedef struct ChScanShared
 	pg_atomic_uint64 units_passed;
 	pg_atomic_uint64 marks;
 	pg_atomic_uint64 marks_read;
+	pg_atomic_uint64 units_cut;	/* VC44: every participant's alike */
 } ChScanShared;
 
 typedef struct ChScanState
@@ -573,6 +574,8 @@ keep_counts(ChScanState *s)
 		pg_atomic_fetch_add_u64(&s->shared->units_passed, c->units_passed);
 		pg_atomic_fetch_add_u64(&s->shared->marks, c->marks);
 		pg_atomic_fetch_add_u64(&s->shared->marks_read, c->marks_read);
+		if (c->units_cut > 0)
+			pg_atomic_write_u64(&s->shared->units_cut, (uint64) c->units_cut);
 	}
 }
 
@@ -616,6 +619,7 @@ chscan_initialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *coordi
 	pg_atomic_init_u64(&s->shared->units_passed, 0);
 	pg_atomic_init_u64(&s->shared->marks, 0);
 	pg_atomic_init_u64(&s->shared->marks_read, 0);
+	pg_atomic_init_u64(&s->shared->units_cut, 0);
 	s->pscan = (ParallelTableScanDesc) ((char *) coordinate + MAXALIGN(sizeof(ChScanShared)));
 	table_parallelscan_initialize(s->rel, s->pscan, node->ss.ps.state->es_snapshot);
 }
@@ -650,6 +654,7 @@ chscan_shutdown(CustomScanState *node)
 		s->others.units_passed = pg_atomic_read_u64(&s->shared->units_passed);
 		s->others.marks = pg_atomic_read_u64(&s->shared->marks);
 		s->others.marks_read = pg_atomic_read_u64(&s->shared->marks_read);
+		s->others.units_cut = (int64) pg_atomic_read_u64(&s->shared->units_cut);
 		s->shared = NULL;
 	}
 }
@@ -694,12 +699,15 @@ chscan_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		c.units_passed += s->others.units_passed;
 		c.marks += s->others.marks;
 		c.marks_read += s->others.marks_read;
+		c.units_cut = Max(c.units_cut, s->others.units_cut);
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			ExplainIndentText(es);
 			appendStringInfo(es->str, "%s: %lld read of %lld", units, (long long) c.marks_read, (long long) c.marks);
 			if (c.parts_pruned > 0)
 				appendStringInfo(es->str, ", %s pruned: %lld", parts, (long long) c.parts_pruned);
+			if (c.units_cut > 0)
+				appendStringInfo(es->str, ", units of the granules kept: %lld", (long long) c.units_cut);
 			appendStringInfoChar(es->str, '\n');
 		}
 		else
@@ -707,6 +715,8 @@ chscan_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			ExplainPropertyInteger(psprintf("%s Read", units), NULL, c.marks_read, es);
 			ExplainPropertyInteger(units, NULL, c.marks, es);
 			ExplainPropertyInteger(external ? "Files Pruned" : "Parts Pruned", NULL, c.parts_pruned, es);
+			if (c.units_cut > 0)
+				ExplainPropertyInteger("Units of the Granules Kept", NULL, c.units_cut, es);
 		}
 	}
 }

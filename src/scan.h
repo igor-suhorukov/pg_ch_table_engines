@@ -60,6 +60,8 @@ typedef struct ChScanCounts
 	int64		marks_read;		/* of them, those read */
 	int64		marks_skipped;	/* F7: of those the filter kept, those a granule skip passed over */
 	int64		marks_bound;	/* VC43: of those, those a running bound passed over */
+	int64		units_cut;		/* VC44: the units, where cut over the granules the filter keeps; else 0 */
+	int64		sparse_passed;	/* VC45: rows of a sparse column's default its quals leave out */
 } ChScanCounts;
 
 /*
@@ -70,6 +72,11 @@ extern void ch_scan_set_columns(TableScanDesc scan, int n, const AttrNumber *att
 
 /* Before the first batch: quals to prune by (filter.c); false when none could be */
 extern bool ch_scan_set_filter(TableScanDesc scan, List *quals);
+/*
+ * VC45: before the first batch, the quals the scan's rows must meet: where one is false of a column's
+ * default and NULL, a part's sparse column's rows of the default are left out of its batches' visible rows
+ */
+extern void ch_scan_set_sparse_quals(TableScanDesc scan, List *quals);
 extern void ch_scan_set_join_keys(TableScanDesc scan, int nkeys, const ScanKeyData *keys);
 
 extern bool ch_scan_set_dictionaries(TableScanDesc scan, const bool *keep);
@@ -154,6 +161,8 @@ extern const ChScanCounts *ch_scan_counts(TableScanDesc scan);
  */
 extern void ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, bool rowid,
 						List *quals, double *rows, double *bytes, double *raw);
+extern void ch_estimate_parallel(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, bool rowid,
+								 List *quals, double *rows, double *bytes, double *raw, double *punits);
 
 /* filter.c: ANDed quals over a table's Vars as a filter of the library's, or NULL */
 extern chte_filter *ch_filter_make(ChTable *t, List *quals, ChFilterKey *key);
@@ -172,6 +181,8 @@ extern bool ch_part_nulls(ChTable *t, const ChPart *part, AttrNumber attnum, int
 extern bool ch_column_minmax_kept(const ChColumn *col);
 /* The parts a serial scan reads, its units, and whether the snapshot sees a deleted row */
 extern void ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted);
+extern double ch_kept_parallel_units(int nparts, const int32 *marks, const int64 *rows, const uint64 *kept_rows,
+									  const double *gbytes);
 
 /*
  * Rows by their TIDs (VC16): of the columns attnums[0 .. n), 1-based, or of

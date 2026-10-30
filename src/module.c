@@ -36,7 +36,11 @@ bool		ch_enable_point_reads = true;
 bool		ch_enable_scan_marks = true;
 bool		ch_enable_skip_indexes = true;
 bool		ch_parallel_part_affinity = false;
+bool		ch_parallel_key_units = true;
+int			ch_parallel_unit_min_bytes = 4096;
+bool		ch_enable_sparse_quals = true;
 uint64		ch_bound_granules_passed = 0;
+uint64		ch_sparse_rows_passed = 0;
 bool		ch_enable_part_summaries = true;
 bool		ch_enable_summary_pruning = true;
 double		ch_fetch_cost = 55.0;
@@ -245,6 +249,13 @@ _PG_init(void)
 	/* the parts' granules filters keep, in the postmaster's shared memory (VC31) */
 	if (process_shared_preload_libraries_in_progress)
 		ch_selections_init();
+	/* the parts' loaded metadata, in the postmaster's shared memory (VC42) */
+	if (process_shared_preload_libraries_in_progress)
+		ch_partmeta_init();
+	else
+		DefineCustomBoolVariable("ch.enable_shared_part_metadata",
+								 "Whether a process makes a MergeTree part of the metadata another process loaded.",
+								 NULL, &ch_enable_shared_part_metadata, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("ch.enable_part_selections",
 							 "Whether the granules a filter keeps of a MergeTree part are kept in shared memory.",
 							 "Kept, a process plans and claims the part under the same filter without loading it; "
@@ -386,6 +397,35 @@ _PG_init(void)
 							 "marks of a few parts; off, every participant the next unit of all, every part's.",
 							 &ch_parallel_part_affinity,
 							 false,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.parallel_key_units",
+							 "Whether a parallel scan's units are cut over the granules its filter keeps.",
+							 "On, a parallel scan whose quals keep some of the parts' granules cuts its units of "
+							 "those granules alone, by the sizes it cuts a whole scan's by, so that a narrow range "
+							 "of the key has units for its participants; off, over every part's granules.",
+							 &ch_parallel_key_units,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomIntVariable("ch.parallel_unit_min_bytes",
+							"The least of a parallel scan's units cut over the granules its filter keeps, by its "
+							"columns' bytes decoded.",
+							"A unit within a compressed block decodes the block whole: a scan of a few narrow "
+							"columns, cut finely, decodes each block once a unit.  At least VC36's least of rows "
+							"too; 0: by rows alone.",
+							&ch_parallel_unit_min_bytes,
+							4096, 0, INT_MAX / 1024,
+							PGC_USERSET, GUC_UNIT_KB,
+							NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_sparse_quals",
+							 "Whether a scan leaves a sparse column's rows of its default out by the quals false of it.",
+							 "On, a part's column of the sparse serialization -- its rows of other than the type's "
+							 "default listed apart -- has its rows of the default left out of a batch's visible "
+							 "rows where one of the scan's quals is false of the default and of NULL; off, every "
+							 "row is handed and the quals judge it.",
+							 &ch_enable_sparse_quals,
+							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomBoolVariable("ch.enable_skip_indexes",

@@ -106,6 +106,102 @@ SELECT * FROM ch.parallel_units(ARRAY[0, 3, 200000], 8192) WHERE part < 3 OR fir
 
 SELECT * FROM ch.parallel_units(ARRAY[-1]);
 ERROR:  a part's granules must be a count, not -1
+-- VC44 (pg_accel's §3.38 F28): a parallel scan whose quals keep some of the
+-- parts' granules cuts its units of those alone, by the same sizes, and of at
+-- least ch.parallel_unit_min_bytes of its columns decoded -- four parts of 128
+-- granules of 1,024 rows, two units each of every granule: the key's range of
+-- 16 granules a part makes a unit each; of 102, with no least of bytes, two
+-- each -- every row read once either way
+CREATE TABLE ku (k int NOT NULL, v int NOT NULL, t text NOT NULL) USING mergetree
+  WITH (order_by = 'k', index_granularity = 1024, settings = 'min_bytes_for_wide_part = 0');
+INSERT INTO ku SELECT g % 1000, g, repeat('x', g % 50) FROM generate_series(1, 131072) g;
+INSERT INTO ku SELECT g % 1000, g, repeat('y', g % 50) FROM generate_series(1, 131072) g;
+INSERT INTO ku SELECT g % 1000, g, repeat('z', g % 50) FROM generate_series(1, 131072) g;
+INSERT INTO ku SELECT g % 1000, g, repeat('w', g % 50) FROM generate_series(1, 131072) g;
+CREATE FUNCTION key_units(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  plan jsonb;
+  node jsonb;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) ' || q INTO plan;
+  node := jsonb_path_query_first(plan, 'strict $.**? (@."Custom Plan Provider" == "ChScan")');
+  RETURN format('%s of %s granules read, units of the granules kept: %s', node->>'Granules Read',
+                node->>'Granules', coalesce(node->>'Units of the Granules Kept', 'none'));
+END $$;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 4;
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k BETWEEN 100 AND 224');
+                       key_units                        
+--------------------------------------------------------
+ 68 of 512 granules read, units of the granules kept: 4
+(1 row)
+
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k BETWEEN 100 AND 224;
+ count |    sum     |   sum   
+-------+------------+---------
+ 65500 | 4268111000 | 1441000
+(1 row)
+
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k < 800');
+                        key_units                        
+---------------------------------------------------------
+ 412 of 512 granules read, units of the granules kept: 4
+(1 row)
+
+SET ch.parallel_unit_min_bytes = 0;
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k < 800');
+                        key_units                        
+---------------------------------------------------------
+ 412 of 512 granules read, units of the granules kept: 8
+(1 row)
+
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k < 800;
+ count  |     sum     |   sum    
+--------+-------------+----------
+ 419488 | 27453732912 | 10276312
+(1 row)
+
+RESET ch.parallel_unit_min_bytes;
+SELECT key_units('SELECT count(*), sum(v) FROM ku');
+                         key_units                          
+------------------------------------------------------------
+ 512 of 512 granules read, units of the granules kept: none
+(1 row)
+
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k >= 0');
+                         key_units                          
+------------------------------------------------------------
+ 512 of 512 granules read, units of the granules kept: none
+(1 row)
+
+SET ch.parallel_key_units = off;
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k BETWEEN 100 AND 224');
+                         key_units                         
+-----------------------------------------------------------
+ 68 of 512 granules read, units of the granules kept: none
+(1 row)
+
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k BETWEEN 100 AND 224;
+ count |    sum     |   sum   
+-------+------------+---------
+ 65500 | 4268111000 | 1441000
+(1 row)
+
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k < 800;
+ count  |     sum     |   sum    
+--------+-------------+----------
+ 419488 | 27453732912 | 10276312
+(1 row)
+
+RESET ch.parallel_key_units;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+DROP FUNCTION key_units(text);
+DROP TABLE ku;
 -- a TID scan fetches a row by its row id
 SELECT ctid AS tid FROM sc WHERE a = 54321 \gset
 SELECT a, b FROM sc WHERE ctid = :'tid';

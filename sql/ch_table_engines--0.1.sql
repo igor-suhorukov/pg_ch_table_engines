@@ -265,6 +265,19 @@ CREATE FUNCTION ch.marks_loaded() RETURNS bigint
 CREATE FUNCTION ch.granules_bound() RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_granules_bound' LANGUAGE C VOLATILE;
 
+-- The rows of a sparse column's default -- of a part whose column ClickHouse's
+-- sparse serialization keeps -- its scans left out in the session's process by
+-- a qual false of the default (pg_accel's §3.38 VC45), for the tests.
+CREATE FUNCTION ch.sparse_passed() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_sparse_passed' LANGUAGE C VOLATILE;
+
+-- MergeTree parts' loaded metadata kept in shared memory (pg_accel's §3.38
+-- VC42): its entries and their bytes, NULLs where none is kept; the session's
+-- process's entries found, kept, and parts made of them.
+CREATE FUNCTION ch.part_metadata(OUT entries int4, OUT bytes int8, OUT found int8, OUT kept int8, OUT made int8)
+	RETURNS record
+	AS 'MODULE_PATHNAME', 'ch_part_metadata_info' LANGUAGE C VOLATILE;
+
 -- The rows the session's process has read alone of the uncompressed record
 -- batches of Arrow files (ch_table_engines.md §3, VC27): a fetch's rows by
 -- their TIDs read from their batch's buffers at those rows, not the batch's

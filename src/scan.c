@@ -55,17 +55,23 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/parallel.h"
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
+#include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "common/hashfn.h"
 #include "lib/ilist.h"
@@ -171,6 +177,7 @@ typedef struct ChScanDescData
 	void	   *unit_check_arg;
 	ChGranuleSkip granule_skip; /* F7: NULL, every granule the filter keeps is read */
 	void	   *granule_skip_arg;
+	uint8	   *sparse_want;	/* VC45: per column read, the reader's sparse rows asked for; NULL, none */
 	ChGranuleCheck granule_check;	/* VC43: a running bound's; NULL, none */
 	void	   *granule_check_arg;
 	bool		bound_moved;	/* since the claimed unit's granules were last checked */
@@ -492,6 +499,275 @@ setup_units(ChScanDesc scan)
 	pfree(rows);
 }
 
+/*
+ * VC44 (pg_accel's §3.38 F28): the units of a parallel scan of parts of
+ * these granules and rows, of which its filter keeps kept[i] granules in
+ * ranges[i]'s ranges (NULL: the part's granules from its first) -- size_units()'s
+ * sizes over the granules kept alone, the granules left to claim the kept
+ * ones left: a range of the key of 82 granules over 13 parts made two or
+ * three units of every part's granules, and of 17 participants three read
+ * rows.  Each part's units still cover its marks, from its first: a unit
+ * begins at its first kept granule -- a part's first at the part's first --
+ * and ends where the next begins, so that a unit is read as the granules the
+ * filter keeps of it, as before.  A part the filter keeps none of is one
+ * unit.  Into unit_start (nparts + 1) as size_units(), each unit's first
+ * granule in the array returned (nunits + 1) -- NULL, and only their count,
+ * where ranges is NULL.
+ */
+static uint32 *
+size_kept_units(int nparts, const int32 *marks, const int64 *rows, const int32 *kept, const double *gbytes,
+				chte_mark_range *const *ranges, const size_t *nranges, uint32 *unit_start, uint32 *nunits)
+{
+	uint64		left = 0;
+	uint32		cap = 64;
+	uint32	   *first = ranges ? palloc(sizeof(uint32) * (cap + 1)) : NULL;
+
+	for (int i = 0; i < nparts; i++)
+		left += (uint64) Max(kept[i], 0);
+	*nunits = 0;
+	for (int i = 0; i < nparts; i++)
+	{
+		uint32		n = (uint32) Max(marks[i], 1);
+		uint32		k = (uint32) Min(Max(kept[i], 0), (int32) n);
+		uint64		per = Max((uint64) Max(rows[i], 0) / n, 1);
+		uint64		least = Max(CH_UNIT_MIN_ROWS / per, 1);
+		uint64		most = Max(CH_UNIT_MAX_ROWS / per, least);
+		uint32		taken = 0;
+		size_t		r = 0;			/* the range of the next kept granule, and its place in it */
+		uint32		off = 0;
+
+		/*
+		 * and at least ch.parallel_unit_min_bytes of its columns decoded:
+		 * a compressed block holds a megabyte of a column's values, 128
+		 * granules of a byte a row, which every unit within it decodes
+		 * whole -- ClickBench's Q41 at 100M rows, a few integers over 93
+		 * granules, 12% slower in units of 8 granules than of 46
+		 */
+		if (gbytes != NULL && gbytes[i] > 0 && ch_parallel_unit_min_bytes > 0)
+			least = Min(Max(least, (uint64) ceil((double) ch_parallel_unit_min_bytes * 1024.0 / gbytes[i])), most);
+		if (unit_start)
+			unit_start[i] = *nunits;
+		do
+		{
+			uint64		size = Min(Max((left + CH_UNIT_DIVISOR - 1) / CH_UNIT_DIVISOR, least), most);
+
+			size = Min(size, (uint64) (k - taken));
+			if (first)
+			{
+				uint32		begin = 0;
+
+				if (*nunits == cap)
+				{
+					cap *= 2;
+					first = repalloc(first, sizeof(uint32) * (cap + 1));
+				}
+				/* the unit's first kept granule, the part's first mark for its first unit */
+				if (taken > 0 && ranges[i] != NULL)
+					begin = ranges[i][r].begin + off;
+				else if (taken > 0)
+					begin = taken;
+				first[*nunits] = begin;
+				/* past its granules, to the next unit's first */
+				if (ranges[i] != NULL)
+					for (uint64 todo = size; todo > 0 && r < nranges[i];)
+					{
+						uint32		avail = ranges[i][r].end - ranges[i][r].begin - off;
+
+						if (todo < avail)
+						{
+							off += (uint32) todo;
+							todo = 0;
+						}
+						else
+						{
+							todo -= avail;
+							r++;
+							off = 0;
+						}
+					}
+			}
+			(*nunits)++;
+			taken += (uint32) size;
+			left -= size;
+		} while (taken < k);
+	}
+	if (unit_start)
+		unit_start[nparts] = *nunits;
+	if (first)
+		first[*nunits] = 0;
+	return first;
+}
+
+/*
+ * What a filter keeps of a part by the part's summary (VC20's B7), as
+ * chte_part_select() would by its statistics and its key: CHTE_SELECT_NONE
+ * or CHTE_SELECT_ALL, the part then neither attached nor loaded, or
+ * CHTE_SELECT_RANGES, chte_part_select()'s to tell.
+ */
+static int
+part_verdict(chte_filter *filter, ChPart *part)
+{
+	const ChEngine *eng = ch_engine();
+	bytea	   *summary = NULL;
+	int			verdict;
+
+	if (filter == NULL || !ch_enable_summary_pruning || eng->filter_summary_select == NULL ||
+		part->listing != NULL)
+		return CHTE_SELECT_RANGES;
+	if (ch_enable_part_summaries)
+		summary = ch_part_summary(part);
+	CH_CALL("analyzing a part",
+			eng->filter_summary_select(filter, part->name, summary ? VARDATA_ANY(summary) : NULL,
+									   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
+	return verdict;
+}
+
+/*
+ * A granule's bytes of these columns decoded, by the part's summary -- the
+ * part neither attached nor loaded -- or 0 where it has none
+ */
+static double
+part_granule_bytes(ChTable *t, ChPart *p, const char *columns)
+{
+	const ChEngine *eng = ch_engine();
+	bytea	   *summary;
+	uint64		compressed = 0;
+	uint64		uncompressed = 0;
+	int			found = 0;
+
+	if (!ch_enable_part_summaries || eng->summary_column_bytes == NULL || p->listing != NULL ||
+		p->marks <= 0 || (summary = ch_part_summary(p)) == NULL)
+		return 0;
+	CH_CALL("sizing a part's columns",
+			eng->summary_column_bytes(t->handle, p->name, VARDATA_ANY(summary), VARSIZE_ANY_EXHDR(summary),
+									  columns, &compressed, &uncompressed, &found, CH_ERR));
+	return found ? (double) uncompressed / p->marks : 0;
+}
+
+/*
+ * VC44: a parallel scan of a table's parts, its filter set, its units cut
+ * anew over the granules the filter keeps of each part (size_kept_units()) --
+ * the same in every participant, whose snapshot sees the same parts and
+ * whose filter is the plan's: the parts' selections are VC31's, kept in
+ * shared memory as the leader planned, else the engine library's, which
+ * answers alike.  Not where the filter has no key (its selections are not
+ * kept, and each participant would load every part to ask), nor where it
+ * keeps every granule, which are cut as before; nor a table of files.
+ */
+static void
+cut_units_by_filter(ChScanDesc scan)
+{
+	int			nparts = scan->nparts;
+	int32	   *marks;
+	int64	   *rows;
+	int32	   *kept;
+	double	   *gbytes;
+	chte_mark_range **ranges;
+	size_t	   *nranges;
+	uint64		total = 0;
+	uint64		all = 0;
+	int			i = 0;
+	ListCell   *lc;
+	MemoryContext old;
+
+	if (!ch_parallel_key_units || scan->unit_start == NULL || scan->filter == NULL || nparts == 0 ||
+		scan->table->external || scan->table->own || scan->claim_alone ||
+		(scan->filter_key.h1 == 0 && scan->filter_key.h2 == 0))
+		return;
+	old = MemoryContextSwitchTo(scan->scan_cxt);
+	marks = palloc(sizeof(int32) * nparts);
+	rows = palloc(sizeof(int64) * nparts);
+	kept = palloc(sizeof(int32) * nparts);
+	ranges = palloc0(sizeof(chte_mark_range *) * nparts);
+	nranges = palloc0(sizeof(size_t) * nparts);
+	gbytes = palloc0(sizeof(double) * nparts);
+	foreach(lc, scan->parts)
+	{
+		ChPart	   *p = lfirst(lc);
+		int			verdict = part_verdict(scan->filter, p);
+
+		marks[i] = p->marks;
+		rows[i] = p->rows;
+		all += (uint64) Max(p->marks, 1);
+		if (verdict == CHTE_SELECT_NONE)
+			kept[i] = 0;
+		else if (verdict == CHTE_SELECT_ALL)
+			kept[i] = Max(p->marks, 1);
+		else
+		{
+			size_t		cap = 16;
+			uint64		krows;
+
+			ranges[i] = palloc(sizeof(chte_mark_range) * cap);
+			for (;;)
+			{
+				(void) ch_unit_select(scan->table, p, scan->filter, &scan->filter_key, 0, 0, ranges[i], cap,
+									  &nranges[i], &krows);
+				if (nranges[i] <= cap)
+					break;
+				cap = nranges[i];
+				ranges[i] = repalloc(ranges[i], sizeof(chte_mark_range) * cap);
+			}
+			kept[i] = 0;
+			for (size_t r = 0; r < nranges[i]; r++)
+				kept[i] += (int32) (ranges[i][r].end - ranges[i][r].begin);
+		}
+		if (kept[i] > 0 && scan->ncols > 0)
+			gbytes[i] = part_granule_bytes(scan->table, p, scan->columns);
+		total += (uint64) kept[i];
+		i++;
+	}
+	if (total < all)
+	{
+		uint32	   *first;
+		uint32		nunits;
+
+		first = size_kept_units(nparts, marks, rows, kept, gbytes, ranges, nranges, scan->unit_start, &nunits);
+		pfree(scan->unit_first);
+		scan->unit_first = first;
+		scan->nunits = nunits;
+		scan->counts.units_cut = nunits;
+	}
+	for (i = 0; i < nparts; i++)
+		if (ranges[i])
+			pfree(ranges[i]);
+	pfree(ranges);
+	pfree(nranges);
+	pfree(gbytes);
+	pfree(kept);
+	pfree(rows);
+	pfree(marks);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * VC44: the units of rows a parallel scan of the parts the snapshot sees
+ * would cut of what a filter keeps, each part's granules kept counted from
+ * its rows kept -- the planner's, for its workers (pg_accel's F28): a part
+ * the filter keeps none of, a unit of none, not counted.  ClickBench's Q36
+ * at 100M rows keeps 93 granules of 2 parts of 13.
+ */
+double
+ch_kept_parallel_units(int nparts, const int32 *marks, const int64 *rows, const uint64 *kept_rows,
+					   const double *gbytes)
+{
+	int32	   *kept = palloc(sizeof(int32) * Max(nparts, 1));
+	uint32		nunits;
+	int			empty = 0;
+
+	for (int i = 0; i < nparts; i++)
+	{
+		uint64		per = Max((uint64) Max(rows[i], 0) / (uint64) Max(marks[i], 1), 1);
+
+		kept[i] = (int32) Min((kept_rows[i] + per - 1) / per, (uint64) Max(marks[i], 1));
+		if (kept[i] == 0)
+			empty++;
+	}
+	(void) size_kept_units(nparts, marks, rows, kept, gbytes, NULL, NULL, NULL, &nunits);
+	pfree(kept);
+	return (double) (nunits - (uint32) empty);
+}
+
 /* ---- ch.parallel_units() (VC36) ---- */
 
 /*
@@ -734,28 +1010,11 @@ claim_one_unit(ChScanDesc scan)
 	return true;
 }
 
-/*
- * What the filter keeps of the claimed unit's part by the part's summary
- * (VC20's B7), as chte_part_select() would by its statistics and its key:
- * CHTE_SELECT_NONE or CHTE_SELECT_ALL, the part then neither attached nor
- * loaded, or CHTE_SELECT_RANGES, chte_part_select()'s to tell.
- */
+/* What the filter keeps of the claimed unit's part by the part's summary (part_verdict()) */
 static int
 summary_verdict(ChScanDesc scan)
 {
-	const ChEngine *eng = ch_engine();
-	bytea	   *summary = NULL;
-	int			verdict;
-
-	if (scan->filter == NULL || !ch_enable_summary_pruning || eng->filter_summary_select == NULL ||
-		scan->part->listing != NULL)
-		return CHTE_SELECT_RANGES;
-	if (ch_enable_part_summaries)
-		summary = ch_part_summary(scan->part);
-	CH_CALL("analyzing a part",
-			eng->filter_summary_select(scan->filter, scan->part->name, summary ? VARDATA_ANY(summary) : NULL,
-									   summary ? VARSIZE_ANY_EXHDR(summary) : 0, &verdict, CH_ERR));
-	return verdict;
+	return part_verdict(scan->filter, scan->part);
 }
 
 /* The claimed unit's granules the filter keeps, and their rows */
@@ -921,6 +1180,9 @@ begin_reader(ChScanDesc scan)
 		CH_CALL("reading a part", eng->read_keep_dictionaries(scan->reader, keep, scan->ncols + 1, CH_ERR));
 		pfree(keep);
 	}
+	/* VC45: the sparse rows of the columns whose default the quals leave out */
+	if (scan->sparse_want != NULL && scan->part->listing == NULL && eng->read_want_sparse != NULL)
+		CH_CALL("reading a part", eng->read_want_sparse(scan->reader, scan->sparse_want, scan->ncols + 1, CH_ERR));
 }
 
 /* What a scan's reader reads, for its errors: a part, or an external table's file (§2.17) */
@@ -1503,6 +1765,181 @@ ch_scan_set_columns(TableScanDesc sscan, int n, const AttrNumber *attnums, bool 
 	MemoryContextSwitchTo(old);
 }
 
+/*
+ * VC45 (pg_accel's §3.38, "After VP5, read again"): a part's sparse column
+ * -- ClickHouse's serialization of its rows of other than the type's default,
+ * their offsets and values -- read whole, and its offsets handed beside it
+ * (chte_read_sparse_rows()): the batch's rows of the default left out of its
+ * visible ones, where a qual is false of the column's default.  ClickBench's
+ * AdvEngineID is 98.3% zeros, and Q1 and Q7 keep AdvEngineID <> 0.
+ */
+static void
+sparse_visible(ChScanDesc scan, ChScanBatch *batch)
+{
+	const ChEngine *eng = ch_engine();
+	uint64	   *bits = NULL;
+	uint64	   *have = NULL;
+	uint32		n = scan->nrows;
+	uint32		before = batch->nvisible;
+	uint32		live = 0;
+
+	if (scan->reader == NULL || scan->part == NULL || scan->part->listing != NULL || eng->read_sparse_rows == NULL)
+		return;
+	for (int c = 0; c < scan->ncols; c++)
+	{
+		const uint64_t *rows;
+		size_t		nrows;
+		int			sparse;
+
+		if (!scan->sparse_want[c])
+			continue;
+		CH_CALL("reading a part", eng->read_sparse_rows(scan->reader, (size_t) c, &rows, &nrows, &sparse, CH_ERR));
+		if (!sparse)
+			continue;
+		if (bits == NULL)
+		{
+			bits = MemoryContextAllocZero(scan->batch_cxt, sizeof(uint64) * ((n + 63) / 64));
+			have = MemoryContextAllocZero(scan->batch_cxt, sizeof(uint64) * ((n + 63) / 64));
+			if (batch->visible)
+				memcpy(bits, batch->visible, sizeof(uint64) * ((n + 63) / 64));
+			else
+			{
+				memset(bits, 0xFF, sizeof(uint64) * (n / 64));
+				if (n % 64)
+					bits[n / 64] = (UINT64CONST(1) << (n % 64)) - 1;
+			}
+		}
+		else
+			memset(have, 0, sizeof(uint64) * ((n + 63) / 64));
+		for (size_t i = 0; i < nrows; i++)
+			if (rows[i] < n)
+				have[rows[i] / 64] |= UINT64CONST(1) << (rows[i] % 64);
+		for (uint32 w = 0; w < (n + 63) / 64; w++)
+			bits[w] &= have[w];
+	}
+	if (bits == NULL)
+		return;
+	for (uint32 w = 0; w < (n + 63) / 64; w++)
+		live += (uint32) pg_popcount64(bits[w]);
+	batch->visible = bits;
+	batch->nvisible = live;
+	scan->counts.sparse_passed += before - live;
+	ch_sparse_rows_passed += before - live;
+}
+
+/*
+ * VC45: whether a qual is false of a column's default and of NULL, judged
+ * where it cannot raise: the column alone, a bool's; or an immutable, strict
+ * btree comparison of the column with a constant -- `a <> 0`, `t <> ''`, `a
+ * > 2` -- its function called with the default.  Any other qual is left to
+ * the rows: a cast's or a function's error at the default would be the
+ * planning's, of a row no part may hold (mod(''::int, 13)).  *attno the
+ * column's.
+ */
+static bool
+sparse_qual(Expr *qual, const ChScanDesc scan, AttrNumber *attno, Datum dflt_of(Oid typid, bool *ok))
+{
+	OpExpr	   *op;
+	Var		   *var;
+	Const	   *cst;
+	bool		var_left;
+	bool		ok;
+	Datum		dflt;
+	Datum		r;
+
+	if (IsA(qual, Var))
+	{
+		var = (Var *) qual;
+		if (var->vartype != BOOLOID || var->varlevelsup != 0 || var->varattno < 1)
+			return false;
+		*attno = var->varattno;
+		return true;			/* false at false, NULL at NULL */
+	}
+	if (!IsA(qual, OpExpr) || list_length(((OpExpr *) qual)->args) != 2)
+		return false;
+	op = (OpExpr *) qual;
+	var_left = IsA(linitial(op->args), Var) && IsA(lsecond(op->args), Const);
+	if (!var_left && !(IsA(linitial(op->args), Const) && IsA(lsecond(op->args), Var)))
+		return false;
+	var = var_left ? linitial(op->args) : lsecond(op->args);
+	cst = var_left ? lsecond(op->args) : linitial(op->args);
+	if (var->varlevelsup != 0 || var->varattno < 1 || cst->constisnull ||
+		!op_strict(op->opno) || func_volatile(op->opfuncid) != PROVOLATILE_IMMUTABLE ||
+		get_op_index_interpretation(op->opno) == NIL)
+		return false;
+	dflt = dflt_of(var->vartype, &ok);
+	if (!ok)
+		return false;
+	r = var_left ? OidFunctionCall2Coll(op->opfuncid, op->inputcollid, dflt, cst->constvalue) :
+		OidFunctionCall2Coll(op->opfuncid, op->inputcollid, cst->constvalue, dflt);
+	*attno = var->varattno;
+	(void) scan;
+	return !DatumGetBool(r);
+}
+
+/* VC45: a type's default as ClickHouse's sparse serialization takes it, where it is one of these */
+static Datum
+sparse_default(Oid typid, bool *ok)
+{
+	*ok = true;
+	switch (typid)
+	{
+		case INT2OID:
+			return Int16GetDatum(0);
+		case INT4OID:
+			return Int32GetDatum(0);
+		case INT8OID:
+			return Int64GetDatum(0);
+		case BOOLOID:
+			return BoolGetDatum(false);
+		case TEXTOID:
+		case VARCHAROID:
+			return PointerGetDatum(cstring_to_text(""));
+		default:
+			*ok = false;
+			return (Datum) 0;
+	}
+}
+
+void
+ch_scan_set_sparse_quals(TableScanDesc sscan, List *quals)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	ListCell   *lc;
+	bool		any = false;
+
+	if (!ch_enable_sparse_quals || scan->table->external || scan->table->own || quals == NIL || scan->ncols == 0 ||
+		ch_engine()->read_want_sparse == NULL)
+		return;
+	if (scan->sparse_want == NULL)
+		scan->sparse_want = MemoryContextAllocZero(scan->scan_cxt, scan->ncols + 1);
+	foreach(lc, quals)
+	{
+		AttrNumber	attno;
+		ChColumn   *col;
+		int			c;
+
+		if (!sparse_qual(lfirst(lc), scan, &attno, sparse_default) || attno > scan->table->natts)
+			continue;
+		col = &scan->table->columns[attno - 1];
+		if (col->low_cardinality || col->kind == CH_COL_DROPPED)
+			continue;
+		/* the column among those read, in the first step */
+		for (c = 0; c < scan->ncols; c++)
+			if (scan->attnos[c] == attno - 1)
+				break;
+		if (c == scan->ncols || (scan->nsteps > 0 && scan->col_step[c] != 0))
+			continue;
+		scan->sparse_want[c] = 1;
+		any = true;
+	}
+	if (!any)
+	{
+		pfree(scan->sparse_want);
+		scan->sparse_want = NULL;
+	}
+}
+
 bool
 ch_scan_set_filter(TableScanDesc sscan, List *quals)
 {
@@ -1513,7 +1950,10 @@ ch_scan_set_filter(TableScanDesc sscan, List *quals)
 	scan->filter_owner = ch_handle_reserve();
 	scan->filter = ch_filter_make(scan->table, quals, &scan->filter_key);
 	if (scan->filter)
+	{
 		ch_handle_opened(scan->filter_owner, CH_HANDLE_FILTER, scan->filter);
+		cut_units_by_filter(scan);	/* VC44 */
+	}
 	return scan->filter != NULL;
 }
 
@@ -1685,6 +2125,8 @@ ch_scan_next_batch(TableScanDesc sscan, ChScanBatch *batch)
 			batch->nvisible = live;
 		}
 	}
+	if (scan->sparse_want != NULL)
+		sparse_visible(scan, batch);
 	scan->row = scan->nrows;
 	return true;
 }
@@ -3379,6 +3821,18 @@ void
 ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, bool rowid, List *quals,
 			double *rows, double *bytes, double *raw)
 {
+	ch_estimate_parallel(rel, snapshot, n, attnums, rowid, quals, rows, bytes, raw, NULL);
+}
+
+/*
+ * ch_estimate()'s, and the units a parallel scan cuts of what the quals keep
+ * into *punits where it is not NULL (VC44): those of every part's granules
+ * where they keep all, else of the granules they keep alone
+ */
+void
+ch_estimate_parallel(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, bool rowid, List *quals,
+					 double *rows, double *bytes, double *raw, double *punits)
+{
 	const ChEngine *eng;
 	ChTable    *t = ch_table(rel);
 	SnapshotData nonvacuumable;
@@ -3390,10 +3844,19 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 	ResourceOwner owner = NULL;
 	ChListing  *own_listing = NULL;
 
+	int32	   *pmarks = NULL;
+	int64	   *prows = NULL;
+	uint64	   *pkept = NULL;
+	double	   *pgbytes = NULL;
+	int			pn = 0;
+	bool		pall = true;
+
 	*rows = 0;
 	*bytes = 0;
 	if (raw)
 		*raw = 0;
+	if (punits)
+		*punits = 0;
 	/* pinned from the start: the catalog's read may accept an invalidation of the table */
 	ch_table_pin(t);
 	parts = t->external && !t->own ? ch_external_listing(rel, t)->parts :
@@ -3423,6 +3886,13 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 		filter = ch_filter_make(t, quals, &filter_key);
 		if (filter)
 			ch_handle_opened(owner, CH_HANDLE_FILTER, filter);
+	}
+	if (punits)
+	{
+		pmarks = palloc(sizeof(int32) * list_length(parts));
+		prows = palloc(sizeof(int64) * list_length(parts));
+		pkept = palloc(sizeof(uint64) * list_length(parts));
+		pgbytes = palloc0(sizeof(double) * list_length(parts));
 	}
 	/*
 	 * Each part's rows the quals keep and its needed columns' bytes, from its
@@ -3456,6 +3926,13 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 			}
 		}
 		*rows += kept;
+		if (punits)
+		{
+			pmarks[pn] = p->marks;
+			prows[pn] = p->rows;
+			pkept[pn++] = kept;
+			pall = pall && kept >= (uint64) Max(p->rows, 0);
+		}
 		if (names.len > 0 && kept > 0 && p->rows > 0)
 		{
 			uint64		compressed;
@@ -3474,12 +3951,28 @@ ch_estimate(Relation rel, Snapshot snapshot, int n, const AttrNumber *attnums, b
 			*bytes += (double) compressed * kept / p->rows;
 			if (raw)
 				*raw += (double) uncompressed * kept / p->rows;
+			if (punits && p->marks > 0)
+				pgbytes[pn - 1] = (double) uncompressed / p->marks;
 		}
 	}
 	if (filter)
 	{
 		ch_handle_closing(owner, CH_HANDLE_FILTER, filter);
 		eng->filter_free(filter);
+	}
+	if (punits)
+	{
+		/* VC44's cut where a parallel scan makes it (cut_units_by_filter()), else size_units()'s */
+		if (pall || !ch_parallel_key_units || t->external || t->own || (filter_key.h1 == 0 && filter_key.h2 == 0))
+		{
+			for (int i = 0; i < pn; i++)
+				pkept[i] = (uint64) Max(prows[i], 0);
+		}
+		*punits = ch_kept_parallel_units(pn, pmarks, prows, pkept, pall ? NULL : pgbytes);
+		pfree(pmarks);
+		pfree(prows);
+		pfree(pkept);
+		pfree(pgbytes);
 	}
 	if (own_listing)
 		ch_listing_unpin(own_listing);

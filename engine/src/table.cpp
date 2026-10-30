@@ -25,6 +25,12 @@
 #include <Parsers/parseQuery.h>
 #include <Storages/IndicesDescription.h>
 #include <Storages/KeyDescription.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
+#include <Storages/MergeTree/MergeTreeIndexGranularityConstant.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/ProjectionsDescription.h>
 #include <Storages/Statistics/Statistics.h>
@@ -42,11 +48,14 @@ namespace DB::MergeTreeSetting
     extern const MergeTreeSettingsBool add_minmax_index_for_string_columns;
     extern const MergeTreeSettingsBool add_minmax_index_for_temporal_columns;
     extern const MergeTreeSettingsBool escape_index_filenames;
+    extern const MergeTreeSettingsBool primary_key_lazy_load;
+    extern const MergeTreeSettingsBool columns_and_secondary_indices_sizes_lazy_calculation;
 }
 
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int UNKNOWN_AGGREGATE_FUNCTION;
     extern const int UNKNOWN_FUNCTION;
@@ -255,6 +264,14 @@ StorageMetadataHandle PgMergeTree::getInMemoryMetadataPtr(ContextPtr query_conte
 
 MergeTreeData::MutableDataPartPtr PgMergeTree::loadPart(const String & part_name) const
 {
+    /// VC42: the part's metadata as another process loaded it, where the caller handed it
+    if (auto it = imported_metadata.find(part_name); it != imported_metadata.end())
+    {
+        String blob = std::move(it->second);
+        imported_metadata.erase(it);
+        if (auto part = restorePart(part_name, blob))
+            return part;
+    }
     auto info = MergeTreePartInfo::fromPartName(part_name, format_version);
     auto disk = getStoragePolicy()->getDisks().at(0);
     auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, disk, 0);
@@ -1098,3 +1115,382 @@ extern "C" void chte_pages_detach(chte_table * table, const char * part_name)
     {
     }
 }
+
+/// ---- VC42 (pg_accel's §3.38, "After VP5, read again"): a part's metadata shared ----
+///
+/// A fresh process loads each part it reads: columns.txt's names and types (each type through
+/// ClickHouse's SQL parser), serialization.json through Poco's JSON parser, the checksums, the index
+/// granularity, the counts and the default codec -- 13 to 24% of ClickBench's small queries' cycles at
+/// 100M rows, 13 parts in each of a query's 17 processes.  A part never changes once committed: the
+/// first process's load is written as a blob (chte_part_metadata_export), which the extension keeps in
+/// shared memory, and the next process's part is made of it (chte_part_metadata_import, restorePart):
+/// no file read, no text parsed, but each column's type by its name, once a process (typeNamed()).
+/// Not for a partitioned table's parts or a table with TTL, a patch part, a part with invalidated system
+/// columns, a serialization of a column's parts (SerializationInfoTuple) or a table loading its primary
+/// keys at once -- the blob none, the part loaded from its files as before.  With CHTE_SPEC_CHECK in the
+/// environment, the tests', each part made so is compared with one loaded from its files.
+
+namespace chte
+{
+
+namespace
+{
+
+constexpr UInt32 PART_META_MAGIC = 0x43484d31;   /// "CHM1"
+
+/// The default codecs the process made, by their description
+std::unordered_map<String, CompressionCodecPtr> known_codecs;
+
+CompressionCodecPtr codecNamed(const String & line)
+{
+    auto it = known_codecs.find(line);
+    if (it != known_codecs.end())
+        return it->second;
+    ReadBufferFromString buf(line);
+    if (!checkString("CODEC", buf))
+        return nullptr;
+    ParserCodec codec_parser;
+    auto ast = parseQuery(codec_parser, line.data() + buf.getPosition(), line.data() + line.size(), "codec parser", 0,
+                          DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    auto codec = CompressionCodecFactory::instance().get(ast, {});
+    known_codecs.emplace(line, codec);
+    return codec;
+}
+
+template <typename T>
+void writePod(const T & value, WriteBuffer & out)
+{
+    out.write(reinterpret_cast<const char *>(&value), sizeof(T));
+}
+
+template <typename T>
+void readPod(T & value, ReadBuffer & in)
+{
+    in.readStrict(reinterpret_cast<char *>(&value), sizeof(T));
+}
+
+/// Whether the part's table and the part are of what a blob holds
+bool metadataShareable(const PgMergeTree & storage, const IMergeTreeDataPart & part)
+{
+    auto metadata = storage.getInMemoryMetadataPtr(storage.getContext(), false);
+    const auto & settings = *storage.getSettings();
+    if (metadata->hasPartitionKey() || metadata->hasAnyTTL() || part.info.isPatch() ||
+        !part.invalidated_system_columns.empty() || !settings[MergeTreeSetting::primary_key_lazy_load] ||
+        !part.default_codec)
+        return false;
+    for (const auto & [name, info] : part.getSerializationInfos())
+    {
+        if (!info)
+            return false;
+        const SerializationInfo & ref = *info;
+        if (typeid(ref) != typeid(SerializationInfo))
+            return false;
+    }
+    const auto * granularity = part.index_granularity.get();
+    return dynamic_cast<const MergeTreeIndexGranularityConstant *>(granularity) ||
+        dynamic_cast<const MergeTreeIndexGranularityAdaptive *>(granularity);
+}
+
+}
+
+/// The loaded part's metadata as a blob; empty where it is not of what a blob holds
+String exportPartMetadata(const PgMergeTree & storage, const IMergeTreeDataPart & part)
+{
+    if (!metadataShareable(storage, part))
+        return {};
+    WriteBufferFromOwnString out;
+    writePod(PART_META_MAGIC, out);
+    writePod(part.getMetadataVersion(), out);
+    const auto & columns = part.getColumns();
+    writeVarUInt(columns.size(), out);
+    for (const auto & column : columns)
+    {
+        writeStringBinary(column.name, out);
+        writeStringBinary(column.type->getName(), out);
+    }
+    const auto & infos = part.getSerializationInfos();
+    writePod(infos.getSettings(), out);
+    writeVarUInt(infos.size(), out);
+    for (const auto & [name, info] : infos)
+    {
+        writeStringBinary(name, out);
+        auto kinds = info->getKindStack();
+        writeVarUInt(kinds.size(), out);
+        for (auto kind : kinds)
+            writePod(kind, out);
+        writePod(info->getData().num_rows, out);
+        writePod(info->getData().num_defaults, out);
+        writePod(info->getData().exact_num_defaults, out);
+    }
+    {
+        WriteBufferFromOwnString substreams;
+        if (!part.getColumnsSubstreams().empty())
+            part.getColumnsSubstreams().writeText(substreams);
+        writeStringBinary(substreams.str(), out);
+    }
+    writeVarUInt(part.checksums.files.size(), out);
+    for (const auto & [file, checksum] : part.checksums.files)
+    {
+        writeStringBinary(file, out);
+        writePod(checksum, out);
+    }
+    const auto * granularity = part.index_granularity.get();
+    if (const auto * constant = dynamic_cast<const MergeTreeIndexGranularityConstant *>(granularity))
+    {
+        UInt8 kind = 0;
+        size_t marks = constant->getMarksCountWithoutFinal();
+        writePod(kind, out);
+        writePod(*constant->getConstantGranularity(), out);
+        writePod(marks > 0 ? constant->getMarkRows(marks - 1) : size_t{0}, out);
+        writePod(marks, out);
+        writePod(constant->hasFinalMark(), out);
+    }
+    else
+    {
+        UInt8 kind = 1;
+        size_t marks = granularity->getMarksCount();
+        writePod(kind, out);
+        writeVarUInt(marks, out);
+        for (size_t i = 0; i < marks; ++i)
+            writeVarUInt(granularity->getMarkRows(i), out);
+    }
+    writePod(part.rows_count, out);
+    writePod(part.existing_rows_count.has_value(), out);
+    writePod(part.existing_rows_count.value_or(0), out);
+    writePod(part.uuid, out);
+    writeStringBinary(part.default_codec->getFullCodecDesc()->formatWithSecretsOneLine(), out);
+    return std::move(out.str());
+}
+
+namespace
+{
+
+/// CHTE_SPEC_CHECK: a part made of a blob against one loaded from its files
+void checkRestored(const IMergeTreeDataPart & made, const IMergeTreeDataPart & loaded)
+{
+    auto differ = [&](const char * what)
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "part {} made of its shared metadata differs from its files: {}",
+                        loaded.name, what);
+    };
+    if (made.getColumns().toString() != loaded.getColumns().toString())
+        differ("columns");
+    if (made.getMetadataVersion() != loaded.getMetadataVersion())
+        differ("metadata version");
+    for (const auto & [name, info] : loaded.getSerializationInfos())
+    {
+        auto other = made.getSerializationInfos().tryGet(name);
+        if (!other || other->getKindStack() != info->getKindStack() || other->getData().num_rows != info->getData().num_rows ||
+            other->getData().num_defaults != info->getData().num_defaults)
+            differ("serialization infos");
+    }
+    if (made.getSerializationInfos().size() != loaded.getSerializationInfos().size())
+        differ("serialization infos");
+    if (made.checksums.files.size() != loaded.checksums.files.size())
+        differ("checksums");
+    for (const auto & [file, checksum] : loaded.checksums.files)
+    {
+        auto it = made.checksums.files.find(file);
+        if (it == made.checksums.files.end() || it->second.file_size != checksum.file_size ||
+            it->second.file_hash != checksum.file_hash || it->second.uncompressed_size != checksum.uncompressed_size ||
+            it->second.uncompressed_hash != checksum.uncompressed_hash || it->second.is_compressed != checksum.is_compressed)
+            differ("checksums");
+    }
+    if (made.index_granularity->getMarksCount() != loaded.index_granularity->getMarksCount() ||
+        made.index_granularity->hasFinalMark() != loaded.index_granularity->hasFinalMark())
+        differ("index granularity");
+    for (size_t i = 0; i < loaded.index_granularity->getMarksCount(); ++i)
+        if (made.index_granularity->getMarkRows(i) != loaded.index_granularity->getMarkRows(i))
+            differ("index granularity");
+    if (made.rows_count != loaded.rows_count || made.existing_rows_count != loaded.existing_rows_count ||
+        made.uuid != loaded.uuid || made.getBytesOnDisk() != loaded.getBytesOnDisk())
+        differ("counts");
+    if (made.default_codec->getFullCodecDesc()->formatWithSecretsOneLine() !=
+        loaded.default_codec->getFullCodecDesc()->formatWithSecretsOneLine())
+        differ("default codec");
+    if (made.getColumnsSubstreams().empty() != loaded.getColumnsSubstreams().empty())
+        differ("columns substreams");
+}
+
+}
+
+MergeTreeData::MutableDataPartPtr PgMergeTree::restorePart(const String & part_name, const String & blob) const
+{
+    ReadBufferFromString in(blob);
+    UInt32 magic = 0;
+    readPod(magic, in);
+    if (magic != PART_META_MAGIC)
+        return nullptr;
+
+    auto info = MergeTreePartInfo::fromPartName(part_name, format_version);
+    auto disk = getStoragePolicy()->getDisks().at(0);
+    auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, disk, 0);
+    auto part = getDataPartBuilder(part_name, volume, part_name, getReadSettings(), PartDirIntent::OpenExisting)
+        .withPartInfo(info)
+        .withPartFormatFromDisk()
+        .build();
+    loading_part_of = this;
+    SCOPE_EXIT({ loading_part_of = nullptr; });
+
+    int32_t metadata_version = 0;
+    readPod(metadata_version, in);
+    NamesAndTypesList columns;
+    size_t ncolumns = 0;
+    readVarUInt(ncolumns, in);
+    for (size_t i = 0; i < ncolumns; ++i)
+    {
+        String name;
+        String type;
+        readStringBinary(name, in);
+        readStringBinary(type, in);
+        columns.emplace_back(name, typeNamed(type));
+    }
+    SerializationInfoSettings settings;
+    readPod(settings, in);
+    SerializationInfoByName infos(settings);
+    size_t ninfos = 0;
+    readVarUInt(ninfos, in);
+    for (size_t i = 0; i < ninfos; ++i)
+    {
+        String name;
+        size_t nkinds = 0;
+        ISerialization::KindStack kinds;
+        SerializationInfo::Data data;
+        readStringBinary(name, in);
+        readVarUInt(nkinds, in);
+        for (size_t k = 0; k < nkinds; ++k)
+        {
+            ISerialization::Kind kind;
+            readPod(kind, in);
+            kinds.push_back(kind);
+        }
+        readPod(data.num_rows, in);
+        readPod(data.num_defaults, in);
+        readPod(data.exact_num_defaults, in);
+        infos.emplace(name, std::make_shared<SerializationInfo>(kinds, settings, data));
+    }
+    part->setColumns(columns, infos, metadata_version);
+    {
+        String substreams;
+        readStringBinary(substreams, in);
+        if (!substreams.empty())
+        {
+            ColumnsSubstreams loaded;
+            ReadBufferFromString sub(substreams);
+            loaded.readText(sub);
+            part->setColumnsSubstreams(loaded);
+        }
+    }
+    size_t nfiles = 0;
+    readVarUInt(nfiles, in);
+    for (size_t i = 0; i < nfiles; ++i)
+    {
+        String file;
+        MergeTreeDataPartChecksum checksum;
+        readStringBinary(file, in);
+        readPod(checksum, in);
+        part->checksums.files.emplace(std::move(file), checksum);
+    }
+    part->setBytesOnDisk(part->checksums.getTotalSizeOnDisk());
+    part->setBytesUncompressedOnDisk(part->checksums.getTotalSizeUncompressedOnDisk());
+    UInt8 kind = 0;
+    readPod(kind, in);
+    if (kind == 0)
+    {
+        size_t granularity = 0;
+        size_t last = 0;
+        size_t marks = 0;
+        bool final_mark = false;
+        readPod(granularity, in);
+        readPod(last, in);
+        readPod(marks, in);
+        readPod(final_mark, in);
+        part->index_granularity = std::make_shared<MergeTreeIndexGranularityConstant>(granularity, last, marks, final_mark);
+    }
+    else
+    {
+        size_t marks = 0;
+        auto adaptive = std::make_shared<MergeTreeIndexGranularityAdaptive>();
+        readVarUInt(marks, in);
+        for (size_t i = 0; i < marks; ++i)
+        {
+            size_t rows = 0;
+            readVarUInt(rows, in);
+            adaptive->appendMark(rows);
+        }
+        part->index_granularity = adaptive;
+    }
+    bool has_existing = false;
+    size_t existing = 0;
+    readPod(part->rows_count, in);
+    readPod(has_existing, in);
+    readPod(existing, in);
+    if (has_existing)
+        part->existing_rows_count = existing;
+    readPod(part->uuid, in);
+    {
+        String codec;
+        readStringBinary(codec, in);
+        part->default_codec = codecNamed(codec);
+        if (!part->default_codec)
+            return nullptr;
+    }
+    /// as loadPartitionAndMinMaxIndex() leaves a part of a table of no partition key
+    auto idx = std::make_shared<IMergeTreeDataPart::MinMaxIndex>();
+    idx->initialized = !part->isEmpty();
+    part->setMinMaxIndex(std::move(idx));
+    if (!(*getSettings())[MergeTreeSetting::columns_and_secondary_indices_sizes_lazy_calculation])
+        part->calculateColumnsAndSecondaryIndicesSizesOnDisk();
+
+    if (specCheck())
+    {
+        /// the part loaded from its files too, as loadPart() loads it, and the two compared
+        auto checked = getDataPartBuilder(part_name, volume, part_name, getReadSettings(), PartDirIntent::OpenExisting)
+            .withPartInfo(info)
+            .withPartFormatFromDisk()
+            .build();
+        checked->loadColumnsChecksumsIndexes(/* require_columns_checksums= */ true, /* check_consistency= */ false);
+        checkRestored(*part, *checked);
+    }
+    /// VC43's probe of the skip indexes' archive, as loadPart() makes it
+    (void) part->getDataPartStorage().existsFile("skp_idx_chte_probe.idx2");
+    part->setState(DataPartState::Active);
+    parts_loaded.fetch_add(1, std::memory_order_relaxed);
+    return part;
+}
+
+bool PgMergeTree::importMetadata(const String & part_name, String blob) const
+{
+    if (parts.contains(part_name))
+        return false;
+    imported_metadata[part_name] = std::move(blob);
+    return true;
+}
+
+}
+
+/// VC42: a part's metadata, loaded here if it is not yet, as a blob for the caller to share; *len 0 where
+/// it is not of what a blob holds
+extern "C" int chte_part_metadata_export(chte_table * table, const char * part_name, const void ** data, size_t * len,
+                                         chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto part = table->storage->getPart(part_name);
+        table->metadata_blob = chte::exportPartMetadata(*table->storage, *part);
+        *data = table->metadata_blob.data();
+        *len = table->metadata_blob.size();
+    });
+}
+
+/// VC42: a part's metadata as another process exported it, for the part's first load here; *taken 0
+/// where the part is loaded already
+extern "C" int chte_part_metadata_import(chte_table * table, const char * part_name, const void * data, size_t len,
+                                         int * taken, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        *taken = table->storage->importMetadata(part_name, String(static_cast<const char *>(data), len)) ? 1 : 0;
+    });
+}
+

@@ -43,6 +43,52 @@ SELECT count(*) AS units, min(granules), max(granules), sum(granules)
   FROM ch.parallel_units(ARRAY[63, 15], 131072, true);
 SELECT * FROM ch.parallel_units(ARRAY[0, 3, 200000], 8192) WHERE part < 3 OR first_granule = 0;
 SELECT * FROM ch.parallel_units(ARRAY[-1]);
+-- VC44 (pg_accel's §3.38 F28): a parallel scan whose quals keep some of the
+-- parts' granules cuts its units of those alone, by the same sizes, and of at
+-- least ch.parallel_unit_min_bytes of its columns decoded -- four parts of 128
+-- granules of 1,024 rows, two units each of every granule: the key's range of
+-- 16 granules a part makes a unit each; of 102, with no least of bytes, two
+-- each -- every row read once either way
+CREATE TABLE ku (k int NOT NULL, v int NOT NULL, t text NOT NULL) USING mergetree
+  WITH (order_by = 'k', index_granularity = 1024, settings = 'min_bytes_for_wide_part = 0');
+INSERT INTO ku SELECT g % 1000, g, repeat('x', g % 50) FROM generate_series(1, 131072) g;
+INSERT INTO ku SELECT g % 1000, g, repeat('y', g % 50) FROM generate_series(1, 131072) g;
+INSERT INTO ku SELECT g % 1000, g, repeat('z', g % 50) FROM generate_series(1, 131072) g;
+INSERT INTO ku SELECT g % 1000, g, repeat('w', g % 50) FROM generate_series(1, 131072) g;
+CREATE FUNCTION key_units(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  plan jsonb;
+  node jsonb;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) ' || q INTO plan;
+  node := jsonb_path_query_first(plan, 'strict $.**? (@."Custom Plan Provider" == "ChScan")');
+  RETURN format('%s of %s granules read, units of the granules kept: %s', node->>'Granules Read',
+                node->>'Granules', coalesce(node->>'Units of the Granules Kept', 'none'));
+END $$;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 4;
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k BETWEEN 100 AND 224');
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k BETWEEN 100 AND 224;
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k < 800');
+SET ch.parallel_unit_min_bytes = 0;
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k < 800');
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k < 800;
+RESET ch.parallel_unit_min_bytes;
+SELECT key_units('SELECT count(*), sum(v) FROM ku');
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k >= 0');
+SET ch.parallel_key_units = off;
+SELECT key_units('SELECT count(*), sum(v) FROM ku WHERE k BETWEEN 100 AND 224');
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k BETWEEN 100 AND 224;
+SELECT count(*), sum(v), sum(length(t)) FROM ku WHERE k < 800;
+RESET ch.parallel_key_units;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+DROP FUNCTION key_units(text);
+DROP TABLE ku;
 
 -- a TID scan fetches a row by its row id
 SELECT ctid AS tid FROM sc WHERE a = 54321 \gset

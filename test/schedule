@@ -12,6 +12,7 @@ test: scans
 test: chscan
 test: summaries
 test: selections
+test: partmeta
 test: skipidx
 test: dictionaries
 test: dml
