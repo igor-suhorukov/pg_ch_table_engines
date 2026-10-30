@@ -19,6 +19,7 @@
 #include "catalog/pg_tablespace.h"
 #include "common/relpath.h"
 #include "lib/stringinfo.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
@@ -497,6 +498,36 @@ ch_plain_columns(TupleDesc desc)
 }
 
 /*
+ * VC48 (pg_accel's §3.38, "After VP6, read again"): the text columns a storage
+ * made now keeps each value's characters of, in a hidden column of its parts
+ * that the library fills as a part is written and a merge copies: NOT NULL, not
+ * LowCardinality, in a database of UTF8 -- where a value's characters are its
+ * bytes that begin one -- of plain MergeTree, whose engine merges no column's
+ * values.  length(col) and col <> '' then read no value's bytes.
+ */
+Bitmapset *
+ch_char_columns(Relation rel, const ChOptions *opts, ChEngineKind kind)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	Bitmapset  *chars = NULL;
+
+	if (!opts->char_counts || kind != CH_ENGINE_MERGETREE || GetDatabaseEncoding() != PG_UTF8)
+		return NULL;
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		ChColumn	col;
+
+		if (att->attisdropped || !att->attnotnull || (att->atttypid != TEXTOID && att->atttypid != VARCHAROID))
+			continue;
+		ch_column_for_table(rel, opts, att, &col);
+		if (col.kind == CH_COL_VARLENA && !col.low_cardinality)
+			chars = bms_add_member(chars, att->attnum);
+	}
+	return chars;
+}
+
+/*
  * Whether a column is ClickHouse's plain type in a storage's table, not
  * Nullable (VC11): one of the storage's plain columns, NOT NULL still, and
  * neither a key column -- ClickHouse reads a part's index by the table's
@@ -528,7 +559,8 @@ ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind)
 	if (opts->low_cardinality)
 		ch_low_cardinality_check(rel, opts->low_cardinality);
 	ch_storage_id(rel, &rel->rd_locator, &id);
-	return ch_table_definition_for(rel, RelationGetDescr(rel), opts, kind, ch_table_row_plain(&id));
+	return ch_table_definition_for(rel, RelationGetDescr(rel), opts, kind, ch_table_row_plain(&id),
+								   ch_table_row_chars(&id));
 }
 
 /*
@@ -549,10 +581,10 @@ typedef struct ChTableSpec
 
 static void
 table_spec_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind, const Bitmapset *plain,
-			   ChTableSpec *ts)
+			   const Bitmapset *chars, ChTableSpec *ts)
 {
 	const char *c = codec(opts->compression);
-	chte_table_column *columns = palloc0(sizeof(chte_table_column) * (desc->natts + 1));
+	chte_table_column *columns = palloc0(sizeof(chte_table_column) * (2 * desc->natts + 1));
 	size_t		n = 0;
 	int			nsettings = 0;
 
@@ -592,6 +624,18 @@ table_spec_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind
 	columns[n].type = "UInt64";
 	columns[n].codec = "T64, LZ4";
 	n++;
+	/* VC48: the text columns' character counts, last: the library's to fill */
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped || !bms_is_member(att->attnum, chars))
+			continue;
+		columns[n].name = psprintf("c%d" CH_CHARS_SUFFIX, att->attnum);
+		columns[n].type = "UInt32";
+		columns[n].codec = c;
+		n++;
+	}
 	ts->spec.columns = columns;
 	ts->spec.ncolumns = n;
 	ts->projections[0] = CH_ROWID_PROJECTION " (SELECT " CH_ROWID_COLUMN ", _part_offset ORDER BY " CH_ROWID_COLUMN ")";
@@ -733,11 +777,11 @@ table_spec_sql(const ChTableSpec *ts)
 
 char *
 ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind,
-						const Bitmapset *plain)
+						const Bitmapset *plain, const Bitmapset *chars)
 {
 	ChTableSpec ts;
 
-	table_spec_for(rel, desc, opts, kind, plain, &ts);
+	table_spec_for(rel, desc, opts, kind, plain, chars, &ts);
 	return table_spec_sql(&ts);
 }
 
@@ -854,6 +898,7 @@ open_table(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cx
 	StringInfoData cols;
 	ChExternalKind ext_kind;
 	ChTableSpec ts;
+	Bitmapset  *chars;
 	const ChEngine *eng;
 
 	if (ch_is_external_rel(rel, &ext_kind))
@@ -868,9 +913,11 @@ open_table(Relation rel, const ChStorageId *id, TupleDesc desc, MemoryContext cx
 	t->relative_path = ch_storage_path(id, true);
 	/* the definition's parts in the caller's memory, the library's for the call alone */
 	MemoryContextSwitchTo(old);
-	table_spec_for(rel, desc, &t->options, t->kind, ch_table_row_plain(id), &ts);
+	chars = ch_table_row_chars(id);
+	table_spec_for(rel, desc, &t->options, t->kind, ch_table_row_plain(id), chars, &ts);
 	MemoryContextSwitchTo(cxt);
 	t->definition = table_spec_sql(&ts);
+	t->chars = bms_copy(chars);
 	t->natts = desc->natts;
 	t->columns = palloc0(sizeof(ChColumn) * Max(desc->natts, 1));
 	initStringInfo(&cols);

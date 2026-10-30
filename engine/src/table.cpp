@@ -513,6 +513,9 @@ ColumnsDescription columnsOfIndex(const StorageInMemoryMetadata & m, const Colum
 std::optional<IndexDescription> implicitIndexOf(const StorageInMemoryMetadata & m, const ColumnDescription & column,
                                                 ContextPtr context)
 {
+    /// VC48: a character count is read whole, for its values, or not at all
+    if (isCharsColumn(column.name))
+        return {};
     for (const auto & index : m.secondary_indices)
         if (index.type == "minmax" && !index.column_names.empty() && index.column_names.front() == column.name)
             return {};
@@ -1480,6 +1483,31 @@ extern "C" int chte_part_metadata_export(chte_table * table, const char * part_n
         table->metadata_blob = chte::exportPartMetadata(*table->storage, *part);
         *data = table->metadata_blob.data();
         *len = table->metadata_blob.size();
+    });
+}
+
+/// VC46: a part's rows and the rows holding a column's default, ClickHouse's own count of them -- what
+/// its optimize_trivial_count_with_sparsity_filter trusts, src/Storages/MergeTree/SparsityFilter.h --
+/// where it counted them exactly
+extern "C" int chte_part_column_defaults(chte_table * table, const char * part_name, const char * column, uint64_t * rows,
+                                         uint64_t * defaults, int * exact, chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        auto part = table->storage->getPart(part_name);
+        auto info = part->getSerializationInfos().tryGet(column);
+
+        *rows = 0;
+        *defaults = 0;
+        *exact = 0;
+        if (info)
+        {
+            const auto & data = info->getData();
+
+            *rows = data.num_rows;
+            *defaults = data.num_defaults;
+            *exact = data.exact_num_defaults ? 1 : 0;
+        }
     });
 }
 

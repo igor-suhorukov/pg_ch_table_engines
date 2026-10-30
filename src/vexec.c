@@ -145,6 +145,7 @@ typedef struct SrcColumn
 	Oid			basetype;
 	uint8		want;			/* the layout the format asks for */
 	bool		dict;			/* handed as its dictionary where the library has one */
+	bool		lengths;		/* VC48: read for its values' characters, where the part may */
 	SrcDict    *cur_dict;		/* the last batch's dictionary, or NULL */
 	VexecColumn missing;		/* the column's missing value, as a constant */
 } SrcColumn;
@@ -185,6 +186,9 @@ typedef struct SrcState
 	ScanKeyData *bound_keys;
 	/* aggregate()'s by-reference answers, until the next call */
 	MemoryContext answer_cxt;
+	/* VC46: the column whose exact defaults aggregate() counts the spec's one qual by, or 0 */
+	AttrNumber	count_attno;
+	int64		counts_answered;
 	/* VEXEC_SRC_ORDERED: the key's attributes this scan hands its rows in the order of (VC4) */
 	int			norder;
 	AttrNumber *order;
@@ -375,6 +379,33 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 	ch_scan_set_columns(scan, n, attnums, st->tids);
 
 	/*
+	 * VC48: a column vexec reads only for its values' characters and whether
+	 * they are empty, from the part's hidden column of them, where the storage
+	 * keeps one and the column is NOT NULL still
+	 */
+	if (spec->size >= offsetof(VexecSourceSpec, length_columns) + sizeof(spec->length_columns) &&
+		spec->length_columns != NULL && !st->tids && ch_enable_char_counts && t->chars != NULL)
+	{
+		bool	   *lengths = palloc0(sizeof(bool) * Max(n, 1));
+		bool		any = false;
+
+		for (int i = 0; i < n; i++)
+		{
+			SrcColumn  *c = &st->cols[i];
+
+			if (spec->length_columns[i] && bms_is_member(c->attnum, t->chars) && c->col->kind == CH_COL_VARLENA &&
+				TupleDescAttr(desc, c->attnum - 1)->attnotnull)
+			{
+				c->lengths = lengths[i] = true;
+				any = true;
+			}
+		}
+		if (any)
+			ch_scan_set_lengths(scan, lengths);
+		pfree(lengths);
+	}
+
+	/*
 	 * VC5: a LowCardinality column as its dictionary, where vexec welcomes
 	 * dictionaries and asks for a layout of the bytes -- text's, in either
 	 * format -- and the library can
@@ -435,7 +466,15 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 		if (ch_scan_set_steps(scan, st->col_step, spec->nsteps))
 			st->nsteps = spec->nsteps;
 	}
-	if (spec->quals != NIL)
+	/*
+	 * VC46: a qual exactly a column's not being its default, with vexec's word
+	 * it asks of aggregate(): no unit filtered, each a part's whole, for its
+	 * figures; a part without them read, its rows judged by the qual above
+	 */
+	st->count_attno = 0;
+	if (list_length(spec->quals) == 1 && !st->tids && (flags & VEXEC_SRC_COUNT_QUALS) != 0)
+		st->count_attno = ch_default_complement_qual(rel, linitial(spec->quals));
+	if (spec->quals != NIL && st->count_attno == 0)
 	{
 		(void) ch_scan_set_filter(scan, spec->quals);
 		/* VC45: a sparse column's rows of its default, where a qual is false of it, left out */
@@ -820,6 +859,34 @@ text_flags(const SrcState *st, const SrcColumn *c)
 	return VEXEC_COL_TEXT_WHOLE;
 }
 
+/*
+ * VC48: a column's values' characters as offsets that count them: a value's
+ * length the difference of two, wrapping as they may, no value being 2^31 long
+ */
+static void
+fill_lengths(SrcOut *out, VexecColumn *vc, const chte_vector *v, uint32 pos, uint32 n)
+{
+	const uint32 *counts = (const uint32 *) v->values + pos;
+	uint32	   *offsets = MemoryContextAlloc(out->cxt, sizeof(int32) * (n + 1));
+	const void **buffers = MemoryContextAlloc(out->cxt, sizeof(void *));
+	int64	   *sizes = MemoryContextAlloc(out->cxt, sizeof(int64));
+	uint32		at = 0;
+
+	for (uint32 i = 0; i < n; i++)
+	{
+		offsets[i] = at;
+		at += counts[i];
+	}
+	offsets[n] = at;
+	buffers[0] = "";
+	sizes[0] = 0;
+	set_shape(vc, VEXEC_OFFSETS, 0, 0, 0);
+	vc->values = offsets;
+	vc->buffers = buffers;
+	vc->buffer_sizes = sizes;
+	vc->nbuffers = 1;
+}
+
 static void
 fill_column(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 {
@@ -828,6 +895,17 @@ fill_column(SrcState *st, SrcOut *out, int i, uint32 pos, uint32 n)
 	VexecColumn *vc = &out->columns[i];
 	const chte_vector *v = &st->batch.vectors[i];
 
+	if (c->lengths && st->batch.lengths)
+	{
+		/* every part of the storage has them (ch_char_columns()) */
+		if (st->batch.missing[i])
+			elog(ERROR, "a part of \"%s\" has no character counts of attribute %d",
+				 RelationGetRelationName(st->rel), c->attnum);
+		fill_lengths(out, vc, v, pos, n);
+		vc->validity = NULL;
+		vc->flags = VEXEC_COL_LENGTHS;
+		return;
+	}
 	if (st->batch.missing[i])
 	{
 		*vc = c->missing;
@@ -1271,6 +1349,13 @@ src_estimate(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, doubl
 				spec->quals, rows, bytes, NULL);
 }
 
+/* VC46: whether aggregate() may count this scan's units under its qual */
+static bool
+src_count_under_quals(void *arg)
+{
+	return ((SrcState *) arg)->count_attno > 0;
+}
+
 /*
  * estimate_ex() (VC13): estimate()'s rows and bytes; the parts a serial scan
  * reads, its units; and VEXEC_EST_AGG_EXACT where aggregate() answers each
@@ -1290,12 +1375,28 @@ src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, Ve
 	double		units;
 	double		raw;
 	double		punits;
-	bool		deleted;
+	bool		deleted = true;
 	uint32		flags = 0;
+	AttrNumber	count_attno = 0;
+	double		non_defaults = 0;
 
-	ch_estimate_parallel(rel, snapshot, spec->ncolumns, spec->attnums, tids, spec->quals, &rows, &bytes, &raw,
-						 &punits);
-	ch_estimate_units(rel, snapshot, &units, &deleted);
+	/*
+	 * VC46: a qual exactly a column's not being its default, every part's
+	 * exact figures of it kept: aggregate() counts its rows, no filter made
+	 */
+	if (list_length(spec->quals) == 1 && !tids)
+	{
+		count_attno = ch_default_complement_qual(rel, linitial(spec->quals));
+		if (count_attno > 0 && !ch_estimate_non_defaults(rel, snapshot, count_attno, &non_defaults, &units))
+			count_attno = 0;
+	}
+	ch_estimate_parallel(rel, snapshot, spec->ncolumns, spec->attnums, tids, spec->quals,
+						 &rows, &bytes, &raw, &punits);
+	/* rows stays what a scan reads: its workers, for an aggregate that is not a count, are by them */
+	if (count_attno > 0)
+		flags |= VEXEC_EST_COUNT_QUALS;
+	else
+		ch_estimate_units(rel, snapshot, &units, &deleted);
 	if (spec->quals == NIL && !tids && !deleted)
 	{
 		ChTable    *t = ch_table(rel);
@@ -1458,6 +1559,28 @@ src_aggregate(void *arg, int nreqs, const VexecSourceAgg *reqs, VexecSourceAggAn
 	 */
 	if (unit.deletions)
 		return false;
+
+	/*
+	 * VC46: count(*) under the spec's qual, the whole part's rows less its
+	 * rows of the column's default, where a process kept their exact figures;
+	 * a unit without them, or anything else asked, read by next()
+	 */
+	if (st->count_attno > 0)
+	{
+		uint64		rows;
+		uint64		defaults;
+
+		if (nreqs > 0 || !unit.whole ||
+			!ch_part_defaults(ch_scan_table(st->scan), unit.part, st->count_attno, &rows, &defaults) ||
+			rows != unit.rows)
+			return false;
+		ch_scan_pass_unit(st->scan);
+		*nrows = (int64) (rows - defaults);
+		if (pgstat_should_count_relation(st->rel))
+			st->rel->pgstat_info->counts.tuples_returned += *nrows;
+		st->counts_answered++;
+		return true;
+	}
 	MemoryContextReset(st->answer_cxt);
 	old = MemoryContextSwitchTo(st->answer_cxt);
 	for (int i = 0; i < nreqs && ok; i++)
@@ -2595,6 +2718,7 @@ ch_vexec_register(void)
 		r->end = src_end;
 		r->estimate = src_estimate;
 		r->aggregate = src_aggregate;
+		r->count_under_quals = src_count_under_quals;
 		r->set_keys = src_set_keys;
 		r->dictionary_id = src_dictionary_id;
 		r->estimate_ex = src_estimate_ex;

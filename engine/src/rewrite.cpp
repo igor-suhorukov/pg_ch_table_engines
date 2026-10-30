@@ -50,7 +50,10 @@ extern "C" int chte_rewrite_part(chte_table * table, const char * part_name, con
         w->block_number = block_number;
         w->header = table->metadata->getSampleBlockNonMaterialized();
         w->columns = w->header.cloneEmptyColumns();
+        w->caller_columns = writerCallerColumns(w->header);
         Names names = w->header.getNames();
+        /// VC48: the character counts written anew, of the values read (writeParts)
+        names.resize(w->caller_columns);
         size_t rowid_at = w->header.getPositionByName("_pg_rowid");
 
         auto reader = openReader(*table, part, names, std::nullopt);

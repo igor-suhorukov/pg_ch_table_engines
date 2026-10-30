@@ -24,6 +24,7 @@ typedef struct ChScanBatch
 	int			ncols;			/* the columns set; none for a scan of no column */
 	const int  *attnos;			/* per column: the attribute's index, -1 the row id */
 	const chte_vector *vectors;
+	bool		lengths;		/* VC48: ch_scan_set_lengths()'s columns' vectors are their character counts */
 	const bool *missing;		/* per column: the part has none, its rows the missing value */
 	const chte_dictionary *dicts;	/* per column, where ch_scan_set_dictionaries() asked:
 									 * encoded, its dictionary in place of its vector; or NULL */
@@ -181,6 +182,9 @@ extern bool ch_part_nulls(ChTable *t, const ChPart *part, AttrNumber attnum, int
 extern bool ch_column_minmax_kept(const ChColumn *col);
 /* The parts a serial scan reads, its units, and whether the snapshot sees a deleted row */
 extern void ch_estimate_units(Relation rel, Snapshot snapshot, double *units, bool *deleted);
+extern void ch_scan_set_lengths(TableScanDesc scan, const bool *lengths);
+extern AttrNumber ch_default_complement_qual(Relation rel, Expr *qual);
+extern bool ch_estimate_non_defaults(Relation rel, Snapshot snapshot, AttrNumber attno, double *rows, double *units);
 extern double ch_kept_parallel_units(int nparts, const int32 *marks, const int64 *rows, const uint64 *kept_rows,
 									  const double *gbytes);
 

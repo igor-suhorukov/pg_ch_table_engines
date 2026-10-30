@@ -162,6 +162,10 @@ typedef struct ChEngine
 	int			(*read_restrict) (chte_reader *, const chte_mark_range *, size_t, uint64_t *, chte_error *);
 	/* VC42 (pg_accel's §3.38): optional, a library built before it lacks them */
 	int			(*part_metadata_export) (chte_table *, const char *, const void **, size_t *, chte_error *);
+	/* VC42's marks; optional */
+	void		(*set_marks_store) (const chte_marks_store *);
+	/* VC46; optional */
+	int			(*part_column_defaults) (chte_table *, const char *, const char *, uint64_t *, uint64_t *, int *, chte_error *);
 	int			(*part_metadata_import) (chte_table *, const char *, const void *, size_t, int *, chte_error *);
 	/* VC45 (pg_accel's §3.38): optional, a library built before it lacks them */
 	int			(*read_want_sparse) (chte_reader *, const uint8_t *, size_t, chte_error *);

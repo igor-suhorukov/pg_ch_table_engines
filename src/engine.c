@@ -464,6 +464,8 @@ ch_engine(void)
 	*(void **) &engine.part_granule_bounds = dlsym(handle, "chte_part_granule_bounds");
 	*(void **) &engine.read_restrict = dlsym(handle, "chte_read_restrict");
 	*(void **) &engine.part_metadata_export = dlsym(handle, "chte_part_metadata_export");
+	*(void **) &engine.part_column_defaults = dlsym(handle, "chte_part_column_defaults");
+	*(void **) &engine.set_marks_store = dlsym(handle, "chte_set_marks_store");
 	*(void **) &engine.part_metadata_import = dlsym(handle, "chte_part_metadata_import");
 	*(void **) &engine.read_want_sparse = dlsym(handle, "chte_read_want_sparse");
 	*(void **) &engine.read_sparse_rows = dlsym(handle, "chte_read_sparse_rows");
@@ -614,6 +616,7 @@ ch_engine(void)
 	on_proc_exit(engine_on_exit, (Datum) 0);
 	/* after it, so first: the teardown left out where the process ends by _exit() (VC23) */
 	on_proc_exit(fast_exit_on_exit, (Datum) 0);
+	ch_part_marks_attach(&engine);
 	if (ch_engine_functions == CH_FUNCTIONS_ALL && engine.register_all_functions != NULL &&
 		engine.register_all_functions(&err) != 0)
 		ch_engine_raise(&err, "registering ClickHouse's functions");

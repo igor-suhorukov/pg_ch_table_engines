@@ -39,6 +39,8 @@ bool		ch_parallel_part_affinity = false;
 bool		ch_parallel_key_units = true;
 int			ch_parallel_unit_min_bytes = 4096;
 bool		ch_enable_sparse_quals = true;
+bool		ch_enable_count_from_defaults = true;
+bool		ch_enable_char_counts = true;
 uint64		ch_bound_granules_passed = 0;
 uint64		ch_sparse_rows_passed = 0;
 bool		ch_enable_part_summaries = true;
@@ -256,6 +258,13 @@ _PG_init(void)
 		DefineCustomBoolVariable("ch.enable_shared_part_metadata",
 								 "Whether a process makes a MergeTree part of the metadata another process loaded.",
 								 NULL, &ch_enable_shared_part_metadata, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	/* the parts' decompressed marks, in the postmaster's shared memory (VC42) */
+	if (process_shared_preload_libraries_in_progress)
+		ch_partmarks_init();
+	else
+		DefineCustomBoolVariable("ch.enable_shared_marks",
+								 "Whether a process takes a MergeTree part's marks another process decompressed.",
+								 NULL, &ch_enable_shared_marks, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("ch.enable_part_selections",
 							 "Whether the granules a filter keeps of a MergeTree part are kept in shared memory.",
 							 "Kept, a process plans and claims the part under the same filter without loading it; "
@@ -418,6 +427,27 @@ _PG_init(void)
 							4096, 0, INT_MAX / 1024,
 							PGC_USERSET, GUC_UNIT_KB,
 							NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_char_counts",
+							 "Reads a text column's character counts in place of its values where vexec needs no more.",
+							 "A storage's NOT NULL text columns keep each value's characters in a hidden column of "
+							 "the parts (the table's option char_counts, on by default for a table made now); a "
+							 "scan that only takes their length() or compares them with '' reads that alone, no "
+							 "value's bytes (pg_accel's pg_vector_executor.md §3.38, F35 and F37).",
+							 &ch_enable_char_counts,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_count_from_defaults",
+							 "Answers count(*) under a column's <> its default from each part's exact figures.",
+							 "A vector aggregate's count(*) over a scan whose one qual is exactly a column's not "
+							 "being its type's default -- a NOT NULL integer's <> 0, a text's <> '', a boolean -- "
+							 "takes each whole part's rows less its rows of the default, ClickHouse's exact count, "
+							 "kept with the part's shared metadata; a part with neither is read (pg_accel's "
+							 "pg_vector_executor.md §3.38, F36).",
+							 &ch_enable_count_from_defaults,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 	DefineCustomBoolVariable("ch.enable_sparse_quals",
 							 "Whether a scan leaves a sparse column's rows of its default out by the quals false of it.",
 							 "On, a part's column of the sparse serialization -- its rows of other than the type's "

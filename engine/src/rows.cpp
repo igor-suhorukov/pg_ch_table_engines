@@ -479,7 +479,7 @@ extern "C" int chte_part_locate(chte_table * table, const char * part_name, cons
             return;
 
         /// VC33: the projection's columns' marks kept in the mark cache, which its sources then find
-        warmMarks(*table, projection_part, {ROWID_COLUMN, "_parent_part_offset"}, std::make_shared<AlterConversions>());
+        warmMarks(*table, projection_part, {ROWID_COLUMN, "_parent_part_offset"}, /* shared= */ false, std::make_shared<AlterConversions>());
         /// a source a run of adjacent granules (markRuns)
         auto snapshot = storage.getStorageSnapshot(projection.metadata, table->context);
         for (auto & run : markRuns(std::move(ranges)))
@@ -528,7 +528,7 @@ extern "C" int chte_read_rows(chte_table * table, const char * part_name, const 
         }
 
         /// VC33: the columns' marks kept in the mark cache, which the reader then finds
-        warmMarks(*table, part, names,
+        warmMarks(*table, part, names, /* shared= */ false,
                   MergeTreeData::getAlterConversionsForPart(part, storage.getMutationsSnapshot({}), table->context));
         names.push_back("_part_offset");
         std::optional<MarkRanges> mark_ranges;

@@ -63,6 +63,7 @@ typedef struct ChOptions
 	char	   *compression;	/* "lz4", "zstd", "zstd(N)", "lz4hc", "none" */
 	char	   *settings;		/* further MergeTree settings, or NULL */
 	bool		merges;
+	bool		char_counts;	/* VC48: a storage made from now on keeps them */
 	/* the engines' own */
 	char	   *ver;
 	char	   *is_deleted;
@@ -91,6 +92,7 @@ typedef struct ChStorageId
 /* The hidden row id and the projection that finds a row by it (Appendix E) */
 #define CH_ROWID_COLUMN "_pg_rowid"
 #define CH_ROWID_PROJECTION "_pg_rowid_index"
+#define CH_CHARS_SUFFIX "_chars"	/* VC48: a text column's character counts' name's end */
 
 /* TIDs from row ids (§2.6): 291 = MaxHeapTuplesPerPage, a TID bitmap's limit */
 #define CH_ROWS_PER_BLOCK 291
@@ -117,6 +119,8 @@ extern bool ch_parallel_part_affinity;
 extern bool ch_parallel_key_units;
 extern int	ch_parallel_unit_min_bytes;
 extern bool ch_enable_sparse_quals;
+extern bool ch_enable_count_from_defaults;
+extern bool ch_enable_char_counts;
 extern uint64 ch_bound_granules_passed;	/* VC43: granules a running bound passed over in this process */
 extern uint64 ch_sparse_rows_passed;	/* VC45: rows of a sparse default the quals left out in this process */
 extern bool ch_enable_part_summaries;
@@ -201,6 +205,7 @@ typedef struct ChTable
 	chte_table *handle;
 	int			natts;			/* the relation's attributes, dropped included */
 	ChColumn   *columns;		/* per attribute */
+	Bitmapset  *chars;			/* VC48: the attributes with character counts in the parts */
 	char	   *all_columns;	/* "c1, c2, ..., _pg_rowid": what a full scan reads */
 	MemoryContext private_cxt;	/* a private table's (ch_table_private) */
 	MemoryContext own_cxt;		/* a cached table's: where it lives */
@@ -238,8 +243,9 @@ extern ChTable *ch_table(Relation rel);
 extern ChTable *ch_table_for_storage(Relation rel, const ChStorageId *id);
 extern char *ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind);
 extern char *ch_table_definition_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind kind,
-									 const Bitmapset *plain);
+									 const Bitmapset *plain, const Bitmapset *chars);
 extern Bitmapset *ch_plain_columns(TupleDesc desc);
+extern Bitmapset *ch_char_columns(Relation rel, const ChOptions *opts, ChEngineKind kind);
 extern void ch_plain_revoke(Oid relid);
 extern void ch_plain_grow(Oid relid, int natts);
 extern ChTable *ch_table_private(Relation rel, const ChStorageId *id, TupleDesc desc);
@@ -304,8 +310,9 @@ extern List *ch_parts_names(const ChStorageId *id);
 extern void ch_part_delete(const ChStorageId *id, const char *name);
 extern void ch_parts_delete_all(const ChStorageId *id);
 extern void ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage,
-								const Bitmapset *plain);
+								const Bitmapset *plain, const Bitmapset *chars);
 extern Bitmapset *ch_table_row_plain(const ChStorageId *id);
+extern Bitmapset *ch_table_row_chars(const ChStorageId *id);
 extern void ch_table_row_set_plain(const ChStorageId *id, const Bitmapset *plain);
 extern void ch_table_row_delete(const ChStorageId *id);
 extern void ch_table_row_copy(Relation rel, const ChStorageId *from, const ChStorageId *to);
@@ -528,7 +535,14 @@ extern int	ch_part_metadata_entries;
 extern int	ch_part_metadata_bytes;
 extern bool ch_enable_shared_part_metadata;
 extern void ch_partmeta_init(void);
+extern int	ch_part_marks_entries;
+extern int	ch_part_marks_bytes;
+extern bool ch_enable_shared_marks;
+extern void ch_partmarks_init(void);
+extern void ch_part_marks_attach(const ChEngine *eng);
+extern void ch_part_marks_begin(const ChTable *t, const ChPart *part);
 extern void ch_part_metadata_prepare(ChTable *t, const ChPart *part);
+extern bool ch_part_defaults(const ChTable *t, const ChPart *part, AttrNumber attno, uint64 *rows, uint64 *defaults);
 extern bool ch_selections_find(const ChTable *t, const ChPart *part, const ChFilterKey *fk, uint32 begin,
 							   uint32 end, chte_mark_range *ranges, size_t cap, size_t *nranges, uint64 *rows);
 extern chte_mark_range *ch_selections_ranges(const ChTable *t, const ChPart *part, const ChFilterKey *fk,

@@ -14,6 +14,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/assert_cast.h>
 #include <Common/SimpleIncrement.h>
+#include <Common/UTF8Helpers.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
@@ -188,6 +189,7 @@ extern "C" int chte_write_begin(chte_table * table, uint64_t block_number, chte_
         w->block_number = block_number;
         w->header = table->metadata->getSampleBlockNonMaterialized();
         w->columns = w->header.cloneEmptyColumns();
+        w->caller_columns = writerCallerColumns(w->header);
         *writer = w.release();
     });
 }
@@ -198,7 +200,7 @@ extern "C" int chte_write_batch(chte_writer * writer, uint32_t nrows, const chte
     {
         if (writer->finished)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_write_batch after chte_write_finish");
-        for (size_t i = 0; i < writer->columns.size(); ++i)
+        for (size_t i = 0; i < writer->caller_columns; ++i)
             appendVector(*writer->columns[i], nrows, columns[i]);
     });
 }
@@ -300,7 +302,7 @@ extern "C" int chte_write_columns(chte_writer * writer, uint32_t nrows, const ch
     {
         if (writer->finished)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "chte_write_columns after chte_write_finish");
-        for (size_t i = 0; i < writer->columns.size(); ++i)
+        for (size_t i = 0; i < writer->caller_columns; ++i)
             appendIn(*writer->columns[i], nrows, columns[i]);
     });
 }
@@ -405,6 +407,43 @@ extern "C" int chte_write_part_files(chte_writer * writer, size_t i, const chte_
 namespace chte
 {
 
+size_t writerCallerColumns(const Block & header)
+{
+    size_t n = header.columns();
+
+    while (n > 0 && isCharsColumn(header.getByPosition(n - 1).name))
+        --n;
+    return n;
+}
+
+namespace
+{
+
+/// VC48: each text column's character counts of the writer's rows: its values' bytes that begin a
+/// character, a value PostgreSQL's input took being UTF8's whole
+void fillCharCounts(chte_writer & writer)
+{
+    size_t rows = writer.caller_columns > 0 ? writer.columns[0]->size() : 0;
+
+    for (size_t i = writer.caller_columns; i < writer.columns.size(); ++i)
+    {
+        const String & name = writer.header.getByPosition(i).name;
+        const IColumn * source = writer.columns[writer.header.getPositionByName(name.substr(0, name.size() - strlen(CHARS_SUFFIX)))].get();
+        if (const auto * nullable = typeid_cast<const ColumnNullable *>(source))
+            source = &nullable->getNestedColumn();
+        const auto & strings = typeid_cast<const ColumnString &>(*source);
+        const auto & chars = strings.getChars();
+        const auto & offsets = strings.getOffsets();
+        auto & counts = typeid_cast<ColumnUInt32 &>(*writer.columns[i]).getData();
+
+        counts.resize(rows);
+        for (size_t r = 0; r < rows; ++r)
+            counts[r] = static_cast<UInt32>(UTF8::countCodePoints(chars.data() + offsets[r - 1], offsets[r] - offsets[r - 1]));
+    }
+}
+
+}
+
 /// The writer's rows as parts, one a partition, under temporary names.
 void writeParts(chte_writer & writer, ContextPtr context)
 {
@@ -415,6 +454,7 @@ void writeParts(chte_writer & writer, ContextPtr context)
     writer.finished = true;
     auto & table = *writer.table;
     auto & storage = *table.storage;
+    fillCharCounts(writer);
     /// the strings' bytes a row, for the next writer's room (chte_write_reserve)
     if (!writer.columns.empty() && writer.columns[0]->size() > 0)
     {
@@ -573,6 +613,9 @@ std::vector<std::optional<MarkRanges>> markRuns(const std::optional<MarkRanges> 
 /// warmed (openReader's caller, chte_read_begin).
 bool scan_marks = true;
 
+/// VC42's marks: the caller's store of marks other processes decompressed, and this process's
+chte_marks_store marks_store{};
+
 std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
                                         std::optional<MarkRanges> mark_ranges, bool warm_marks)
 {
@@ -582,7 +625,7 @@ std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData:
     auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, mutations, table.context);
 
     if (warm_marks)
-        warmMarks(table, part, names, alter_conversions);
+        warmMarks(table, part, names, /* shared= */ true, alter_conversions);
     auto r = std::make_unique<chte_reader>();
     r->table = &table;
     for (const auto & name : names)
@@ -600,7 +643,7 @@ std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData:
     return r;
 }
 
-void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
+void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names, bool shared,
                AlterConversionsPtr alter_conversions)
 {
     auto mark_cache = table.context->getMarkCache();
@@ -608,6 +651,7 @@ void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, cons
         return;
     auto info = std::make_shared<LoadedMergeTreeDataPartInfoForReader>(part, std::move(alter_conversions));
     auto settings = table.storage->getSettings();
+    shared = shared && marks_store.find != nullptr;
     for (const auto & name : names)
     {
         auto column = part->getColumns().tryGetByName(name);
@@ -620,10 +664,35 @@ void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, cons
             auto stream = IMergeTreeDataPart::getStreamNameForColumn(*column, path, ".bin", part->checksums, settings);
             if (!stream)
                 return;
-            MergeTreeMarksLoader loader(info, mark_cache.get(), part->index_granularity_info.getMarksFilePath(*stream),
-                                        part->getMarksCount(), part->index_granularity_info, /* save_marks_in_cache= */ true,
+            String marks_path = part->index_granularity_info.getMarksFilePath(*stream);
+            size_t count = part->getMarksCount();
+
+            /// VC42's marks: where the caller keeps marks another process decompressed, this process's cache's
+            /// entry made of them and no file read; otherwise the file's, kept for the next process
+            if (shared)
+            {
+                auto storage = part->getDataPartStoragePtr();
+                auto key = MarkCache::hash(storage->getDiskName() + ":" + (fs::path(storage->getFullPath()) / marks_path).string());
+                if (mark_cache->getWithoutMetrics(key))
+                    return;
+                MarksInCompressedFile::PlainArray plain(count);
+                if (count > 0 && marks_store.find(marks_store.arg, stream->c_str(), count, plain.data()))
+                {
+                    mark_cache->getOrSet(key, [&] { return MarksInCompressedFile::create(plain); });
+                    return;
+                }
+            }
+            MergeTreeMarksLoader loader(info, mark_cache.get(), marks_path,
+                                        count, part->index_granularity_info, /* save_marks_in_cache= */ true,
                                         ReadSettings{}, nullptr, 1, false);
-            (void) loader.loadMarks();
+            auto loaded = loader.loadMarks();
+            if (shared && count > 0)
+            {
+                MarksInCompressedFile::PlainArray plain(count);
+                for (size_t i = 0; i < count; ++i)
+                    plain[i] = loaded->getMark(i, 0);
+                marks_store.keep(marks_store.arg, stream->c_str(), count, plain.data());
+            }
         });
     }
 }
@@ -726,6 +795,11 @@ extern "C" int chte_read_begin(chte_table * table, const char * part_name, const
 extern "C" void chte_set_scan_marks(int on)
 {
     scan_marks = on != 0;
+}
+
+extern "C" void chte_set_marks_store(const chte_marks_store * store)
+{
+    marks_store = *store;
 }
 
 extern "C" uint64_t chte_marks_loaded(void)
@@ -1054,7 +1128,7 @@ extern "C" int chte_read_begin_steps(chte_table * table, const char * part_name,
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "chte_read_begin_steps: part {} has patches or a lightweight delete", part_name);
         /// VC41: the steps' readers take their marks from the cache, as a run's sources do (openReader)
         if (scan_marks)
-            warmMarks(*table, part, names, alter_conversions);
+            warmMarks(*table, part, names, /* shared= */ true, alter_conversions);
         ReadSettings read_settings = storage.getContext()->getReadSettings();
         read_settings.local_fs_settings.method = LocalFSReadMethod::pread;
         r->mark_cache = storage.getContext()->getMarkCache();

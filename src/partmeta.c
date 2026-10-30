@@ -56,11 +56,23 @@ typedef struct ChPartMetaKey
 	char		part[CH_PARTMETA_NAME];
 } ChPartMetaKey;
 
+/*
+ * VC46: a column's rows and exact default rows in a part, as the library counted
+ * them, kept with its blob, by attribute number
+ */
+typedef struct ChPartMetaFigure
+{
+	int32		attno;
+	uint64		rows;
+	uint64		defaults;
+} ChPartMetaFigure;
+
 typedef struct ChPartMetaSlot
 {
 	uint32		hash;			/* 0: empty */
 	uint32		len;
 	Size		off;			/* in the pool */
+	uint32		nfigures;		/* ChPartMetaFigure, after the blob's bytes */
 	ChPartMetaKey key;
 } ChPartMetaSlot;
 
@@ -257,11 +269,11 @@ find(const ChPartMetaKey *key, size_t *len)
 }
 
 static void
-keep(const ChPartMetaKey *key, const void *data, size_t len)
+keep(const ChPartMetaKey *key, const void *data, size_t len, const ChPartMetaFigure *figures, int nfigures)
 {
 	uint32		h = key_hash(key);
 	ChPartMetaSlot *s;
-	Size		need = MAXALIGN(len);
+	Size		need = MAXALIGN(len) + sizeof(ChPartMetaFigure) * nfigures;
 
 	if (need > shared->pool_size || len > PG_UINT32_MAX)
 		return;
@@ -277,7 +289,10 @@ keep(const ChPartMetaKey *key, const void *data, size_t len)
 		s->key = *key;
 		s->off = shared->pool_used;
 		s->len = (uint32) len;
+		s->nfigures = nfigures;
 		memcpy(pool() + s->off, data, len);
+		if (nfigures > 0)
+			memcpy(pool() + s->off + MAXALIGN(len), figures, sizeof(ChPartMetaFigure) * nfigures);
 		shared->pool_used += need;
 	}
 	LWLockRelease(shared->lock);
@@ -317,8 +332,67 @@ ch_part_metadata_prepare(ChTable *t, const ChPart *part)
 
 		CH_CALL("loading a part", eng->part_metadata_export(t->handle, part->name, &data, &len, CH_ERR));
 		if (len > 0)
-			keep(&key, data, len);
+		{
+			ChPartMetaFigure *figures = palloc_array(ChPartMetaFigure, Max(t->natts, 1));
+			int			nfigures = 0;
+
+			/* VC46: each column's exact figures, in the attributes' order */
+			for (int i = 0; eng->part_column_defaults != NULL && i < t->natts; i++)
+			{
+				char		column[16];
+				uint64_t	rows;
+				uint64_t	defaults;
+				int			exact;
+
+				if (t->columns[i].kind == CH_COL_DROPPED)
+					continue;
+				snprintf(column, sizeof(column), "c%d", i + 1);
+				CH_CALL("reading a part's figures",
+						eng->part_column_defaults(t->handle, part->name, column, &rows, &defaults, &exact, CH_ERR));
+				if (exact)
+				{
+					figures[nfigures].attno = i + 1;
+					figures[nfigures].rows = rows;
+					figures[nfigures].defaults = defaults;
+					nfigures++;
+				}
+			}
+			keep(&key, data, len, figures, nfigures);
+			pfree(figures);
+		}
 	}
+}
+
+/*
+ * VC46: a part's rows and the rows holding a column's default where the library
+ * counted them exactly and a process has kept them with the part's metadata;
+ * false where no process has, or they were not exact: no part loaded for them.
+ */
+bool
+ch_part_defaults(const ChTable *t, const ChPart *part, AttrNumber attno, uint64 *rows, uint64 *defaults)
+{
+	ChPartMetaKey key;
+	ChPartMetaSlot *s;
+	bool		found = false;
+
+	if (!make_key(t, part, &key))
+		return false;
+	LWLockAcquire(shared->lock, LW_SHARED);
+	s = probe(&key, key_hash(&key));
+	if (s->hash != 0)
+	{
+		const ChPartMetaFigure *f = (const ChPartMetaFigure *) (pool() + s->off + MAXALIGN(s->len));
+
+		for (uint32 i = 0; i < s->nfigures && !found; i++)
+			if (f[i].attno == attno)
+			{
+				*rows = f[i].rows;
+				*defaults = f[i].defaults;
+				found = true;
+			}
+	}
+	LWLockRelease(shared->lock);
+	return found;
 }
 
 /*

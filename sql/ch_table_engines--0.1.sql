@@ -21,7 +21,10 @@ CREATE TABLE ch.tables (
 	library			text NOT NULL,
 	-- the columns ClickHouse keeps as their plain types, not Nullable: NOT
 	-- NULL where the storage was made, and since (§2.5, VC11)
-	plain			int2[] NOT NULL
+	plain			int2[] NOT NULL,
+	-- the text columns whose values' characters each part of the storage keeps
+	-- beside them (pg_accel's §3.38, VC48): fixed as the storage is made
+	chars			int2[]
 ) USING heap;
 CREATE UNIQUE INDEX tables_storage ON ch.tables (tablespace, relfilenumber, backend);
 
@@ -277,6 +280,13 @@ CREATE FUNCTION ch.sparse_passed() RETURNS bigint
 CREATE FUNCTION ch.part_metadata(OUT entries int4, OUT bytes int8, OUT found int8, OUT kept int8, OUT made int8)
 	RETURNS record
 	AS 'MODULE_PATHNAME', 'ch_part_metadata_info' LANGUAGE C VOLATILE;
+
+-- The parts' decompressed marks kept in shared memory (ch_table_engines.md
+-- VC42): its entries and their bytes, NULLs where none is kept; the session's
+-- process's entries found and kept.
+CREATE FUNCTION ch.part_marks(OUT entries int4, OUT bytes int8, OUT found int8, OUT kept int8)
+	RETURNS record
+	AS 'MODULE_PATHNAME', 'ch_part_marks_info' LANGUAGE C VOLATILE;
 
 -- The rows the session's process has read alone of the uncompressed record
 -- batches of Arrow files (ch_table_engines.md §3, VC27): a fetch's rows by

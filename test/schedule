@@ -13,6 +13,7 @@ test: chscan
 test: summaries
 test: selections
 test: partmeta
+test: partmarks
 test: skipidx
 test: dictionaries
 test: dml

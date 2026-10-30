@@ -84,6 +84,8 @@ static const ChOptionName option_names[] = {
 	{"sign", true},
 	{"sum_columns", true},
 	{"low_cardinality", true},
+	/* VC48: whether a storage made from now on keeps its text columns' character counts */
+	{"char_counts", true},
 	/* an external table's (§2.17): where it reads, which changes at any time */
 	{"location", false},
 	/* a table of its own files' (§2.18): its parts' codec, the next part's and merge's */
@@ -250,7 +252,7 @@ ch_options_validate(List *defs, ChEngineKind kind)
 		}
 		else if (strcmp(name, "compression") == 0)
 			check_compression(def_string(def));
-		else if (strcmp(name, "merges") == 0)
+		else if (strcmp(name, "merges") == 0 || strcmp(name, "char_counts") == 0)
 			(void) parse_bool_value(name, def_string(def));
 		else if (strcmp(name, "settings") == 0)
 			(void) def_string(def);
@@ -378,6 +380,7 @@ set_defaults(ChOptions *opts)
 	opts->index_granularity = 8192;
 	opts->compression = "lz4";
 	opts->merges = true;
+	opts->char_counts = true;
 }
 
 static void
@@ -401,6 +404,13 @@ apply_option(ChOptions *opts, const char *name, const char *value)
 
 		(void) parse_bool(value, &b);
 		opts->merges = b;
+	}
+	else if (strcmp(name, "char_counts") == 0)
+	{
+		bool		b = true;
+
+		(void) parse_bool(value, &b);
+		opts->char_counts = b;
 	}
 	else if (strcmp(name, "ver") == 0)
 		opts->ver = pstrdup(value);
@@ -490,6 +500,20 @@ ch_relation_options(Relation rel, ChOptions *opts)
 	if (!HeapTupleIsValid(tuple))
 	{
 		ListCell   *lc;
+		Oid			source = ch_rewrite_source(rel);
+
+		/* a rewrite's transient table, whose options will be its table's (make_new_heap()) */
+		if (OidIsValid(source))
+		{
+			tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(source));
+			if (HeapTupleIsValid(tuple))
+			{
+				datum = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions, &isnull);
+				ch_options_parse(isnull ? (Datum) 0 : datum, opts);
+				ReleaseSysCache(tuple);
+				return;
+			}
+		}
 
 		/*
 		 * made by the running command, before its options were bound: the

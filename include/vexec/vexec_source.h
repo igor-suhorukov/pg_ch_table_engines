@@ -163,6 +163,12 @@ typedef struct VexecColumn
  * F5); a source that cannot say so leaves it clear, and vexec checks them.
  */
 #define VEXEC_COL_TEXT_WHOLE	0x01
+/*
+ * From minor version 19: an OFFSETS column asked for by VexecSourceSpec's
+ * length_columns, its offsets counting each value's characters, no byte behind
+ * them; NOT NULL
+ */
+#define VEXEC_COL_LENGTHS		0x02
 
 /* VexecSourceSpec.flags */
 #define VEXEC_SRC_COMPACT	0x0001	/* hand only visible rows */
@@ -177,6 +183,9 @@ typedef struct VexecColumn
 									 * come in steps, the first from next(),
 									 * each later one from a call of
 									 * next_rest() (nsteps, step_ends) */
+#define VEXEC_SRC_COUNT_QUALS 0x0020	/* from minor version 19: aggregate()
+										 * may be asked count(*) under the
+										 * spec's quals */
 
 /* At most this many steps */
 #define VEXEC_SRC_MAX_STEPS	8
@@ -239,6 +248,14 @@ typedef struct VexecSourceSpec
 	 * the contract is minor 12's otherwise, the extension's own minor 12.
 	 */
 	bool		granule_keys;
+
+	/*
+	 * From minor version 19 (F35 and F37, pg_vector_executor.md §3.38): NULL,
+	 * or per column whether vexec reads its values only for their length in
+	 * characters and whether they are empty.  The source may then hand the
+	 * column as VEXEC_COL_LENGTHS.
+	 */
+	const uint8 *length_columns;
 } VexecSourceSpec;
 
 /* One batch from a source. */
@@ -332,6 +349,13 @@ typedef struct VexecSourceEstimate
  * statistics are exact there, and no row of the units is deleted
  */
 #define VEXEC_EST_AGG_EXACT		0x0001
+
+/*
+ * Minor version 19: aggregate() would answer count(*) of every unit of a
+ * serial scan begun with the spec's quals (VEXEC_SRC_COUNT_QUALS), each unit's
+ * rows that satisfy them
+ */
+#define VEXEC_EST_COUNT_QUALS	0x0002
 
 /*
  * A unit a source hands for the GPU's executor to read itself, from its file
@@ -676,6 +700,16 @@ typedef struct VexecSourceRoutine
 	 * A unit another participant claimed meanwhile stays its own.
 	 */
 	void		(*claim_alone) (void *state);
+
+	/* minor version 16's scan_figures and planning_figures, which this copy does not use */
+	void	   *figures_unused[2];
+
+	/*
+	 * Optional, from minor version 19 (pg_vector_executor.md §3.38, F36):
+	 * whether aggregate() counts this scan's units under the qual it was begun
+	 * with, asked of a scan begun with VEXEC_SRC_COUNT_QUALS
+	 */
+	bool		(*count_under_quals) (void *state);
 } VexecSourceRoutine;
 
 /*

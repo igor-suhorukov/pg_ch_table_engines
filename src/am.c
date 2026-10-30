@@ -397,7 +397,8 @@ ch_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 	ch_storage_id(rel, newrlocator, &newid);
 	newid.persistence = persistence;
 	newid.backend = persistence == RELPERSISTENCE_TEMP ? rel->rd_backend : -1;
-	ch_table_row_create(rel, &newid, kind, opts.storage, ch_plain_columns(RelationGetDescr(rel)));
+	ch_table_row_create(rel, &newid, kind, opts.storage, ch_plain_columns(RelationGetDescr(rel)),
+						ch_char_columns(rel, &opts, kind));
 	ch_store_create(&newid);
 	ch_table_forget(RelationGetRelid(rel));
 }

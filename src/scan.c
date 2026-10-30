@@ -156,6 +156,10 @@ typedef struct ChScanDescData
 	int		   *attnos;			/* per column read: the attribute's index, -1 the row id */
 	char	   *columns;		/* their names, for the library */
 	char	   *columns_rowid;	/* the same, and the row id where it is not among them */
+	char	   *columns_lengths;	/* VC48: with the marked columns' character counts */
+	char	   *columns_lengths_rowid;
+	bool		lengths;		/* VC48: there are marked columns */
+	bool		reading_lengths;	/* and the reader reads them */
 	int			asked_rowid;	/* the row id's column among them, or -1 */
 	chte_vector *vectors;		/* ncols + 1: the row id last where the reader adds it */
 	bool	   *missing;		/* per column read: not in the current part */
@@ -1126,11 +1130,15 @@ begin_reader(ChScanDesc scan)
 	const ChEngine *eng = ch_engine();
 	const char *columns = scan->columns;
 
+	/* VC48: the marked columns' character counts, of a part of whole text */
+	scan->reading_lengths = scan->lengths && scan->part->listing == NULL && scan->part->text_checked;
+	if (scan->reading_lengths)
+		columns = scan->columns_lengths;
 	/* a unit with deletions reads the row ids, to know its rows; one of no column, to count them */
 	scan->rowid_col = scan->asked_rowid;
 	if ((scan->dead_lo < scan->dead_hi || scan->ncols == 0) && scan->asked_rowid < 0)
 	{
-		columns = scan->columns_rowid;
+		columns = scan->reading_lengths ? scan->columns_lengths_rowid : scan->columns_rowid;
 		scan->rowid_col = scan->ncols;
 	}
 	if (scan->table->options.storage == CH_STORAGE_PAGES)
@@ -1151,6 +1159,7 @@ begin_reader(ChScanDesc scan)
 		/* VC41: the readers' marks from the process's mark cache, as the setting says */
 		if (eng->set_scan_marks != NULL)
 			eng->set_scan_marks(ch_enable_scan_marks);
+		ch_part_marks_begin(scan->table, scan->part);
 		CH_CALL("reading a part",
 				eng->read_begin_steps(scan->table->handle, scan->part->name, columns, steps,
 									  scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader,
@@ -1162,6 +1171,7 @@ begin_reader(ChScanDesc scan)
 		/* VC41: the readers' marks from the process's mark cache, as the setting says */
 		if (eng->set_scan_marks != NULL)
 			eng->set_scan_marks(ch_enable_scan_marks);
+		ch_part_marks_begin(scan->table, scan->part);
 		CH_CALL("reading a part",
 				eng->read_begin(scan->table->handle, scan->part->name, columns,
 								scan->nranges > 0 ? scan->ranges : NULL, scan->nranges, &scan->reader, CH_ERR));
@@ -1366,6 +1376,38 @@ set_columns(ChScanDesc scan, int n, const int *attnos)
 	scan->columns = names.data;
 	scan->columns_rowid = scan->asked_rowid >= 0 ? pstrdup(names.data) :
 		psprintf("%s%s" CH_ROWID_COLUMN, names.data, n > 0 ? ", " : "");
+	scan->lengths = false;
+}
+
+/*
+ * VC48 (pg_accel's §3.38, "After VP6, read again"): the scan's columns marked
+ * read for their values' characters alone, a part's hidden column of them in
+ * place of the values: for a part none of whose text may be other than UTF8's
+ * whole (text_checked), the others' values read as ever.
+ */
+void
+ch_scan_set_lengths(TableScanDesc sscan, const bool *lengths)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+	MemoryContext old = MemoryContextSwitchTo(scan->scan_cxt);
+	StringInfoData names;
+
+	Assert(scan->part == NULL);
+	initStringInfo(&names);
+	for (int c = 0; c < scan->ncols; c++)
+	{
+		if (c > 0)
+			appendStringInfoString(&names, ", ");
+		if (scan->attnos[c] < 0)
+			appendStringInfoString(&names, CH_ROWID_COLUMN);
+		else
+			appendStringInfo(&names, lengths[c] ? "c%d" CH_CHARS_SUFFIX : "c%d", scan->attnos[c] + 1);
+	}
+	scan->columns_lengths = names.data;
+	scan->columns_lengths_rowid = scan->asked_rowid >= 0 ? pstrdup(names.data) :
+		psprintf("%s%s" CH_ROWID_COLUMN, names.data, scan->ncols > 0 ? ", " : "");
+	scan->lengths = true;
+	MemoryContextSwitchTo(old);
 }
 
 /* Every column of the scan's table, then the row id: what getnextslot reads */
@@ -1901,6 +1943,75 @@ sparse_default(Oid typid, bool *ok)
 	}
 }
 
+/*
+ * VC46: the column a qual is true of exactly where it holds other than its
+ * type's default -- a boolean alone, an integer's <> 0, a text's <> '' -- not
+ * NULL anywhere, ClickHouse's count of its defaults then the qual's rows'
+ * complement (as its classifySparsityPredicate() takes them,
+ * CHT:src/Storages/MergeTree/SparsityFilter.h); 0 for any other.
+ */
+AttrNumber
+ch_default_complement_qual(Relation rel, Expr *qual)
+{
+	ChTable    *t = ch_table(rel);
+	AttrNumber	attno = 0;
+
+	if (!ch_enable_count_from_defaults || t->external || t->own ||
+		!sparse_qual(qual, NULL, &attno, sparse_default) || attno > t->natts)
+		return 0;
+	if (IsA(qual, OpExpr))
+	{
+		List	   *in = get_op_index_interpretation(((OpExpr *) qual)->opno);
+		ListCell   *lc;
+		bool		ne = in != NIL;
+
+		foreach(lc, in)
+			ne &= ((OpIndexInterpretation *) lfirst(lc))->cmptype == COMPARE_NE;
+		list_free_deep(in);
+		if (!ne)
+			return 0;
+	}
+	if (!TupleDescAttr(RelationGetDescr(rel), attno - 1)->attnotnull ||
+		t->columns[attno - 1].low_cardinality || t->columns[attno - 1].kind == CH_COL_DROPPED)
+		return 0;
+	return attno;
+}
+
+/*
+ * VC46: where no row of the snapshot's parts is deleted and every part's exact
+ * figures of the column are kept, the rows not of its default; false else
+ */
+bool
+ch_estimate_non_defaults(Relation rel, Snapshot snapshot, AttrNumber attno, double *rows, double *units)
+{
+	ChTable    *t = ch_table(rel);
+	SnapshotData nonvacuumable;
+	List	   *parts;
+	ListCell   *lc;
+	bool		ok = snapshot != NULL;
+
+	*rows = 0;
+	ch_table_pin(t);
+	parts = ch_parts_to_scan(&t->storage, ch_parts_snapshot(rel, snapshot, &nonvacuumable));
+	*units = list_length(parts);
+	if (ok && ch_tombstones_visible_any(&t->storage, snapshot))
+		ok = false;
+	foreach(lc, parts)
+	{
+		const ChPart *part = lfirst(lc);
+		uint64		part_rows;
+		uint64		defaults;
+
+		if (!ok)
+			break;
+		ok = !part->deletes && ch_part_defaults(t, part, attno, &part_rows, &defaults) && part_rows == part->rows;
+		if (ok)
+			*rows += (double) (part_rows - defaults);
+	}
+	ch_table_unpin(t);
+	return ok;
+}
+
 void
 ch_scan_set_sparse_quals(TableScanDesc sscan, List *quals)
 {
@@ -2089,6 +2200,7 @@ ch_scan_next_batch(TableScanDesc sscan, ChScanBatch *batch)
 	batch->nrows = scan->nrows;
 	batch->ncols = scan->ncols;
 	batch->attnos = scan->attnos;
+	batch->lengths = scan->reading_lengths;
 	batch->vectors = scan->vectors;
 	batch->missing = scan->missing;
 	batch->dicts = scan->keep_dict ? scan->dicts : NULL;

@@ -401,7 +401,7 @@ extern bool skip_indexes;
 /// VC33: a wide part's named columns' marks, each stream's, loaded into the process's mark cache where they
 /// are not there -- a merge's sequential source, which openReader's reader is, only looks there
 /// (MergeTreeMarksLoader.cpp:305-313), so that a fetch's every reader decompressed them again
-void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names,
+void warmMarks(chte_table & table, const MergeTreeData::DataPartPtr & part, const Names & names, bool shared,
                AlterConversionsPtr alter_conversions);
 
 /// Mark ranges, ascending, as runs of adjacent granules, each for a sequential source of its own; none: the
@@ -426,6 +426,18 @@ struct ReadStep
     std::optional<size_t> next_mark;
 };
 
+/// VC48 (pg_accel's §3.38, "After VP6, read again"): a text column's hidden column of each value's
+/// characters, named by the extension's table spec: every part of a storage made with it has it
+constexpr const char * CHARS_SUFFIX = "_chars";
+
+inline bool isCharsColumn(const std::string & name)
+{
+    return name.ends_with(CHARS_SUFFIX);
+}
+
+/// The columns of a writer's header the caller fills, those before the character counts
+size_t writerCallerColumns(const DB::Block & header);
+
 /// The writer's rows as parts, one a partition, under temporary names (chte_write_finish).
 void writeParts(chte_writer & writer, ContextPtr context);
 /// A part's description for the caller, its directory as it is now.
@@ -448,6 +460,9 @@ struct chte_writer
     UInt64 block_number = 0;
     DB::Block header;
     DB::MutableColumns columns;
+    /// VC48: the columns the caller fills; those after them are text columns' character counts, last in
+    /// the header, the writer's own to fill as its parts are written (writeParts)
+    size_t caller_columns = 0;
     std::vector<DB::MergeTreeTemporaryPartPtr> parts;
     bool finished = false;
     bool committed = false;

@@ -665,6 +665,29 @@ CHTE_API int			chte_part_metadata_export(chte_table *table, const char *part_nam
 									  size_t *len, chte_error *error);
 CHTE_API int			chte_part_metadata_import(chte_table *table, const char *part_name, const void *data,
 									  size_t len, int *taken, chte_error *error);
+/*
+ * VC42's marks (pg_accel's §3.38, "After VP6, read again"): a part's marks kept by the caller as one
+ * process decompressed them, so that the next process reads no marks file.  chte_set_marks_store: find
+ * copies the `count` marks of a stream of the part whose scan's read is beginning -- 16 bytes each -- into
+ * `into` and returns 1 where it keeps them; keep takes them as this process decompressed them.  Both are
+ * called in the caller's thread, inside chte_read_begin and chte_read_begin_steps alone, and neither may
+ * throw or jump out.  Optional: a library built before it lacks it.
+ */
+typedef struct chte_marks_store
+{
+	void	   *arg;
+	int			(*find) (void *arg, const char *stream, size_t count, void *into);
+	void		(*keep) (void *arg, const char *stream, size_t count, const void *marks);
+} chte_marks_store;
+
+CHTE_API void			chte_set_marks_store(const chte_marks_store *store);
+/*
+ * VC46 (pg_accel's §3.38, "After VP6, read again"): a part's rows and the rows holding a column's default,
+ * as its serialization's figures keep them (serialization.json), the part loaded here if it is not yet;
+ * *exact 0 where it keeps none of the column -- a Nullable's, a tuple's -- or only a sample's.  Optional.
+ */
+CHTE_API int			chte_part_column_defaults(chte_table *table, const char *part_name, const char *column,
+									  uint64_t *rows, uint64_t *defaults, int *exact, chte_error *error);
 
 CHTE_API int			chte_read_want_sparse(chte_reader *reader, const uint8_t *wanted, size_t ncolumns,
 								  chte_error *error);

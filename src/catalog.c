@@ -56,7 +56,7 @@
 #include "chte.h"
 
 /* ch.tables's columns */
-#define Natts_tables 10
+#define Natts_tables 11
 #define Anum_tables_tablespace 1
 #define Anum_tables_relfilenumber 2
 #define Anum_tables_backend 3
@@ -67,6 +67,7 @@
 #define Anum_tables_next_block 8
 #define Anum_tables_library 9
 #define Anum_tables_plain 10
+#define Anum_tables_chars 11
 
 /* ch.parts's columns */
 #define Natts_parts 14
@@ -683,7 +684,7 @@ datum_attnums(Datum datum)
 
 void
 ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChStorage storage,
-					const Bitmapset *plain)
+					const Bitmapset *plain, const Bitmapset *chars)
 {
 	Relation	catalog;
 	Datum		values[Natts_tables];
@@ -708,6 +709,8 @@ ch_table_row_create(Relation rel, const ChStorageId *id, ChEngineKind kind, ChSt
 	values[Anum_tables_next_block - 1] = Int64GetDatum(1);
 	values[Anum_tables_library - 1] = CStringGetTextDatum("v26.8.8.8-lts");
 	values[Anum_tables_plain - 1] = attnums_datum(plain);
+	/* a catalog made before the column was has no place for it, and no table of it: see ch_table_row_chars() */
+	values[Anum_tables_chars - 1] = attnums_datum(chars);
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	insert_with_cid(catalog, tuple, GetCurrentCommandId(true));
 	heap_freetuple(tuple);
@@ -791,6 +794,42 @@ ch_table_row_plain(const ChStorageId *id)
 	systable_endscan(scan);
 	table_close(catalog, AccessShareLock);
 	return plain;
+}
+
+/*
+ * VC48: the text columns whose values' character counts a storage's parts
+ * keep, fixed as it was made: every part of it has them
+ */
+Bitmapset *
+ch_table_row_chars(const ChStorageId *id)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+	int			nkeys;
+	Bitmapset  *chars = NULL;
+
+	catalog = open_catalog("tables", id, AccessShareLock);
+	if (RelationGetDescr(catalog)->natts < Anum_tables_chars)
+	{
+		table_close(catalog, AccessShareLock);
+		return NULL;
+	}
+	nkeys = storage_keys(id, keys);
+	scan = systable_beginscan(catalog, catalog_index(catalog), true, SnapshotSelf, nkeys, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		datum = heap_getattr(tuple, Anum_tables_chars, RelationGetDescr(catalog), &isnull);
+
+		if (!isnull)
+			chars = datum_attnums(datum);
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return chars;
 }
 
 /*
