@@ -231,6 +231,14 @@ typedef struct VexecSourceSpec
 	 * more than a granule's rows do -- but leaves them out of its ranges
 	 */
 	bool		unit_ranges;
+
+	/*
+	 * From minor version 17 (F25, pg_vector_executor.md §3.38): set_keys()'s
+	 * keys may pass over the granules of a unit the source reads, not only
+	 * whole units (set_keys(), below).  Read by the spec's size: this copy of
+	 * the contract is minor 12's otherwise, the extension's own minor 12.
+	 */
+	bool		granule_keys;
 } VexecSourceSpec;
 
 /* One batch from a source. */
@@ -481,7 +489,9 @@ typedef struct VexecSourceRoutine
 	 * BTLessEqualStrategyNumber or BTGreaterEqualStrategyNumber.  Pruning
 	 * only: from the next unit the source begins -- a file, a group -- it
 	 * may pass over one whose statistics show that none of its rows
-	 * satisfies them, and never a row of a unit it reads.  vexec gives them
+	 * satisfies them, and never a row of a unit it reads; from minor
+	 * version 17, where the spec's granule_keys is set, a granule of a unit
+	 * it reads too, one it has not begun, whose statistics show the same.  vexec gives them
 	 * only where passing a row over unread raises no error PostgreSQL would
 	 * raise, and only under a NULLS order a key's NULLs never satisfy.
 	 * Called between batches; the source copies what it keeps of them.

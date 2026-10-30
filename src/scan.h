@@ -59,6 +59,7 @@ typedef struct ChScanCounts
 	int64		marks;			/* granules of the units taken */
 	int64		marks_read;		/* of them, those read */
 	int64		marks_skipped;	/* F7: of those the filter kept, those a granule skip passed over */
+	int64		marks_bound;	/* VC43: of those, those a running bound passed over */
 } ChScanCounts;
 
 /*
@@ -106,6 +107,18 @@ extern void ch_scan_claim_alone(TableScanDesc scan);
 typedef const uint64 *(*ChGranuleSkip) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
 										uint32 end);
 extern void ch_scan_set_granule_skip(TableScanDesc scan, ChGranuleSkip skip, void *arg);
+
+/*
+ * VC43 (pg_accel's §3.38, F25): a running bound's check of a part's granules
+ * [begin, end): keep's bit m - begin set for a granule the bound may leave a
+ * row of, cleared for one it leaves none of, by its least or greatest value;
+ * false where it knows none of them, every granule read.  The scan applies it
+ * to each unit it claims, and -- told the bound moved -- to the granules of the
+ * unit it reads that its reader has not begun.
+ */
+typedef bool (*ChGranuleCheck) (void *arg, const ChPart *part, uint32 begin, uint32 end, uint64 *keep);
+extern void ch_scan_set_granule_check(TableScanDesc scan, ChGranuleCheck check, void *arg);
+extern void ch_scan_bound_moved(TableScanDesc scan);
 /* W21: granules of a unit passed over for the device by the caller's granule skip, counted */
 extern void ch_scan_note_skipped(TableScanDesc scan, int64 n);
 /* W21: the unit being read here has the caller's granule skip applied already: skip_granules() asks no more */

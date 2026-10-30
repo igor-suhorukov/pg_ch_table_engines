@@ -760,6 +760,8 @@ filter_key(ChTable *t, List *nodes, ChFilterKey *key)
 		appendBinaryStringInfo(&k, t->definition, strlen(t->definition) + 1);
 	if (ch_engine_settings)
 		appendBinaryStringInfo(&k, ch_engine_settings, strlen(ch_engine_settings) + 1);
+	/* VC43: whether the min/max skip indexes narrowed the selection too */
+	appendStringInfoChar(&k, ch_enable_skip_indexes ? 'S' : 's');
 	key->h1 = hash_bytes_extended((const unsigned char *) k.data, k.len, UINT64CONST(0x9e3779b97f4a7c15));
 	key->h2 = hash_bytes_extended((const unsigned char *) k.data, k.len, UINT64CONST(0x632be59bd9b4e019));
 	if (key->h1 == 0 && key->h2 == 0)
@@ -834,6 +836,9 @@ ch_filter_make_keys(ChTable *t, List *quals, int nkeys, const ScanKeyData *keys,
 			i++;
 		}
 		MemoryContextSwitchTo(old);
+		/* VC43: whether the filter narrows granules by the min/max skip indexes too, as the setting says */
+		if (ch_engine()->set_skip_indexes != NULL)
+			ch_engine()->set_skip_indexes(ch_enable_skip_indexes);
 		CH_CALL("making a filter", ch_engine()->filter_create(t->handle, array, i, &filter, CH_ERR));
 	}
 	else

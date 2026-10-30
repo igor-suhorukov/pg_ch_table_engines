@@ -213,6 +213,22 @@ typedef struct SrcState
 	void	   *granules_arg;
 	/* W26 (minor 12): vexec takes a MergeTree unit of several ranges of granules */
 	bool		unit_ranges;
+	/*
+	 * VC43 (minor 17, pg_accel's §3.38 F25): set_keys()'s bound may pass over
+	 * a unit's granules; the part whose granules' least or greatest values of
+	 * the bound's column are kept, by its min/max skip index -- known a
+	 * granule each -- and whether it has them
+	 */
+	bool		granule_keys;
+	bool		granule_check;	/* given to the scan */
+	const ChPart *gb_part;
+	AttrNumber	gb_attno;
+	int			gb_direction;
+	bool		gb_found;
+	int32		gb_marks;
+	Datum	   *gb_values;
+	uint8	   *gb_known;
+	MemoryContext gb_cxt;
 } SrcState;
 
 static uint64 null_row = 0;		/* a constant's validity: its one value NULL */
@@ -436,6 +452,9 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 	/* W26 (minor 12): a device's MergeTree units of several ranges, where vexec takes them */
 	st->unit_ranges = ch_device_unit_ranges &&
 		spec->size >= offsetof(VexecSourceSpec, unit_ranges) + sizeof(spec->unit_ranges) && spec->unit_ranges;
+	/* VC43 (minor 17): a running bound's keys may pass over the granules of a unit read */
+	st->granule_keys = spec->size >= offsetof(VexecSourceSpec, granule_keys) + sizeof(spec->granule_keys) &&
+		spec->granule_keys;
 	if (spec->nkeys > 0)
 	{
 		st->nspec_keys = spec->nkeys;
@@ -925,6 +944,111 @@ unit_within_keys(void *arg, const ChScanUnit *unit)
 
 	return keys_may_match(st, unit->part, st->nspec_keys, st->spec_keys) &&
 		keys_may_match(st, unit->part, st->nbound_keys, st->bound_keys);
+}
+
+/*
+ * VC43: the least (direction 1) or greatest (-1) value of the bound's column
+ * in each of a part's granules, by its min/max skip index, kept for the part
+ * the scan reads; false where the part has none of them
+ */
+static bool
+granule_bounds(SrcState *st, const ChPart *part, AttrNumber attnum, int direction)
+{
+	const ChEngine *eng = ch_engine();
+	ChTable    *t = ch_scan_table(st->scan);
+	char		name[16];
+	chte_vector values;
+	int			found = 0;
+	MemoryContext old;
+
+	if (st->gb_part == part && st->gb_attno == attnum && st->gb_direction == direction)
+		return st->gb_found;
+	if (st->gb_cxt == NULL)
+		st->gb_cxt = AllocSetContextCreate(st->cxt, "ch granule bounds", ALLOCSET_SMALL_SIZES);
+	else
+		MemoryContextReset(st->gb_cxt);
+	st->gb_part = part;
+	st->gb_attno = attnum;
+	st->gb_direction = direction;
+	st->gb_found = false;
+	st->gb_marks = 0;
+	if (attnum < 1 || attnum > t->natts || part->listing != NULL || part->marks <= 0 ||
+		eng->part_granule_bounds == NULL)
+		return false;
+	old = MemoryContextSwitchTo(st->gb_cxt);
+	st->gb_known = palloc0(part->marks);
+	snprintf(name, sizeof(name), "c%d", attnum);
+	if (t->options.storage == CH_STORAGE_PAGES)
+		ch_pages_attach(t, part);
+	CH_CALL("reading a part's granules' least and greatest values",
+			eng->part_granule_bounds(t->handle, part->name, name, direction, 0, (uint32_t) part->marks, &values,
+									 st->gb_known, &found, CH_ERR));
+	if (found)
+	{
+		st->gb_values = palloc(sizeof(Datum) * part->marks);
+		for (int32 m = 0; m < part->marks; m++)
+		{
+			bool		isnull = false;
+
+			st->gb_values[m] = (Datum) 0;
+			if (!st->gb_known[m])
+				continue;
+			ch_vector_to_datum(&t->columns[attnum - 1], &values, (uint32) m, &st->gb_values[m], &isnull, NULL);
+			if (isnull)
+				st->gb_known[m] = 0;
+		}
+		st->gb_marks = part->marks;
+		st->gb_found = true;
+	}
+	MemoryContextSwitchTo(old);
+	return st->gb_found;
+}
+
+/*
+ * VC43 (pg_accel's §3.38, F25): the scan's check of a part's granules
+ * [begin, end) against the running bound -- the one key set_keys() gave, as
+ * keys_may_match() checks a part's least and greatest values -- a granule
+ * whose value is not known kept
+ */
+static bool
+granules_within_bound(void *arg, const ChPart *part, uint32 begin, uint32 end, uint64 *keep)
+{
+	SrcState   *st = arg;
+	const ScanKeyData *key;
+	int			direction;
+
+	if (!ch_enable_skip_indexes || st->nbound_keys != 1)
+		return false;
+	key = &st->bound_keys[0];
+	if (key->sk_flags & (SK_ISNULL | SK_SEARCHARRAY | SK_SEARCHNULL | SK_SEARCHNOTNULL | SK_ROW_HEADER))
+		return false;
+	switch (key->sk_strategy)
+	{
+		case BTLessStrategyNumber:
+		case BTLessEqualStrategyNumber:
+			direction = 1;
+			break;
+		case BTGreaterStrategyNumber:
+		case BTGreaterEqualStrategyNumber:
+			direction = -1;
+			break;
+		default:
+			return false;
+	}
+	if (!granule_bounds(st, part, key->sk_attno, direction))
+		return false;
+	memset(keep, 0, sizeof(uint64) * ((end - begin + 63) / 64));
+	for (uint32 m = begin; m < end; m++)
+	{
+		bool		ok = true;
+
+		if ((int32) m < st->gb_marks && st->gb_known[m])
+			ok = DatumGetBool(FunctionCall2Coll((FmgrInfo *) &key->sk_func, key->sk_collation, st->gb_values[m],
+												key->sk_argument));
+		if (ok)
+			keep[(m - begin) / 64] |= UINT64CONST(1) << ((m - begin) % 64);
+	}
+	return true;
 }
 
 static bool
@@ -2280,6 +2404,21 @@ src_set_keys(void *arg, int nkeys, const ScanKeyData *keys)
 		memcpy(st->bound_keys, keys, sizeof(ScanKeyData) * nkeys);
 	st->nbound_keys = nkeys;
 	ch_scan_set_unit_check(st->scan, st->nspec_keys > 0 || nkeys > 0 ? unit_within_keys : NULL, st);
+	/*
+	 * VC43 (minor 17): where vexec lets the bound pass over a unit's granules,
+	 * the scan checks them by the min/max skip indexes, as the bound moves
+	 */
+	if (st->granule_keys && nkeys == 1 && ch_engine()->part_granule_bounds != NULL &&
+		ch_engine()->read_restrict != NULL)
+	{
+		if (!st->granule_check)
+		{
+			ch_scan_set_granule_check(st->scan, granules_within_bound, st);
+			st->granule_check = true;
+		}
+		else
+			ch_scan_bound_moved(st->scan);
+	}
 	MemoryContextSwitchTo(old);
 }
 

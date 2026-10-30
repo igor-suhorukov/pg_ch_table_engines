@@ -538,7 +538,7 @@ ch_table_definition(Relation rel, const ChOptions *opts, ChEngineKind kind)
  * ch.definition() shows and a library built before VC21 compiles.  Its
  * members point into memory of the current context.
  */
-#define CH_SPEC_SETTINGS 5
+#define CH_SPEC_SETTINGS 7
 
 typedef struct ChTableSpec
 {
@@ -676,6 +676,17 @@ table_spec_for(Relation rel, TupleDesc desc, const ChOptions *opts, ChEngineKind
 	 */
 	if (!opts->settings || !mentions_setting(opts->settings, "auto_statistics_types"))
 		ts->settings[nsettings++] = (chte_table_setting) {"auto_statistics_types", "basic", 0};
+	/*
+	 * VC43 (pg_accel's §3.38; §8, decided): ClickHouse's min/max skip index
+	 * of every numeric and temporal column, written with each part and
+	 * merge, which a scan's quals and a running bound choose granules by
+	 * (engine/src/select.cpp); a text column's none, its least nearly
+	 * always the empty string.  A table's own settings over them.
+	 */
+	if (!opts->settings || !mentions_setting(opts->settings, "add_minmax_index_for_numeric_columns"))
+		ts->settings[nsettings++] = (chte_table_setting) {"add_minmax_index_for_numeric_columns", NULL, 1};
+	if (!opts->settings || !mentions_setting(opts->settings, "add_minmax_index_for_temporal_columns"))
+		ts->settings[nsettings++] = (chte_table_setting) {"add_minmax_index_for_temporal_columns", NULL, 1};
 	Assert(nsettings <= CH_SPEC_SETTINGS);
 	ts->spec.settings = ts->settings;
 	ts->spec.nsettings = nsettings;

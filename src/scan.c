@@ -113,10 +113,20 @@
 #define CH_UNIT_MIN_ROWS_PARQUET 1048576
 #define CH_UNIT_MAX_ROWS 1048576
 
+/*
+ * VC42 (pg_accel's §3.38): a parallel scan's units claimed part by part, each
+ * participant in a part of its own as far as it lasts -- each of a query's
+ * processes then loads, attaches and reads the marks of a few parts, not of
+ * every one -- for tables of CH_AFFINE_PARTS parts at most, the next unit
+ * of each part counted apart
+ */
+#define CH_AFFINE_PARTS 256
+
 typedef struct ChParallelScan
 {
 	ParallelTableScanDescData base;
 	pg_atomic_uint32 next_unit;
+	pg_atomic_uint32 part_next[CH_AFFINE_PARTS];	/* VC42: each part's next unit, from its first */
 	/* an external table's (§2.17): the leader's listing of its files, which every participant reads */
 	uint32		listing_size;
 	char		listing[FLEXIBLE_ARRAY_MEMBER];
@@ -133,6 +143,7 @@ typedef struct ChScanDescData
 	uint32		nunits;
 	uint32		next_unit;		/* serial */
 	bool		claim_alone;	/* VC35: parallel, its participant the only one claiming: a part's units at once */
+	int			home_part;		/* VC42: the part this participant claims in, -1 none yet */
 
 	/* what is read: the columns, in the order set, the row id last when read */
 	int			ncols;
@@ -160,6 +171,9 @@ typedef struct ChScanDescData
 	void	   *unit_check_arg;
 	ChGranuleSkip granule_skip; /* F7: NULL, every granule the filter keeps is read */
 	void	   *granule_skip_arg;
+	ChGranuleCheck granule_check;	/* VC43: a running bound's; NULL, none */
+	void	   *granule_check_arg;
+	bool		bound_moved;	/* since the claimed unit's granules were last checked */
 
 	/* the claimed unit */
 	ChPart	   *part;			/* NULL: none */
@@ -539,6 +553,8 @@ ch_parallel_units(PG_FUNCTION_ARGS)
 static bool claim_one_unit(ChScanDesc scan);
 static void refresh_filter(ChScanDesc scan);
 static void skip_granules(ChScanDesc scan);
+static int64 bound_cut(ChScanDesc scan);
+static void note_bound(ChScanDesc scan, int64 n);
 
 /* Takes the next unit the scan's unit check keeps, passing over the others: false at the end */
 static bool
@@ -578,6 +594,70 @@ own_listing(ChScanDesc scan)
 	ch_listing_pin(scan->listing);
 }
 
+/*
+ * VC42: whether the scan's units are claimed part by part -- a parallel scan
+ * of a few parts, its units cut by parts (setup_units()), its participant not
+ * a device's sole claimer (VC35, which takes a part's units at once)
+ */
+static bool
+affine_claims(ChScanDesc scan)
+{
+	return ch_parallel_part_affinity && scan->unit_start != NULL && scan->nparts > 1 &&
+		scan->nparts <= CH_AFFINE_PARTS && !scan->claim_alone;
+}
+
+/*
+ * VC42: the next unit of the participant's part, the part's own counter's;
+ * its part out, the part with the most units left -- false where none is.
+ * A participant's first part is the one holding the unit at its place among
+ * the participants, spread over the units as the parts' sizes are
+ */
+static bool
+claim_affine(ChScanDesc scan, uint32 *u)
+{
+	ChParallelScan *ps = (ChParallelScan *) scan->base.rs_parallel;
+
+	if (scan->home_part < 0)
+	{
+		uint32		slot = (uint32) (ParallelWorkerNumber + 1);
+		uint32		at = (uint32) (((uint64) slot * 2654435761u) % Max(scan->nunits, 1));
+		int			p = 0;
+
+		while (p + 1 < scan->nparts && scan->unit_start[p + 1] <= at)
+			p++;
+		scan->home_part = p;
+	}
+	for (;;)
+	{
+		int			p = scan->home_part;
+		uint32		n = scan->unit_start[p + 1] - scan->unit_start[p];
+		uint32		k = pg_atomic_fetch_add_u32(&ps->part_next[p], 1);
+		int			best = -1;
+		uint32		most = 0;
+
+		if (k < n)
+		{
+			*u = scan->unit_start[p] + k;
+			return true;
+		}
+		/* the part is out: the one with the most left */
+		for (int q = 0; q < scan->nparts; q++)
+		{
+			uint32		taken = pg_atomic_read_u32(&ps->part_next[q]);
+			uint32		units = scan->unit_start[q + 1] - scan->unit_start[q];
+
+			if (taken < units && units - taken > most)
+			{
+				most = units - taken;
+				best = q;
+			}
+		}
+		if (best < 0)
+			return false;
+		scan->home_part = best;
+	}
+}
+
 static bool
 claim_one_unit(ChScanDesc scan)
 {
@@ -586,7 +666,12 @@ claim_one_unit(ChScanDesc scan)
 
 	Assert(scan->part == NULL);
 	own_listing(scan);
-	if (scan->base.rs_parallel)
+	if (scan->base.rs_parallel && affine_claims(scan))
+	{
+		if (!claim_affine(scan, &u))
+			return false;
+	}
+	else if (scan->base.rs_parallel)
 	{
 		ChParallelScan *ps = (ChParallelScan *) scan->base.rs_parallel;
 
@@ -872,6 +957,22 @@ next_batch(ChScanDesc scan)
 		{
 			uint32		n;
 
+			/*
+			 * VC43: the bound moved since the unit's granules were checked:
+			 * those it now leaves, of the reader's not begun, passed over
+			 */
+			if (scan->bound_moved && scan->granule_check != NULL && eng->read_restrict != NULL)
+			{
+				scan->bound_moved = false;
+				if (bound_cut(scan) > 0)
+				{
+					uint64		dropped = 0;
+
+					CH_CALL(reading(scan), eng->read_restrict(scan->reader, scan->ranges, scan->nranges, &dropped,
+															 CH_ERR));
+					note_bound(scan, (int64) dropped);
+				}
+			}
 			CH_CALL(reading(scan), eng->read_next(scan->reader, &n, CH_ERR));
 			if (n > 0)
 			{
@@ -928,6 +1029,12 @@ next_batch(ChScanDesc scan)
 		select_unit(scan);
 		/* F7: a CPU's batches of the unit, the granules the caller passes over left out */
 		skip_granules(scan);
+		/* VC43: and those a running bound leaves no row of */
+		if (scan->granule_check != NULL)
+		{
+			scan->bound_moved = false;
+			note_bound(scan, bound_cut(scan));
+		}
 		if (scan->unit_rows == 0)
 		{
 			release_unit(scan);
@@ -1137,6 +1244,7 @@ ch_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKeyData *key,
 	scan->base.rs_key = key;
 	scan->base.rs_flags = flags;
 	scan->base.rs_parallel = pscan;
+	scan->home_part = -1;		/* VC42 */
 
 	if (ch_is_external_rel(rel, NULL) && !ch_is_own_rel(rel))
 	{
@@ -1248,6 +1356,7 @@ ch_scan_rescan(TableScanDesc sscan, ScanKeyData *key, bool set_params,
 
 	release_unit(scan);
 	scan->next_unit = 0;
+	scan->home_part = -1;
 	scan->one_unit = false;
 	scan->position = 0;
 	scan->block_end = 0;
@@ -1339,6 +1448,8 @@ ch_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 	ps->base.phs_locator = rel->rd_locator;
 	ps->base.phs_syncscan = false;
 	pg_atomic_init_u32(&ps->next_unit, 0);
+	for (int i = 0; i < CH_AFFINE_PARTS; i++)
+		pg_atomic_init_u32(&ps->part_next[i], 0);
 	ps->listing_size = (uint32) size;
 	if (size > 0)
 		memcpy(ps->listing, bytes, size);
@@ -1351,6 +1462,8 @@ ch_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 	ChParallelScan *ps = (ChParallelScan *) pscan;
 
 	pg_atomic_write_u32(&ps->next_unit, 0);
+	for (int i = 0; i < CH_AFFINE_PARTS; i++)
+		pg_atomic_write_u32(&ps->part_next[i], 0);
 }
 
 /* ---- what ChScan and vexec's source ask of a scan (scan.h) ---- */
@@ -1728,6 +1841,107 @@ skip_granules(ChScanDesc scan)
 		scan->counts.marks_read -= passed;
 	}
 	pfree(out);
+}
+
+void
+ch_scan_set_granule_check(TableScanDesc sscan, ChGranuleCheck check, void *arg)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	scan->granule_check = check;
+	scan->granule_check_arg = arg;
+	scan->bound_moved = true;
+}
+
+void
+ch_scan_bound_moved(TableScanDesc sscan)
+{
+	ChScanDesc	scan = (ChScanDesc) sscan;
+
+	scan->bound_moved = true;
+}
+
+/* VC43: granules a running bound passed over, of those the filter kept */
+static void
+note_bound(ChScanDesc scan, int64 n)
+{
+	if (n <= 0)
+		return;
+	scan->counts.marks_bound += n;
+	scan->counts.marks_read -= n;
+	ch_bound_granules_passed += (uint64) n;
+}
+
+/*
+ * VC43 (pg_accel's §3.38, F25): the claimed unit's ranges less the granules
+ * the granule check finds the running bound leaves no row of -- the rows left
+ * none where no granule is left -- and how many it took out
+ */
+static int64
+bound_cut(ChScanDesc scan)
+{
+	uint32		begin;
+	uint32		end;
+	chte_mark_range whole;
+	const chte_mark_range *from;
+	size_t		nfrom;
+	uint64	   *keep;
+	chte_mark_range *out;
+	size_t		nout = 0;
+	int64		cut = 0;
+
+	if (scan->part == NULL || scan->part->listing != NULL || scan->unit_rows == 0 || scan->part->marks <= 0)
+		return 0;
+	begin = scan->unit_begin;
+	end = scan->unit_end ? scan->unit_end : (uint32) scan->part->marks;
+	if (begin >= end)
+		return 0;
+	keep = palloc(sizeof(uint64) * ((end - begin + 63) / 64));
+	if (!scan->granule_check(scan->granule_check_arg, scan->part, begin, end, keep))
+	{
+		pfree(keep);
+		return 0;
+	}
+	whole.begin = begin;
+	whole.end = end;
+	from = scan->nranges > 0 ? scan->ranges : &whole;
+	nfrom = scan->nranges > 0 ? scan->nranges : 1;
+	/* at most a range for each granule kept, in a copy: the ranges are rewritten in place */
+	out = palloc(sizeof(chte_mark_range) * Max(end - begin, 1));
+	for (size_t i = 0; i < nfrom; i++)
+		for (uint32 m = from[i].begin; m < from[i].end; m++)
+		{
+			if (!(keep[(m - begin) / 64] & (UINT64CONST(1) << ((m - begin) % 64))))
+			{
+				cut++;
+				continue;
+			}
+			if (nout > 0 && out[nout - 1].end == m)
+				out[nout - 1].end = m + 1;
+			else
+			{
+				out[nout].begin = m;
+				out[nout].end = m + 1;
+				nout++;
+			}
+		}
+	if (cut > 0)
+	{
+		if (nout > scan->ranges_cap)
+		{
+			scan->ranges = scan->ranges ? repalloc(scan->ranges, sizeof(chte_mark_range) * nout) :
+				MemoryContextAlloc(scan->scan_cxt, sizeof(chte_mark_range) * nout);
+			scan->ranges_cap = nout;
+		}
+		if (nout > 0)
+			memcpy(scan->ranges, out, sizeof(chte_mark_range) * nout);
+		scan->nranges = nout;
+		if (nout == 0)
+			scan->unit_rows = 0;
+	}
+	pfree(out);
+	pfree(keep);
+	return cut;
 }
 
 bool

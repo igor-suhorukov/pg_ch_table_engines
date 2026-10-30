@@ -14,6 +14,14 @@ SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 4;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a) FROM sc;
 SELECT count(*), sum(a), sum(length(b)) FROM sc;
+-- VC42 (pg_accel's §3.38): on, each participant claims the units of a part of
+-- its own first, then of the part with the most left; off, the default, every
+-- participant the next unit of all: every row read once either way
+SELECT count(*), sum(a), sum(length(b)) FROM sc WHERE a % 3 <> 1;
+SET ch.parallel_part_affinity = on;
+SELECT count(*), sum(a), sum(length(b)) FROM sc;
+SELECT count(*), sum(a), sum(length(b)) FROM sc WHERE a % 3 <> 1;
+RESET ch.parallel_part_affinity;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;

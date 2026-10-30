@@ -218,6 +218,18 @@ ch_point_bytes_left(PG_FUNCTION_ARGS)
  * from the process's mark cache; NULL where the engine library predates the
  * count.
  */
+PG_FUNCTION_INFO_V1(ch_granules_bound);
+/*
+ * The granules a running bound passed over in the session's process
+ * (pg_accel's §3.38, VC43 and F25), for the tests that check a bounded scan
+ * reads past none of them.
+ */
+Datum
+ch_granules_bound(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) ch_bound_granules_passed);
+}
+
 PG_FUNCTION_INFO_V1(ch_marks_loaded);
 Datum
 ch_marks_loaded(PG_FUNCTION_ARGS)

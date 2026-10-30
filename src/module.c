@@ -34,6 +34,9 @@ bool		ch_enable_memory_parts = true;
 bool		ch_enable_fetch_cache = true;
 bool		ch_enable_point_reads = true;
 bool		ch_enable_scan_marks = true;
+bool		ch_enable_skip_indexes = true;
+bool		ch_parallel_part_affinity = false;
+uint64		ch_bound_granules_passed = 0;
 bool		ch_enable_part_summaries = true;
 bool		ch_enable_summary_pruning = true;
 double		ch_fetch_cost = 55.0;
@@ -361,6 +364,36 @@ _PG_init(void)
 							 "readers, which then find them there, each part's marks decompressed once in the "
 							 "process; off, each reader -- a run's, a step's -- decompresses them itself.",
 							 &ch_enable_scan_marks,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * VC43 (pg_accel's §3.38, F25): a mergetree table's min/max skip indexes
+	 * -- every numeric and temporal column's, made by default -- read where a
+	 * scan's granules are chosen, by its quals and by a running bound
+	 */
+	/*
+	 * VC42 (pg_accel's §3.38): a parallel scan's participants each claim the
+	 * units of a part of their own first -- off by default: at 100M rows Q1
+	 * and Q7 gained 6 to 10%, the scans of URL and Title lost 5 to 15%, the
+	 * participants following the units left, not the work left
+	 */
+	DefineCustomBoolVariable("ch.parallel_part_affinity",
+							 "Whether a parallel scan's participants claim the units of a part of their own first.",
+							 "On, each participant claims its part's units until it runs out, then the part with "
+							 "the most left, so that each of a query's processes loads, attaches and reads the "
+							 "marks of a few parts; off, every participant the next unit of all, every part's.",
+							 &ch_parallel_part_affinity,
+							 false,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("ch.enable_skip_indexes",
+							 "Whether a scan chooses a mergetree part's granules by its min/max skip indexes too.",
+							 "On, a scan's quals and a running bound vexec's sort gives it pass over the granules "
+							 "whose least and greatest values leave them no row, after the primary key; off, by "
+							 "the primary key alone, as before.  The indexes are made either way.",
+							 &ch_enable_skip_indexes,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

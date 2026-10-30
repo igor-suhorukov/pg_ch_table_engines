@@ -8,6 +8,7 @@
 #include <Common/Exception.h>
 #include <Compression/CompressionFactory.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/StoragePolicy.h>
 #include <Interpreters/ExpressionActions.h>
@@ -31,11 +32,16 @@
 
 #include <base/scope_guard.h>
 
+#include <algorithm>
 #include <atomic>
 
 namespace DB::MergeTreeSetting
 {
     extern const MergeTreeSettingsString auto_statistics_types;
+    extern const MergeTreeSettingsBool add_minmax_index_for_numeric_columns;
+    extern const MergeTreeSettingsBool add_minmax_index_for_string_columns;
+    extern const MergeTreeSettingsBool add_minmax_index_for_temporal_columns;
+    extern const MergeTreeSettingsBool escape_index_filenames;
 }
 
 namespace DB::ErrorCodes
@@ -261,6 +267,12 @@ MergeTreeData::MutableDataPartPtr PgMergeTree::loadPart(const String & part_name
     loading_part_of = this;
     SCOPE_EXIT({ loading_part_of = nullptr; });
     part->loadColumnsChecksumsIndexes(/* require_columns_checksums= */ true, /* check_consistency= */ false);
+    /// VC43: the part's packed skip indexes' archive (skp_idx.packed) probed now, inside the statement: the part's
+    /// destruction clears its indexes' cache entries (IMergeTreeDataPart::clearCaches()), which looks into the
+    /// archive, and on the pages store a read there is a read of the relation, which a table closed as its
+    /// transaction commits may no longer make.  A skip index's file name has existsFile() probe the archive, once a
+    /// part (DataPartStorageOnDiskBase::getArchiveReaderForFile())
+    (void) part->getDataPartStorage().existsFile("skp_idx_chte_probe.idx2");
     part->setState(DataPartState::Active);
     parts_loaded.fetch_add(1, std::memory_order_relaxed);
     return part;
@@ -446,9 +458,77 @@ std::unique_ptr<MergeTreeSettings> loadSettings(ContextMutablePtr context, ASTSt
     return settings;
 }
 
+/// VC43: whether a column is of the table's sorting or primary key, which the extension keeps Nullable
+/// whatever its NOT NULL (its stored_plain(), ch_table_engines.md §8 item 10)
+bool keyColumn(const StorageInMemoryMetadata & m, const String & name)
+{
+    for (const KeyDescription * key : {&m.sorting_key, &m.primary_key})
+    {
+        if (std::find(key->column_names.begin(), key->column_names.end(), name) != key->column_names.end())
+            return true;
+        if (key->expression)
+        {
+            const auto required = key->expression->getRequiredColumns();
+            if (std::find(required.begin(), required.end(), name) != required.end())
+                return true;
+        }
+    }
+    return false;
+}
+
+/// VC43: the columns a column's implicit index is analyzed over: the column alone, where ClickHouse's
+/// analysis of the table's every column for each index made the open's description of them quadratic
+/// in the columns; an ALIAS column's expression over the table's
+ColumnsDescription columnsOfIndex(const StorageInMemoryMetadata & m, const ColumnDescription & column)
+{
+    if (column.default_desc.kind == ColumnDefaultKind::Alias)
+        return m.columns;
+    ColumnsDescription alone;
+    alone.add(column);
+    return alone;
+}
+
+/// VC43: a column's implicit min/max skip index, as registerStorageMergeTree.cpp:975-1017 at the tag adds
+/// it (StorageInMemoryMetadata::addImplicitIndicesForColumn), where no declared min/max index is of the
+/// column; and a key column's, Nullable, which ClickHouse makes none of, as its type without Nullable
+/// would have it -- ClickHouse's own table of the same NOT NULL key has it -- the index the column's
+/// own, Nullable: a granule's NULL leaves its greatest value not known
+std::optional<IndexDescription> implicitIndexOf(const StorageInMemoryMetadata & m, const ColumnDescription & column,
+                                                ContextPtr context)
+{
+    for (const auto & index : m.secondary_indices)
+        if (index.type == "minmax" && !index.column_names.empty() && index.column_names.front() == column.name)
+            return {};
+    StorageInMemoryMetadata one;
+    one.columns = columnsOfIndex(m, column);
+    one.add_minmax_index_for_numeric_columns = m.add_minmax_index_for_numeric_columns;
+    one.add_minmax_index_for_string_columns = m.add_minmax_index_for_string_columns;
+    one.add_minmax_index_for_temporal_columns = m.add_minmax_index_for_temporal_columns;
+    one.escape_index_filenames = m.escape_index_filenames;
+    /// the decision by the type it is handed, the index over the column's own (one.columns)
+    if (column.type->isNullable() && keyColumn(m, column.name))
+    {
+        ColumnDescription plain = column;
+        plain.type = removeNullable(column.type);
+        one.addImplicitIndicesForColumn(plain, context);
+    }
+    else
+        one.addImplicitIndicesForColumn(column, context);
+    if (one.secondary_indices.empty())
+        return {};
+    return std::move(one.secondary_indices.front());
+}
+
+bool implicitIndexesAsked(const StorageInMemoryMetadata & m)
+{
+    return m.add_minmax_index_for_numeric_columns || m.add_minmax_index_for_string_columns ||
+        m.add_minmax_index_for_temporal_columns;
+}
+
 /// The table of a definition's columns and keys, in either open: its settings -- storage_def's, loaded --
 /// its columns' statistics, where the columns do not carry them yet, and the storage; its projections
-/// described as first needed (describeProjections)
+/// and its implicit min/max skip indexes described as first needed (describeProjections,
+/// describeImplicitIndexes)
 chte_table * makeTable(const chte_table_def * def, ContextMutablePtr context, StorageInMemoryMetadata & metadata,
                        ASTStorage & storage_def, const MergeTreeData::MergingParams & merging, ASTPtr projections,
                        std::unique_ptr<MergeTreeSettings> settings, bool with_statistics)
@@ -465,6 +545,21 @@ chte_table * makeTable(const chte_table_def * def, ContextMutablePtr context, St
     if (statisticsNeedFunctions(metadata.columns))
         registerAllFunctions();
 
+    /// VC43 (pg_accel's §3.38): the implicit min/max skip indexes of the columns the settings name, as
+    /// registerStorageMergeTree.cpp:975-1017 at the tag adds them -- each granule's least and greatest
+    /// value, written with a part or its merge, which a scan's granules are chosen by.  A Nullable column
+    /// has none, as ClickHouse makes none (StorageInMemoryMetadata::addImplicitIndicesForColumn), but a
+    /// key column, Nullable here whatever its NOT NULL, has its type's (implicitIndexOf).  Described where
+    /// an insert, a merge or a rewrite first needs them (describeImplicitIndexes), a scan's columns' as it
+    /// names them (implicitIndex), not at every open.
+    metadata.add_minmax_index_for_numeric_columns = (*settings)[MergeTreeSetting::add_minmax_index_for_numeric_columns];
+    metadata.add_minmax_index_for_string_columns = (*settings)[MergeTreeSetting::add_minmax_index_for_string_columns];
+    metadata.add_minmax_index_for_temporal_columns = (*settings)[MergeTreeSetting::add_minmax_index_for_temporal_columns];
+    metadata.escape_index_filenames = (*settings)[MergeTreeSetting::escape_index_filenames];
+    for (auto & index : metadata.secondary_indices)
+        if (index.name.starts_with(IMPLICITLY_ADDED_MINMAX_INDEX_PREFIX))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "index {} uses a reserved index name", index.name);
+
     StorageID id("chte", def->name && *def->name ? def->name : "table");
     std::shared_ptr<PagesDisk> pages_disk;
     if (def->pages)
@@ -474,7 +569,7 @@ chte_table * makeTable(const chte_table_def * def, ContextMutablePtr context, St
                                                  std::move(pages_disk));
     StorageMetadataHandle handle = storage->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ true);
     StorageMetadataPtr snapshot = handle;
-    auto * table = new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}, {}, {}, {}};
+    auto * table = new chte_table{storage, snapshot, context, {}, {}, {}, {}, {}, {}, {}, {}, {}, false, {}};
     if (projections && !projections->children.empty())
         table->projections = projections;
     return table;
@@ -797,6 +892,50 @@ void chte::describeProjections(chte_table & table)
     table.projections = nullptr;
 }
 
+void chte::describeImplicitIndexes(chte_table & table)
+{
+    if (table.implicit_indexes || !table.storage || !table.metadata)
+        return;
+    table.implicit_indexes = true;
+    const auto & m = *table.metadata;
+    if (!implicitIndexesAsked(m))
+        return;
+    /// VC43: each column's, in the columns' order as ClickHouse adds them -- one a scan described before
+    /// taken as it is
+    auto copy = std::make_shared<StorageInMemoryMetadata>(m);
+    for (const auto & column : m.columns)
+    {
+        auto it = table.column_indexes.find(column.name);
+        auto index = it != table.column_indexes.end() ? it->second : implicitIndexOf(m, column, table.context);
+        if (index)
+            copy->secondary_indices.push_back(std::move(*index));
+    }
+    table.storage->setInMemoryMetadata(*copy);
+    StorageMetadataHandle handle = table.storage->getInMemoryMetadataPtr(table.context, /* bypass_metadata_cache= */ true);
+    table.metadata = handle;
+}
+
+const IndexDescription * chte::implicitIndex(chte_table & table, const String & column)
+{
+    if (!table.metadata)
+        return nullptr;
+    const auto & m = *table.metadata;
+    if (table.implicit_indexes)
+    {
+        for (const auto & index : m.secondary_indices)
+            if (index.isImplicitlyCreated() && index.name == IMPLICITLY_ADDED_MINMAX_INDEX_PREFIX + column)
+                return &index;
+        return nullptr;
+    }
+    if (!implicitIndexesAsked(m))
+        return nullptr;
+    auto [it, inserted] = table.column_indexes.try_emplace(column);
+    if (inserted)
+        if (const auto * description = m.columns.tryGet(column))
+            it->second = implicitIndexOf(m, *description, table.context);
+    return it->second ? &*it->second : nullptr;
+}
+
 namespace
 {
 
@@ -805,6 +944,7 @@ namespace
 /// as its metadata and as its storage has them, its engine's parameters, and its projections described
 String describeTable(chte_table & table)
 {
+    describeImplicitIndexes(table);
     describeProjections(table);
     const auto & m = *table.metadata;
     WriteBufferFromOwnString out;

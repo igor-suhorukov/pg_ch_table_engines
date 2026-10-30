@@ -178,6 +178,8 @@ extern "C" int chte_write_begin(chte_table * table, uint64_t block_number, chte_
         /// block 0: numbered by chte_write_block before chte_write_finish (VC18)
         /// a part's writing -- its sort, statistics and projections -- looks up functions of its own
         registerAllFunctions();
+        /// VC43: the part's implicit min/max skip indexes written with it
+        describeImplicitIndexes(*table);
         /// VC21: a part's projections written with it
         describeProjections(*table);
         auto w = std::make_unique<chte_writer>();
@@ -634,6 +636,7 @@ void chte_reader::noteGranule(size_t rows)
 {
     batch_granule = -1;
     batch_granule_last = false;
+    at_granule_start = false;
     if (!run_mark || rows == 0)
         return;
     if (rows > run_mark_left)
@@ -644,6 +647,7 @@ void chte_reader::noteGranule(size_t rows)
     batch_granule = static_cast<int64_t>(*run_mark);
     run_mark_left -= rows;
     batch_granule_last = run_mark_left == 0;
+    at_granule_start = batch_granule_last;
     if (batch_granule_last)
     {
         ++*run_mark;
@@ -671,6 +675,7 @@ bool chte_reader::pull(Block & block)
         executor.reset();
         /// F7: the run's first granule, its rows
         run_mark.reset();
+        at_granule_start = false;
         if (granularity)
         {
             size_t first = runs[next_run] ? runs[next_run]->front().begin : 0;
@@ -679,6 +684,8 @@ bool chte_reader::pull(Block & block)
             {
                 run_mark = first;
                 run_mark_left = granularity->getMarkRows(first);
+                run_end = runs[next_run] ? runs[next_run]->back().end : granularity->getMarksCountWithoutFinal();
+                at_granule_start = true;
             }
         }
         pipeline = QueryPipeline(open_run(std::move(runs[next_run++])));
@@ -1152,6 +1159,109 @@ extern "C" int chte_read_next(chte_reader * reader, uint32_t * nrows, chte_error
     });
 }
 
+namespace
+{
+
+/// VC43: the granules of `rest` within `keep`, both ascending, and those of `rest` outside them
+MarkRanges keptOf(const MarkRanges & rest, const chte_mark_range * keep, size_t nkeep, size_t & dropped)
+{
+    MarkRanges out;
+    size_t j = 0;
+    dropped = 0;
+    for (const auto & range : rest)
+    {
+        size_t kept = 0;
+        while (j < nkeep && keep[j].end <= range.begin)
+            ++j;
+        for (size_t i = j; i < nkeep && keep[i].begin < range.end; ++i)
+        {
+            size_t b = std::max<size_t>(range.begin, keep[i].begin);
+            size_t e = std::min<size_t>(range.end, keep[i].end);
+            if (b >= e)
+                continue;
+            if (!out.empty() && out.back().end == b)
+                out.back().end = e;
+            else
+                out.push_back(MarkRange(b, e));
+            kept += e - b;
+        }
+        dropped += range.end - range.begin - kept;
+    }
+    return out;
+}
+
+}
+
+/// VC43 (pg_accel's §3.38, F25): of the granules a reader has not begun, those outside `ranges` passed over -- a
+/// reader in steps from its next granule, its steps' streams sought at the next it reads (readStep); a reader of
+/// runs from its next run, the run it reads read to its end; an external table's reader none.
+extern "C" int chte_read_restrict(chte_reader * reader, const chte_mark_range * ranges, size_t nranges, uint64_t * dropped,
+                                  chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        *dropped = 0;
+        if (reader->next_block)
+            return;
+        size_t n = 0;
+        if (!reader->steps.empty())
+        {
+            MarkRanges rest;
+            for (size_t i = reader->range_at; i < reader->step_ranges.size(); ++i)
+            {
+                size_t b = i == reader->range_at ? std::max<size_t>(reader->mark_at, reader->step_ranges[i].begin)
+                                                 : reader->step_ranges[i].begin;
+                if (b < reader->step_ranges[i].end)
+                    rest.push_back(MarkRange(b, reader->step_ranges[i].end));
+            }
+            MarkRanges kept = keptOf(rest, ranges, nranges, n);
+            if (n == 0)
+                return;
+            reader->step_ranges = std::move(kept);
+            reader->range_at = 0;
+            reader->mark_at = reader->step_ranges.empty() ? 0 : reader->step_ranges.front().begin;
+            *dropped = n;
+            return;
+        }
+        /// the run being read, from the granule its next block begins, where it stands at one -- a
+        /// granule's rows come in one block or more -- and the runs not begun
+        MarkRanges current;
+        if (reader->executor && reader->run_mark && reader->at_granule_start && *reader->run_mark < reader->run_end)
+            current.push_back(MarkRange(*reader->run_mark, reader->run_end));
+        MarkRanges later;
+        for (size_t i = reader->next_run; i < reader->runs.size(); ++i)
+        {
+            if (!reader->runs[i])
+                return;			/* a whole part's one run, never cut */
+            for (const auto & range : *reader->runs[i])
+                later.push_back(range);
+        }
+        size_t n_current = 0;
+        MarkRanges kept_current = keptOf(current, ranges, nranges, n_current);
+        MarkRanges kept_later = keptOf(later, ranges, nranges, n);
+        if (n_current == 0 && n == 0)
+            return;
+        reader->runs.resize(reader->next_run);
+        if (n_current > 0)
+        {
+            /// the run's source let go at the granule's start, its kept granules read as runs of their own
+            reader->executor.reset();
+            reader->pipeline = QueryPipeline();
+            reader->run_mark.reset();
+            reader->at_granule_start = false;
+            reader->runs.clear();
+            reader->next_run = 0;
+            for (auto & run : markRuns(std::optional<MarkRanges>(kept_current)))
+                if (run && !run->empty())
+                    reader->runs.push_back(std::move(run));
+        }
+        for (auto & run : markRuns(std::optional<MarkRanges>(kept_later)))
+            if (run && !run->empty())
+                reader->runs.push_back(std::move(run));
+        *dropped = n_current + n;
+    });
+}
+
 extern "C" void chte_read_granule(chte_reader * reader, int64_t * granule, int32_t * last)
 {
     *granule = reader->batch_granule;
@@ -1259,6 +1369,8 @@ extern "C" int chte_merge(chte_table * table, const char * const * part_names, s
         /// a merge's algorithms -- a summing engine's sums, an aggregating one's states -- and its
         /// projections look up functions and aggregate functions by name
         registerAllFunctions();
+        /// VC43: the part's implicit min/max skip indexes written with it
+        describeImplicitIndexes(*table);
         /// VC21: the merged part's projections made with it, the inputs' loaded
         describeProjections(*table);
         auto & storage = *table->storage;

@@ -155,6 +155,11 @@ typedef struct ChEngine
 	/* optional (pg_accel's §3.38 VC41): a scan's readers' marks warmed first, and the marks files decompressed */
 	void		(*set_scan_marks) (int);
 	uint64_t	(*marks_loaded) (void);
+	/* optional (pg_accel's §3.38 VC43, F25): granules by min/max skip indexes, and a reader's not begun cut */
+	void		(*set_skip_indexes) (int);
+	int			(*part_granule_bounds) (chte_table *, const char *, const char *, int, uint32_t, uint32_t,
+										chte_vector *, uint8_t *, int *, chte_error *);
+	int			(*read_restrict) (chte_reader *, const chte_mark_range *, size_t, uint64_t *, chte_error *);
 } ChEngine;
 
 /* GUCs */

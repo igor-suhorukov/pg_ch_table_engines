@@ -619,6 +619,28 @@ CHTE_API void		chte_set_scan_marks(int on);
 CHTE_API uint64_t	chte_marks_loaded(void);
 
 /*
+ * VC43 (pg_accel's §3.38, F25): a table's min/max skip indexes -- ClickHouse's implicit ones, of every
+ * numeric and temporal column where the table's settings ask for them (add_minmax_index_for_*), or
+ * declared -- read.  chte_set_skip_indexes: whether a filter (chte_filter_create) narrows a part's
+ * granules by them, after the primary key -- on, the default; off, by the primary key alone, as
+ * before.  chte_part_granule_bounds: column's least value (direction 1) or greatest (-1) in each
+ * granule [begin, end) of a part (end 0: its last), by its min/max index of that column alone:
+ * values holds end - begin values of the column's own type, valid until the next call on the
+ * table, known[i] 1 where granule begin + i's is known -- the caller's array, end - begin bytes;
+ * found 0 where the table has no such index or the part was written without its file.
+ * chte_read_restrict: of the granules a reader has not begun, those outside ranges -- in order --
+ * passed over, and how many: a reader in steps from its next granule, a reader of runs from its
+ * next run, the run it reads read to its end; an external table's file's none.  Optional: a
+ * library built before them lacks them.
+ */
+CHTE_API void		chte_set_skip_indexes(int on);
+CHTE_API int			chte_part_granule_bounds(chte_table *table, const char *part_name, const char *column,
+									 int direction, uint32_t begin, uint32_t end, chte_vector *values,
+									 uint8_t *known, int *found, chte_error *error);
+CHTE_API int			chte_read_restrict(chte_reader *reader, const chte_mark_range *ranges, size_t nranges,
+							   uint64_t *dropped, chte_error *error);
+
+/*
  * A part written again without the rows whose _pg_rowid are dead[0 .. n),
  * ascending -- deletions every snapshot sees, folded into it -- as a new part
  * named as a mutation of it, block_number its version (all_<min>_<max>_<level>_<block_number>),

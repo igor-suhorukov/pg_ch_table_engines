@@ -3,8 +3,11 @@
  * ActionsDAG of ClickHouse's own functions, prunes a part whole by its statistics and its
  * granules by the primary key (KeyCondition and MergeTreeDataSelectExecutor::
  * markRangesFromPKRange), as ClickHouse's ReadFromPart does with a filter
- * (MergeTreeSequentialSource.cpp:446-470); a part's column sizes and its statistics, for
- * the caller's estimates and aggregates.
+ * (MergeTreeSequentialSource.cpp:446-470), then by the table's min/max skip indexes (VC43:
+ * MergeTreeDataSelectExecutor::filterMarksUsingIndex, as MergeTreeIndexReadResultPool.cpp:170-196
+ * applies them); a part's column sizes and its statistics, for the caller's estimates and
+ * aggregates; and a column's least or greatest value in each granule, by its min/max index, for
+ * a running bound (VC43, pg_accel's §3.38 F25).
  *
  * The statistics are checked as ClickHouse's StatisticsPartPruner checks them -- a
  * KeyCondition over the columns that have them, against a hyperrectangle of each
@@ -25,6 +28,8 @@
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Storages/MergeTree/KeyCondition.h>
+#include <Storages/MergeTree/MergeTreeIOSettings.h>
+#include <Storages/MergeTree/MergeTreeIndexMinMax.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Interpreters/ExpressionActions.h>
@@ -265,6 +270,41 @@ bool statisticsCanMatch(chte_filter & filter, const Estimates & estimates)
     return false;
 }
 
+/// VC43: whether a part's statistics, their estimates, leave the filter true of every row -- no granule of the
+/// part then excluded by a min/max index either: each granule's range lies within the part's
+bool statisticsAlwaysTrue(chte_filter & filter, const Estimates & estimates)
+{
+    if (!filter.stats_condition)
+        return false;
+    std::vector<std::vector<Range>> boxes;
+    DataTypes types;
+    size_t combinations = 1;
+    for (const auto & [name, type] : filter.stats_columns)
+    {
+        boxes.push_back(columnBoxes(estimates, name, type));
+        types.push_back(type);
+        if (boxes.back().empty())
+            return true;			/* no rows at all */
+        combinations *= boxes.back().size();
+    }
+    if (combinations > 64)
+        return false;
+    Hyperrectangle rectangle;
+    for (size_t k = 0; k < combinations; ++k)
+    {
+        size_t rest = k;
+        rectangle.clear();
+        for (const auto & column : boxes)
+        {
+            rectangle.push_back(column[rest % column.size()]);
+            rest /= column.size();
+        }
+        if (filter.stats_condition->checkInHyperrectangle(rectangle, types).can_be_false)
+            return false;
+    }
+    return true;
+}
+
 /// The granules of a part the filter keeps, worked out once per part.
 const MarkRanges & selectedRanges(chte_filter & filter, const MergeTreeData::DataPartPtr & part)
 {
@@ -273,8 +313,15 @@ const MarkRanges & selectedRanges(chte_filter & filter, const MergeTreeData::Dat
         return it->second;
 
     MarkRanges ranges{MarkRange(0, part->index_granularity->getMarksCountWithoutFinal())};
-    bool pruned = filter.stats_condition
-        && !statisticsCanMatch(filter, filter.table->storage->partEstimates(part, filter.stats_columns.getNames()));
+    bool pruned = false;
+    bool always_true = false;
+    if (filter.stats_condition)
+    {
+        const auto & estimates = filter.table->storage->partEstimates(part, filter.stats_columns.getNames());
+        pruned = !statisticsCanMatch(filter, estimates);
+        /// VC43: the indexes left unread where the part's statistics leave the filter true of every row
+        always_true = !pruned && !filter.skip_indexes.empty() && statisticsAlwaysTrue(filter, estimates);
+    }
     if (!pruned && filter.key_condition)
     {
         if (filter.key_condition->alwaysFalse())
@@ -284,6 +331,24 @@ const MarkRanges & selectedRanges(chte_filter & filter, const MergeTreeData::Dat
                 RangesInDataPart(part), filter.table->metadata, *filter.key_condition, /* part_offset_condition= */ nullptr,
                 /* total_offset_condition= */ nullptr, /* exact_ranges= */ nullptr, /* pk_to_minmax_slot= */ nullptr,
                 filter.table->context->getSettingsRef(), getLogger("chte"));
+    }
+    /// VC43: each min/max skip index's granules the filter keeps of those; a part written before the
+    /// table had the index has no file of it, and keeps them all (filterMarksUsingIndex)
+    if (!pruned && !always_true && !ranges.empty() && !filter.skip_indexes.empty())
+    {
+        auto reader_settings = MergeTreeReaderSettings::createFromContext(filter.table->context);
+        auto mark_cache = filter.table->context->getMarkCache();
+        for (const auto & [helper, condition] : filter.skip_indexes)
+        {
+            MergeTreeDataSelectExecutor::PartialDisjunctionResult no_disjunctions;
+            ranges = MergeTreeDataSelectExecutor::filterMarksUsingIndex(
+                helper, condition, /* key_condition_rpn_template= */ {}, part, ranges, RangesInDataPartReadHints{},
+                reader_settings, mark_cache.get(), /* uncompressed_cache= */ nullptr,
+                /* vector_similarity_index_cache= */ nullptr, /* use_skip_indexes_for_disjunctions= */ false,
+                no_disjunctions, getLogger("chte")).first;
+            if (ranges.empty())
+                break;
+        }
     }
     if (pruned)
         ranges.clear();
@@ -353,6 +418,8 @@ enum : UInt8
 
 namespace chte
 {
+
+bool skip_indexes = true;
 
 const ActionsDAG::Node & buildFilter(ActionsDAG & dag, const chte_filter_node * nodes, size_t nnodes, ContextPtr context,
                                      const FilterColumns & columns)
@@ -500,6 +567,40 @@ extern "C" int chte_filter_create(chte_table * table, const chte_filter_node * n
             ActionsDAGWithInversionPushDown filter_dag(f->predicate, context, /* boolean_context= */ true);
             f->key_condition.emplace(filter_dag, context, table->metadata->getPrimaryKey());
         }
+        /// VC43: the min/max skip indexes it can narrow granules by, as MergeTreeIndexReadResultPool.cpp:
+        /// 170-182 at the tag chooses them -- the declared ones, and the implicit ones of the columns it
+        /// names, each described as first needed (chte::implicitIndex): another column's narrows nothing.
+        /// The primary key's first column's implicit one left out: a granule's range of it is the marks'
+        /// around the granule, which the key's condition reads already
+        if (skip_indexes)
+        {
+            const auto & key = table->metadata->getPrimaryKey().column_names;
+            auto first_key = [&](const IndexDescription & index)
+            {
+                return index.isImplicitlyCreated() && !key.empty() && index.column_names.size() == 1 &&
+                    index.column_names.front() == key.front();
+            };
+            std::vector<const IndexDescription *> indexes;
+            for (const auto & index : table->metadata->getSecondaryIndices())
+                if (index.type == "minmax" && !first_key(index))
+                    indexes.push_back(&index);
+            if (!table->implicit_indexes)
+                for (const auto & name : f->dag.getRequiredColumnsNames())
+                    if (const auto * index = implicitIndex(*table, name); index && !first_key(*index))
+                        indexes.push_back(index);
+            if (!indexes.empty())
+            {
+                f->index_dag.emplace(f->predicate, context, /* boolean_context= */ true);
+                if (f->index_dag->predicate)
+                    for (const auto * index : indexes)
+                    {
+                        auto helper = MergeTreeIndexFactory::instance().get(table->metadata, *index, *table->storage->getSettings());
+                        auto condition = helper->createIndexCondition(f->index_dag->predicate, context);
+                        if (condition && !condition->alwaysUnknownOrTrue())
+                            f->skip_indexes.emplace_back(std::move(helper), std::move(condition));
+                    }
+            }
+        }
         /// the columns the filter names that have statistics in the table's definition
         const auto & columns = table->metadata->getColumns();
         for (const auto & name : f->dag.getRequiredColumnsNames())
@@ -627,6 +728,7 @@ extern "C" int chte_filter_summary_select(chte_filter * filter, const char * par
     {
         /// as selectedRanges() decides, but for the granules the key keeps, which only the part's index tells
         *verdict = CHTE_SELECT_RANGES;
+        bool always_true = false;
         if (filter->key_condition && filter->key_condition->alwaysFalse())
         {
             *verdict = CHTE_SELECT_NONE;
@@ -645,8 +747,80 @@ extern "C" int chte_filter_summary_select(chte_filter * filter, const char * par
                 *verdict = CHTE_SELECT_NONE;
                 return;
             }
+            always_true = !filter->skip_indexes.empty() && statisticsAlwaysTrue(*filter, s->estimates);
         }
-        if (!filter->key_condition || filter->key_condition->alwaysUnknownOrTrue())
+        /// VC43: a min/max skip index the filter narrows by may leave granules out too -- but where the part's
+        /// statistics leave the filter true of every row, of none (VC29's whole part, loaded nowhere)
+        if ((!filter->key_condition || filter->key_condition->alwaysUnknownOrTrue()) &&
+            (filter->skip_indexes.empty() || always_true))
             *verdict = CHTE_SELECT_ALL;
+    });
+}
+
+extern "C" void chte_set_skip_indexes(int on)
+{
+    skip_indexes = on != 0;
+}
+
+extern "C" int chte_part_granule_bounds(chte_table * table, const char * part_name, const char * column, int direction,
+                                        uint32_t begin, uint32_t end, chte_vector * values, uint8_t * known, int * found,
+                                        chte_error * error)
+{
+    return guarded(error, [&]
+    {
+        *found = 0;
+        *values = {};
+        table->scratch.clear();
+        if (!table->storage || !column)
+            return;
+        /// the column's min/max skip index, declared or implicit, of the column alone
+        const IndexDescription * description = nullptr;
+        for (const auto & index : table->metadata->getSecondaryIndices())
+            if (index.type == "minmax" && index.column_names.size() == 1 && index.column_names.front() == column)
+            {
+                description = &index;
+                break;
+            }
+        if (!description)
+            description = implicitIndex(*table, column);
+        if (!description)
+            return;
+        auto part = table->storage->getPart(part_name);
+        size_t marks = part->index_granularity->getMarksCountWithoutFinal();
+        size_t last = end == 0 ? marks : std::min<size_t>(end, marks);
+        if (begin >= last)
+            return;
+        auto helper = MergeTreeIndexFactory::instance().get(table->metadata, *description, *table->storage->getSettings());
+        auto reader_settings = MergeTreeReaderSettings::createFromContext(table->context);
+        /// a part written before the table had the index has no file of it: none found
+        auto granules = MergeTreeDataSelectExecutor::getMinMaxIndexGranules(
+            part, helper, MarkRanges{MarkRange(begin, last)}, direction >= 0 ? 1 : -1, /* access_by_mark= */ false,
+            reader_settings, table->context->getMarkCache().get(), /* uncompressed_cache= */ nullptr,
+            /* vector_similarity_index_cache= */ nullptr);
+        if (!granules)
+            return;
+        DataTypePtr type = removeLowCardinalityAndNullable(table->metadata->getColumns().getPhysical(column).type);
+        auto out = type->createColumn();
+        out->reserve(last - begin);
+        std::memset(known, 0, last - begin);
+        size_t k = 0;
+        for (size_t m = begin; m < last; ++m)
+        {
+            while (k < granules->granules.size() && granules->granules[k].granule_num < m)
+                ++k;
+            const Field * value = k < granules->granules.size() && granules->granules[k].granule_num == m
+                ? &granules->granules[k].min_or_max_value : nullptr;
+            /// a granule's value NULL -- a Nullable column's index -- or not read is not known: kept
+            if (value && !value->isNull())
+            {
+                out->insert(*value);
+                known[m - begin] = 1;
+            }
+            else
+                out->insertDefault();
+        }
+        table->scratch.push_back(std::move(out));
+        *values = vectorOf(*table->scratch[0]);
+        *found = 1;
     });
 }

@@ -38,6 +38,8 @@ extern "C" int chte_rewrite_part(chte_table * table, const char * part_name, con
             if (dead[i] <= dead[i - 1])
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "chte_rewrite_part: row ids not ascending");
         registerAllFunctions();
+        /// VC43: the part's implicit min/max skip indexes written with it
+        describeImplicitIndexes(*table);
         /// VC21: the part's projections checked and written again
         describeProjections(*table);
         auto & storage = *table->storage;

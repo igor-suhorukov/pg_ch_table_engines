@@ -259,6 +259,12 @@ CREATE FUNCTION ch.point_bytes_left() RETURNS bigint
 CREATE FUNCTION ch.marks_loaded() RETURNS bigint
 	AS 'MODULE_PATHNAME', 'ch_marks_loaded' LANGUAGE C VOLATILE;
 
+-- The granules a running bound -- vexec's bounded sort's, given to its scan --
+-- passed over in the session's process by the min/max skip indexes of their
+-- parts (pg_accel's §3.38 VC43 and F25), for the tests.
+CREATE FUNCTION ch.granules_bound() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'ch_granules_bound' LANGUAGE C VOLATILE;
+
 -- The rows the session's process has read alone of the uncompressed record
 -- batches of Arrow files (ch_table_engines.md §3, VC27): a fetch's rows by
 -- their TIDs read from their batch's buffers at those rows, not the batch's

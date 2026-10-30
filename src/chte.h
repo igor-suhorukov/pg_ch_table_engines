@@ -112,6 +112,9 @@ extern bool ch_enable_memory_parts;
 extern bool ch_enable_fetch_cache;
 extern bool ch_enable_point_reads;
 extern bool ch_enable_scan_marks;
+extern bool ch_enable_skip_indexes;
+extern bool ch_parallel_part_affinity;
+extern uint64 ch_bound_granules_passed;	/* VC43: granules a running bound passed over in this process */
 extern bool ch_enable_part_summaries;
 extern bool ch_enable_summary_pruning;
 extern double ch_fetch_cost;

@@ -459,6 +459,10 @@ ch_engine(void)
 	/* optional: a library built before pg_accel's VC41 has each scan reader decompress its marks */
 	*(void **) &engine.set_scan_marks = dlsym(handle, "chte_set_scan_marks");
 	*(void **) &engine.marks_loaded = dlsym(handle, "chte_marks_loaded");
+	/* optional: a library built before pg_accel's VC43 reads no min/max skip index */
+	*(void **) &engine.set_skip_indexes = dlsym(handle, "chte_set_skip_indexes");
+	*(void **) &engine.part_granule_bounds = dlsym(handle, "chte_part_granule_bounds");
+	*(void **) &engine.read_restrict = dlsym(handle, "chte_read_restrict");
 	/* optional: a library built before pg_accel's F7 says no batch's granule */
 	*(void **) &engine.read_granule = dlsym(handle, "chte_read_granule");
 	/* optional: a library built before pg_accel's F6 reads no row alone */

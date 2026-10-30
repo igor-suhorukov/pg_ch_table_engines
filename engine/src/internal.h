@@ -20,6 +20,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreeReadTask.h>
 #include <Storages/MergeTree/MergeTreeReadersChain.h>
 #include <Storages/MergeTree/MergedBlockOutputStream.h>
@@ -28,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -161,6 +163,11 @@ bool functionsRegistered(const Names & names);
 
 /// VC21: the table's projections described in its metadata, where they are not yet (table.cpp)
 void describeProjections(chte_table & table);
+/// VC43: the table's implicit min/max skip indexes described in its metadata, where they are not yet (table.cpp)
+void describeImplicitIndexes(chte_table & table);
+/// VC43: a column's implicit min/max skip index -- the metadata's, described, or else described alone and
+/// kept -- none where the column has none (table.cpp)
+const DB::IndexDescription * implicitIndex(chte_table & table, const String & column);
 
 /// VC29: the parts PgMergeTree::loadPart() has loaded in the process (chte_parts_loaded)
 uint64_t partsLoaded();
@@ -375,6 +382,9 @@ std::unique_ptr<chte_reader> openReader(chte_table & table, const MergeTreeData:
 
 /// VC41 (pg_accel's §3.38): whether a scan's part readers warm their columns' marks first (chte_set_scan_marks)
 extern bool scan_marks;
+/// VC43 (pg_accel's §3.38): whether a filter narrows a part's granules by its min/max skip indexes
+/// (chte_set_skip_indexes)
+extern bool skip_indexes;
 
 /// VC33: a wide part's named columns' marks, each stream's, loaded into the process's mark cache where they
 /// are not there -- a merge's sequential source, which openReader's reader is, only looks there
@@ -479,6 +489,10 @@ struct chte_filter
     /// the filter over the columns it names that have statistics, in this order
     DB::NamesAndTypesList stats_columns;
     std::optional<DB::KeyCondition> stats_condition;
+    /// VC43: the table's min/max skip indexes the filter narrows a part's granules by, each with its
+    /// condition, over the DAG they were made of
+    std::optional<DB::ActionsDAGWithInversionPushDown> index_dag;
+    std::vector<std::pair<DB::MergeTreeIndexPtr, DB::MergeTreeIndexConditionPtr>> skip_indexes;
     /// each part's granules the filter keeps, worked out once
     std::map<DB::String, DB::MarkRanges> selected;
 
@@ -546,6 +560,9 @@ struct chte_reader
     std::shared_ptr<const DB::MergeTreeIndexGranularity> granularity;
     std::optional<size_t> run_mark;
     size_t run_mark_left = 0;
+    /// VC43 (chte_read_restrict): the current run's end, and whether the next block begins a granule
+    size_t run_end = 0;
+    bool at_granule_start = false;
     int64_t batch_granule = -1;
     bool batch_granule_last = false;
 
@@ -578,4 +595,11 @@ struct chte_table
     /// VC21: a table opened from its definition's parts (chte_table_open_spec): its projections'
     /// declarations, read into projections as they are first described
     std::vector<std::string> projection_texts;
+    /// VC43: the implicit min/max skip indexes described in the metadata, where an insert, a merge or a
+    /// rewrite first needs them (chte::describeImplicitIndexes); before, each column a scan names
+    /// described alone as first needed, and kept (chte::implicitIndex) -- ClickHouse's description of
+    /// every one at the open analyzes the table's whole list of columns for each, 3 ms of a fresh
+    /// process's at ClickBench's 105 columns
+    bool implicit_indexes = false;
+    std::map<std::string, std::optional<DB::IndexDescription>> column_indexes;
 };
